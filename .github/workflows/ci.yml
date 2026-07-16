@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-targets
+      # Debug: exercises overflow checks + debug_assertions (the heavy oracles are
+      # debug-gated with #[cfg_attr(debug_assertions, ignore)], so they stay skipped here).
+      - run: cargo test
+      # Release: same suite optimized, and it additionally runs the heavy debug-gated oracles.
+      - run: cargo test --release
+
+  lint:
+    name: fmt & clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # --all-targets covers lib, bins, tests, benches, and examples.
+      - run: cargo clippy --all-targets -- -D warnings
+
+  msrv:
+    name: minimum supported Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      # The library is zero-dependency; check it builds on the declared MSRV.
+      - run: cargo build --lib
