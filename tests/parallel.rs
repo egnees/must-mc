@@ -106,7 +106,7 @@ fn nondet_choices() {
 }
 
 #[test]
-fn nonblocking_receives_phase_b() {
+fn nonblocking_receives() {
     // Non-blocking receives may read nothing (multiple at once).
     check("nb-recv", Config::default(), || {
         SeqProgram::new(vec![vec![send(P2P, 1, "x")], vec![recv_nb(), recv_nb()]])

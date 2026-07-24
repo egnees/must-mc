@@ -155,7 +155,7 @@ fn bottom_is_read_by_multiple_receives() {
     assert_eq!(col.full_count(), 2);
     assert!(
         max_bottom_readers(&col) >= 2,
-        "expected a full execution where ⊥ is read by ≥ 2 receives (error 3)"
+        "expected a full execution where ⊥ is read by ≥ 2 receives"
     );
 }
 
