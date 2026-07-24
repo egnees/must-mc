@@ -1,10 +1,10 @@
 [package]
 name = "must-mc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Optimal dynamic partial-order reduction for message-passing concurrency (the Must algorithm, OOPSLA 2024)"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/egnees/must-mc"
 documentation = "https://docs.rs/must-mc"
 readme = "README.md"
