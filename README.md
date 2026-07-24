@@ -1,8 +1,8 @@
 # must-mc
 
-[![crates.io](https://img.shields.io/crates/v/must-mc.svg)](https://crates.io/crates/must-mc)
+[![crates.io](https://img.shields.io/crates/v/must-mc)](https://crates.io/crates/must-mc)
 [![docs.rs](https://img.shields.io/docsrs/must-mc)](https://docs.rs/must-mc)
-[![license](https://img.shields.io/crates/l/must-mc.svg)](#license)
+[![license](https://img.shields.io/crates/l/must-mc)](#license)
 
 A model checker for message-passing concurrency. `must` explores **every**
 distinct way the messages of a distributed protocol can be delivered, and checks
