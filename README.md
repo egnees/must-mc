@@ -1,4 +1,4 @@
-# must
+# must-mc
 
 [![crates.io](https://img.shields.io/crates/v/must-mc.svg)](https://crates.io/crates/must-mc)
 [![docs.rs](https://img.shields.io/docsrs/must-mc)](https://docs.rs/must-mc)
@@ -53,7 +53,7 @@ assert_eq!(counter.full(), 2); // reads "ping", or reads "pong"
 
 ## Writing a process
 
-A process is an `async` block driven by a [`Ctx`]. It looks like ordinary code; the
+A process is an `async` block driven by a `Ctx`. It looks like ordinary code; the
 checker replays it under every consistent message ordering.
 
 | Method | Meaning |
@@ -84,8 +84,9 @@ Every `send` carries a delivery model, so one program can mix guarantees:
 - Selective receives, timeouts, and data non-determinism.
 - Four communication models, mixable per message.
 - A parallel explorer (set `Config::threads`) that scales the search across cores.
-- Pluggable [`Observer`]s for counting, recording, collecting, and rendering runs.
-- Export any run as a `must-viz` JSON trace for the web visualizer.
+- Pluggable `Observer`s — count, record, collect, or render runs, or hook every
+  step of the search to follow the algorithm's progress in detail.
+- Export any run as a JSON trace for external tooling.
 - Zero runtime dependencies — pure `std`.
 
 ## Running the example
