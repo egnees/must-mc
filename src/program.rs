@@ -9,14 +9,13 @@
 //! ## The `traces` contract
 //!
 //! `traces[i]` holds **one value per already-committed event of thread `i`**, in program
-//! order (po) - exactly the paper's `trace_G(i) = (G.val(e_1), ..., G.val(e_n))`, where
-//! `n` is the number of thread-`i` events. Each entry is:
+//! order (po), where `n` is the number of thread-`i` events. Each entry is:
 //!   * `Some(v)` - a **receive** that read value `v` from some send;
 //!   * `None` - a **send** or **error** event (whose value is nothing), or a receive
 //!     that read nothing (a timeout or a non-blocking receive).
 //!
 //! So `traces[i].len()` is the number of thread-`i` events already in the graph, and
-//! `next(traces)[i]` is the `(len + 1)`-th event - the paper's `P_i(trace) = e_{n+1}`.
+//! `next(traces)[i]` is the `(len + 1)`-th event.
 //!
 //! Why a value per *event* and not per receive: after the explorer adds a send between
 //! two receives and re-calls `next`, a receive-only trace would be unchanged, so `next`

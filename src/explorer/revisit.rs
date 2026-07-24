@@ -1,10 +1,10 @@
-//! Backward revisits and the revisiting condition (Algorithm 1, lines 10-13, 17-22).
+//! Backward revisits and the revisiting condition.
 //!
-//! When a send `e` has just been added (<=G-maximal), it may become the source of an
+//! When a send `e` has just been added (≤_G-maximal), it may become the source of an
 //! earlier receive `r`. `Must` explores that (`rf(r) := e`) only from the canonical source
-//! graph - the one built with no prior revisit, each non-blocking receive reading nothing,
-//! each nondet at `min(S)`, and each blocking receive reading its deterministic tiebreaker.
-//! `RevisitCondition` is exactly that canonicity test.
+//! graph — the one built with no prior revisit, each non-blocking receive reading nothing,
+//! each nondet at its minimum, and each blocking receive reading its deterministic
+//! tiebreaker. `RevisitCondition` is exactly that canonicity test.
 
 use std::collections::BTreeSet;
 
@@ -17,15 +17,15 @@ use crate::program::Program;
 use super::Explorer;
 
 impl<P: Program, O: Observer> Explorer<'_, P, O> {
-    /// lines 10-13: for every revisitable receive `r`, delete the events added after it
-    /// (bar `e`'s causal prefix), and - if every deleted event and `r` itself satisfy
-    /// `RevisitCondition` - explore the graph where `r` reads `e`.
+    /// For every revisitable receive `r`, delete the events added after it (except `e`'s
+    /// causal prefix), and — if every deleted event and `r` itself satisfy `RevisitCondition`
+    /// — explore the graph where `r` reads `e`.
     pub(crate) fn backward_revisits(&mut self, first: &mut bool, g: &ExecutionGraph, e: EventId) {
         // e's porf-prefix is reused by the candidate filter, `Deleted`, and every
         // `Previous`, so compute it once.
         let porf_e = g.porf_prefix(e);
 
-        // line 10: candidates r with matches(e, r) and no porf path r -> e.
+        // Candidates: receives r that e matches and that are not porf-before e.
         for r in g.recvs() {
             if self.stopping() {
                 return;
@@ -36,11 +36,11 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
 
             let deleted = deleted_set(g, r, &porf_e);
 
-            // line 12: check RevisitCondition for every e' in Deleted plus {r}. Deleted
-            // already contains e (trivially passing), and r is added explicitly - the
-            // `chain(once(&r))` is load-bearing: dropping it lets a revisit whose r does
-            // not read its tiebreaker slip through, duplicating graphs (e.g. ns+r(3) under
-            // priorities [0,1,3,2] would explore 4 instead of 3).
+            // Check RevisitCondition for every e' in Deleted plus {r}. Deleted already
+            // contains e (trivially passing); r is added explicitly, and the `chain(once(&r))`
+            // is load-bearing: dropping it lets a revisit whose r does not read its tiebreaker
+            // slip through, duplicating graphs (e.g. ns+r(3) under priorities [0,1,3,2] would
+            // explore 4 executions instead of 3).
             let all_ok = deleted
                 .iter()
                 .chain(std::iter::once(&r))
@@ -53,9 +53,8 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                 continue;
             }
 
-            // line 13: restrict to G.E \ (Deleted \ {e}), then rf(r) := e AFTER the cut.
-            // e stays in the graph (it is in Deleted but must survive) and remains
-            // <=G-maximal.
+            // Restrict to G.E \ (Deleted \ {e}), then set rf(r) := e AFTER the cut. e stays
+            // in the graph (it is in Deleted but must survive) and remains ≤_G-maximal.
             let mut keep: BTreeSet<EventId> = g.all_events().into_iter().collect();
             for &d in &deleted {
                 if d != e {
@@ -70,9 +69,8 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         }
     }
 
-    /// `RevisitCondition(G, e', s)` (lines 17-22), where `porf_s` is the precomputed
-    /// porf-prefix of the revisiting send `s` (the only way `s` enters the condition,
-    /// via `Previous`).
+    /// `RevisitCondition(G, e', s)`, where `porf_s` is the precomputed porf-prefix of the
+    /// revisiting send `s` (the only way `s` enters the condition, via `Previous`).
     fn revisit_condition(
         &self,
         g: &ExecutionGraph,
@@ -80,25 +78,25 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         porf_s: &BTreeSet<EventId>,
     ) -> bool {
         match g.label(ep) {
-            // line 18: a non-blocking receive is canonical iff it reads bottom.
+            // A non-blocking receive is canonical iff it reads bottom.
             Label::Recv {
                 blocking: false, ..
             } => g.reads_bottom(ep),
 
-            // line 22: a blocking receive is canonical iff it reads the tiebreaker send
-            // that the oracle picks on G|_Previous (NOT on the full G).
+            // A blocking receive is canonical iff it reads the tiebreaker send picked on
+            // G|_Previous (NOT on the full G).
             Label::Recv { blocking: true, .. } => {
                 let previous = previous_set(g, ep, porf_s);
                 let h = g.restrict(&previous);
                 g.reads_from(ep) == get_cons_tiebreaker(&h, ep)
             }
 
-            // line 19: a nondet event is canonical iff it chose the minimum of its option
-            // set. This is what keeps a backward revisit firing only from the unique
-            // canonical source graph, in which every nondet sits at min(S). Minimum by the
-            // *resolved string* (never the nondeterministic `Sym` id), matching
-            // `Label::nondet`'s canonicalising sort; `min_by` (not `set.first()`) so
-            // canonicity holds even if a `set` ever reaches here unsorted.
+            // A nondet event is canonical iff it chose the minimum of its option set. This is
+            // what keeps a backward revisit firing only from the unique canonical source
+            // graph, in which every nondet sits at its minimum. Minimum by the *resolved
+            // string* (never the nondeterministic `Sym` id), matching `Label::nondet`'s sort;
+            // `min_by` (not `set.first()`) so canonicity holds even if a set reaches here
+            // unsorted.
             Label::Nondet { set } => {
                 let min = set
                     .iter()
@@ -106,10 +104,10 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                 g.nd_value(ep) == min
             }
 
-            // line 21: any non-receive (send / error) is canonical iff no receive in
-            // Previous reads it - i.e. it never itself backward-revisited an earlier
-            // receive (deleting it would undo that revisit). Nondet is handled by its own
-            // line-19 arm above, so this covers only sends and errors.
+            // Any non-receive (send / error) is canonical iff no receive in Previous reads it
+            // — i.e. it never itself backward-revisited an earlier receive (deleting it would
+            // undo that revisit). Nondet is handled by its own arm above, so this covers only
+            // sends and errors.
             Label::Send { .. } | Label::Error { .. } => {
                 let previous = previous_set(g, ep, porf_s);
                 !previous
@@ -120,10 +118,10 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     }
 }
 
-/// `Deleted = { e' in G.E | r <G e' and (e', s) not in G.porf }` (line 11), with `porf_s`
-/// the precomputed porf-prefix of `s`. Strict `<G`; `s`'s porf-prefix is preserved. `s`
-/// itself is included (it is <=G-maximal and not in its own porf-prefix), but the caller
-/// keeps it in the graph.
+/// `Deleted = { e' in G.E | r <_G e' and (e', s) not in G.porf }`, with `porf_s` the
+/// precomputed porf-prefix of `s`. Strict `<_G`; `s`'s porf-prefix is preserved. `s` itself
+/// is included (it is ≤_G-maximal and not in its own porf-prefix), but the caller keeps it
+/// in the graph.
 fn deleted_set(g: &ExecutionGraph, r: EventId, porf_s: &BTreeSet<EventId>) -> BTreeSet<EventId> {
     let sr = g.stamp(r);
     g.all_events()
@@ -132,12 +130,12 @@ fn deleted_set(g: &ExecutionGraph, r: EventId, porf_s: &BTreeSet<EventId>) -> BT
         .collect()
 }
 
-/// `Previous = { e' in G.E | e' <=G e or (e', s) in G.porf }` (line 20), with `porf_s` the
-/// precomputed porf-prefix of the revisiting send `s`. Non-strict `<=G` (so `e` itself is
-/// in Previous), and the porf part is strict up to `s`. This encodes "as of when e was
-/// added": from the future, e sees only s's porf-prefix, which is guaranteed to remain.
-/// The set is po-prefix-closed (stamp-downward within each thread plus a porf-prefix), so
-/// `restrict` accepts it as a keep set.
+/// `Previous = { e' in G.E | e' ≤_G e or (e', s) in G.porf }`, with `porf_s` the precomputed
+/// porf-prefix of the revisiting send `s`. Non-strict `≤_G` (so `e` itself is in Previous),
+/// and the porf part is strict up to `s`. This encodes "as of when e was added": from the
+/// future, e sees only s's porf-prefix, which is guaranteed to remain. The set is
+/// po-prefix-closed (stamp-downward within each thread plus a porf-prefix), so `restrict`
+/// accepts it as a keep set.
 fn previous_set(g: &ExecutionGraph, e: EventId, porf_s: &BTreeSet<EventId>) -> BTreeSet<EventId> {
     let se = g.stamp(e);
     g.all_events()

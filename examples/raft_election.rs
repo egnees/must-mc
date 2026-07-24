@@ -47,13 +47,12 @@
 //!
 //! Not expressible: unbounded execution. Stateless DPOR enumerates the finite set of
 //! consistent execution graphs, and a forever-running protocol has infinitely many. So each
-//! node runs a bounded number of event-loop ticks and terms, and crashes are bounded (the
-//! paper bounds its protocols the same way). Within the bound the full elect -> crash ->
-//! re-elect cycle is modelled and verified. There is no real time: timers are
-//! nondeterministic timeouts, so DPOR explores every timeout pattern (a superset of any real
-//! clock), which is safety-sound; liveness is not checked (Must is safety-only). Everything
-//! is p2p, and receives are selective (each waits for a specific message) so `rf` stays
-//! deterministic and the state space tractable.
+//! node runs a bounded number of event-loop ticks and terms, and crashes are bounded. Within
+//! the bound the full elect -> crash -> re-elect cycle is modelled and verified. There is no
+//! real time: timers are nondeterministic timeouts, so DPOR explores every timeout pattern (a
+//! superset of any real clock), which is safety-sound; liveness is not checked (Must is
+//! safety-only). Everything is p2p, and receives are selective (each waits for a specific
+//! message) so `rf` stays deterministic and the state space tractable.
 
 use std::collections::BTreeMap;
 
@@ -281,8 +280,7 @@ async fn leader_tick(c: &Ctx, k: usize, n: usize, p: &mut Persistent) -> Role {
 
 /// Build the cluster: `n` Raft nodes (tids `0..n`) plus the election-safety monitor (tid
 /// `n`). Each node runs at most `ticks` event-loop iterations and may crash up to `faults`
-/// times (its per-node crash budget, which bounds the fault space; the paper bounds crashes
-/// similarly).
+/// times (its per-node crash budget, which keeps the fault space finite).
 fn raft_cluster(n: usize, max_term: u64, ticks: usize, faults: u32, bug: Bug) -> System {
     let mut sys = System::new();
 
@@ -325,7 +323,7 @@ fn raft_cluster(n: usize, max_term: u64, ticks: usize, faults: u32, bug: Bug) ->
         }
         for (_t, count) in per_term {
             c.assert_that(
-                count <= 1,
+                count == 1,
                 "election safety violated: two leaders in one term",
             );
         }

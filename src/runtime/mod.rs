@@ -169,10 +169,10 @@ impl Ctx {
         }
     }
 
-    /// Data non-determinism (ND, Algorithm 1 lines 6 and 19): returns some value of the
-    /// finite option set `set`. The DPOR enumerates every value of `set`; during replay it
-    /// resolves to the value already committed for this choice, or - when this is the
-    /// thread's next event - parks and emits `Label::nondet(set)`. `set` must be non-empty.
+    /// Data non-determinism: returns some value of the finite option set `set`. The search
+    /// enumerates every value of `set`; during replay it resolves to the value already
+    /// committed for this choice, or — when this is the thread's next event — parks and emits
+    /// `Label::nondet(set)`. `set` must be non-empty.
     pub fn nondet(&self, set: impl IntoIterator<Item = impl Into<Val>>) -> NondetFuture {
         NondetFuture {
             cell: self.cell.clone(),
@@ -180,8 +180,8 @@ impl Ctx {
         }
     }
 
-    /// Assertion: if `cond` is false, emit `Label::Error` as this thread's next event
-    /// (line 5 of Algorithm 1). A holding assertion is pure control flow.
+    /// Assertion: if `cond` is false, emit `Label::Error` as this thread's next event. A
+    /// holding assertion is pure control flow.
     pub fn assert_that(&self, cond: bool, msg: &str) {
         self.cell.borrow_mut().record_assert(cond, msg);
     }

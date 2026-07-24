@@ -1,4 +1,4 @@
-//! The Must DPOR explorer (Algorithm 1).
+//! The Must DPOR explorer.
 //!
 //! [`explore`] is the entry point: it walks every consistent execution graph starting
 //! from the empty one. The backward-revisit half of the algorithm lives in [`revisit`].
@@ -27,8 +27,7 @@ use parallel::Spawner;
 pub struct Config {
     /// Thread priority permutation for `next_P`. `None` = the default `0..N`.
     pub priorities: Option<Vec<Tid>>,
-    /// Stop the whole exploration at the first `error` event (line 5 of Algorithm 1
-    /// says `exit`). Default `true`.
+    /// Stop the whole exploration at the first `error` event. Default `true`.
     ///
     /// When `false`, an error event finishes only its own thread and the branch keeps
     /// running, so every reachable error surfaces as its own erroneous terminal. This is
@@ -163,11 +162,10 @@ pub(crate) struct Explorer<'a, P: Program, O: Observer> {
 }
 
 impl<P: Program, O: Observer> Explorer<'_, P, O> {
-    /// `Visit_P(G)` (Algorithm 1, lines 2-14), building the per-thread `(traces, nexts)`
-    /// state from scratch. `g` is consistent on entry (it arrived through
-    /// `branch_if_consistent`, or is the empty graph). Used wherever the parent's state does
-    /// not carry over: the root, a subtree taken from the work queue, and after a backward
-    /// revisit restructures the graph.
+    /// `Visit_P(G)`, building the per-thread `(traces, nexts)` state from scratch. `g` is
+    /// consistent on entry (it arrived through `branch_if_consistent`, or is the empty
+    /// graph). Used wherever the parent's state does not carry over: the root, a subtree
+    /// taken from the work queue, and after a backward revisit restructures the graph.
     pub(crate) fn visit(&mut self, g: &ExecutionGraph) {
         if self.stopping() {
             return;
@@ -199,7 +197,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             "threaded traces/nexts drifted from a fresh recompute"
         );
         match pick(g, nexts, &self.priorities) {
-            // line 4: next_P(G) = nothing - a terminal execution.
+            // Nothing more can be added: a terminal execution.
             NextStep::Terminal { blocked } => {
                 // In collect-errors mode a branch that ran through an error reaches its
                 // terminal still carrying that error event, so it is an Error terminal, not
@@ -217,13 +215,13 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                 self.record(g.clone(), kind);
             }
             NextStep::Event { tid, label } => match &label {
-                // line 5: error - see `visit_error`.
+                // Error - see `visit_error`.
                 Label::Error { .. } => self.visit_error(g, tid, label),
-                // line 6: nondet - enumerate every value of the option set.
+                // Nondet - enumerate every value of the option set.
                 Label::Nondet { .. } => self.visit_nondet(g, tid, label, traces, nexts),
-                // line 7: receive - enumerate rf sources.
+                // Receive - enumerate rf sources.
                 Label::Recv { .. } => self.visit_recv(g, tid, label, traces, nexts),
-                // lines 8-13: send - the no-revisit branch plus backward revisits.
+                // Send - the no-revisit branch plus backward revisits.
                 Label::Send { .. } => self.visit_send(g, tid, label, traces, nexts),
             },
         }
@@ -330,10 +328,10 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         }
     }
 
-    /// line 5: an `error` event.
+    /// An `error` event.
     ///
-    /// With `stop_on_error` (default) this is the paper's `exit`: record the erroneous
-    /// graph and halt the whole search after the first error.
+    /// With `stop_on_error` (default), record the erroneous graph and halt the whole search
+    /// after the first error.
     ///
     /// Without it (`collect_errors`) the error finishes only its own thread and the branch
     /// keeps going, so other threads run to completion and any error they reach surfaces
@@ -356,12 +354,12 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         }
     }
 
-    /// line 7: `for s in G.S union {bottom} do VisitIfConsistent(SetRF(G, e, s))`.
+    /// Add receive `e` and try every rf source: each send, plus bottom (the no-message
+    /// source).
     ///
-    /// No syntactic prefilter: every send plus bottom (the no-message source) is tried,
-    /// and consistency does the filtering (a non-matching send, or bottom under a blocking
-    /// receive, fails well-formedness). The bottom option is never dropped - it is the
-    /// timeout of a non-blocking receive.
+    /// No syntactic prefilter — consistency does the filtering (a non-matching send, or
+    /// bottom under a blocking receive, fails well-formedness). The bottom option is never
+    /// dropped; it is the timeout of a non-blocking receive.
     fn visit_recv(
         &mut self,
         g: &ExecutionGraph,
@@ -372,18 +370,17 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     ) {
         let mut base = g.clone();
         let e = base.add_event(tid, label);
-        // Discipline (graph.rs): assign an rf immediately after adding a receive.
+        // A receive must always carry an rf; give it ⊥ now; the loop below repoints it per
+        // source.
         base.set_rf(e, None);
         self.observer.on_event_added(&base, e);
 
-        // Sources in a deterministic order: sends in (tid, idx) order, then bottom. The
-        // enumeration order does not affect the set of explored executions (each rf source
-        // is a distinct child, visited once), so the natural event order suffices.
+        // Every send, then bottom. The order does not affect which executions are explored
+        // (each source is a distinct child), so the natural event order suffices.
         let mut sources: Vec<Option<EventId>> = base.iter_sends().map(Some).collect();
         sources.push(None); // bottom
 
-        // `branch` never mutates the graph it is handed (it clones internally for its own
-        // children, and once when donating to the queue), so one `base` is reused across
+        // `branch` never mutates the graph it is handed, so one `base` is reused across
         // sources, re-pointing `e`'s rf in place for each.
         let mut first = true;
         for src in sources {
@@ -412,12 +409,11 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         }
     }
 
-    /// line 6: `case e in ND: for v in S do Visit_P(SetND(G, e, v))`.
+    /// Add nondet event `e` and enumerate every value of its finite option set.
     ///
-    /// A nondet event enumerates every value of its finite option set. Each choice recurses
-    /// through plain `Visit_P`, not `VisitIfConsistent`: a nondet value never participates
-    /// in rf / well-formedness / the model predicates, so `g` being consistent on entry
-    /// makes every `SetND` result consistent by construction.
+    /// Each choice recurses through plain `Visit_P`, not the consistency-gated path: a nondet
+    /// value never participates in rf / well-formedness / the model predicates, so `g` being
+    /// consistent on entry makes every choice consistent by construction.
     fn visit_nondet(
         &mut self,
         g: &ExecutionGraph,
@@ -430,8 +426,8 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         let e = g_add.add_event(tid, label);
         self.observer.on_event_added(&g_add, e);
 
-        // `Label::nondet` canonicalised the set to sorted+unique, so this explores
-        // min(S) first (the line-19 canonical value) and each value exactly once.
+        // `Label::nondet` canonicalised the set to sorted+unique, so this explores the
+        // minimum first (the canonical choice) and each value exactly once.
         let set = g_add
             .label(e)
             .nd_set()
@@ -452,10 +448,9 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         }
     }
 
-    /// lines 8-13: add the send, explore the no-revisit branch (line 9), then attempt every
-    /// backward revisit (lines 10-13). The revisit loop runs on `g_add` regardless of
-    /// whether line 9's graph was consistent - Algorithm 1 does not gate it, and a revisit
-    /// can delete the very events that made `g_add` inconsistent.
+    /// Add the send, explore the plain no-revisit branch, then attempt every backward
+    /// revisit. The revisit loop runs on `g_add` regardless of whether the plain branch was
+    /// consistent — a revisit can delete the very events that made `g_add` inconsistent.
     fn visit_send(
         &mut self,
         g: &ExecutionGraph,
@@ -472,11 +467,10 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         // node, so they share one `first` flag (the first explored inline, the rest
         // donatable).
         let mut first = true;
-        // line 9: `e` is simply added. A ≤_G-maximal *unread* send is consistent in every
-        // model (it is so-after everything in its thread / has no porf-successors, so it
-        // cannot be the `u` of clause (b), never appears in clause (c), and has no outgoing
-        // edge in the mbox graph). So branch unconditionally rather than re-checking the
-        // whole graph; the debug assertion guards the proof.
+        // The plain branch: `e` is simply added. A ≤_G-maximal *unread* send is consistent in
+        // every model (it is so-after everything in its thread and has no porf-successors, so
+        // no ordering clause can mention it and it has no outgoing mbox edge), so branch
+        // unconditionally rather than re-checking the whole graph; the debug assert guards it.
         if !self.stopping() {
             debug_assert!(
                 consistent(&g_add),
@@ -490,8 +484,8 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         if self.stopping() {
             return;
         }
-        // lines 10-13. A backward revisit restructures the graph, so its children take the
-        // fresh `visit` path rather than a derived state.
+        // A backward revisit restructures the graph, so its children take the fresh `visit`
+        // path rather than a derived state.
         self.backward_revisits(&mut first, &g_add, e);
     }
 

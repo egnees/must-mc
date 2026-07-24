@@ -13,10 +13,10 @@ use crate::graph::ExecutionGraph;
 
 /// How an explored execution terminated.
 ///
-/// * `Full` - `next_P(G) = nothing` with every thread finished (line 4).
-/// * `Blocked` - `next_P(G) = nothing` with some thread stuck on a blocking receive that
-///   never got a message (a maximal consistent prefix).
-/// * `Error` - an `error` event was reached (line 5).
+/// * `Full` - nothing more can be added and every thread finished.
+/// * `Blocked` - nothing more can be added but some thread is stuck on a blocking receive
+///   that never got a message (a maximal consistent prefix).
+/// * `Error` - an `error` event was reached.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ExecutionKind {
     Full,

@@ -256,8 +256,8 @@ pub enum StepKind {
     },
 }
 
-/// Flat log of every step, for later rendering. For sequential runs in practice: a
-/// parallel run interleaves the workers' steps into one meaningless log.
+/// Flat log of every step, for later rendering. Best for sequential runs — a parallel run
+/// interleaves the workers' steps into one meaningless log.
 #[derive(Debug, Default)]
 pub struct RecordingObserver {
     steps: Mutex<Vec<Step>>,
@@ -355,8 +355,7 @@ impl ExecutionCollector {
     pub fn errors(&self) -> Vec<Execution> {
         self.inner.lock().unwrap().errors.clone()
     }
-    /// Full followed by blocked - the terminal executions over which Theorem 4.1 forbids
-    /// duplicates.
+    /// Full followed by blocked - the terminal executions the search must not duplicate.
     pub fn terminals(&self) -> Vec<Execution> {
         let c = self.inner.lock().unwrap();
         c.full.iter().chain(c.blocked.iter()).cloned().collect()

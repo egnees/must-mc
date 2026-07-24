@@ -1,12 +1,11 @@
 //! The `next_P` scheduling policy.
 //!
-//! `next_P(G)` obeys the paper's three assumptions: (i) it never picks an event of a
-//! blocked thread; (ii) it never adds a blocking receive when there is no matching
-//! message; (iii) it yields a terminal verdict only when nothing can be added. Because
-//! addability is recomputed on the current graph every call, a receive is automatically
-//! rescheduled the moment a matching send appears (Example 4.1). There is no explicit
-//! blocking event in the graph: a thread whose next event is a blocking receive with no
-//! message is simply "blocked" at this graph, and unblocks when a send shows up.
+//! `next_P(G)` follows three rules: it never picks an event of a blocked thread; it never
+//! adds a blocking receive when no matching message exists; and it reports a terminal
+//! verdict only when nothing can be added. Addability is recomputed on the current graph
+//! every call, so a receive is rescheduled the moment a matching send appears. There is no
+//! explicit blocking event in the graph: a thread whose next event is a blocking receive
+//! with no message is simply "blocked" at this graph, and unblocks when a send appears.
 
 use crate::event::{EventId, Label, Tid, Val};
 use crate::graph::ExecutionGraph;
@@ -22,8 +21,8 @@ pub enum NextStep {
     Terminal { blocked: Vec<Tid> },
 }
 
-/// Extract `trace_G(i)` for every thread: one value per event in po, `Some(v)` for a
-/// receive that read value `v`, `None` for a send/error or a receive that read nothing.
+/// Extract each thread's trace: one value per event in po, `Some(v)` for a receive that
+/// read value `v`, `None` for a send/error or a receive that read nothing.
 pub fn traces_of(g: &ExecutionGraph, num_threads: usize) -> Vec<Vec<Option<Val>>> {
     let mut traces = vec![Vec::new(); num_threads];
     for (tid, trace) in traces.iter_mut().enumerate() {
@@ -51,7 +50,7 @@ pub fn traces_of(g: &ExecutionGraph, num_threads: usize) -> Vec<Vec<Option<Val>>
 fn addable(g: &ExecutionGraph, tid: Tid, label: &Label) -> bool {
     match label {
         Label::Send { .. } | Label::Error { .. } => true,
-        // A nondet choice is always addable; assumption (ii) constrains blocking receives only.
+        // A nondet choice is always addable; only blocking receives are ever held back.
         Label::Nondet { .. } => true,
         // A non-blocking receive can always read nothing, so it is always addable.
         Label::Recv {
@@ -215,7 +214,7 @@ mod tests {
         }
     }
 
-    /// Rescheduling (Example 4.1): with thread 2 (the receiver) first in priority but no
+    /// Rescheduling: with thread 2 (the receiver) first in priority but no
     /// message, the scheduler skips it and picks a sender; once a send exists, the
     /// receiver becomes addable on the same priority order.
     #[test]

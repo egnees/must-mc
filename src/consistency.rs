@@ -1,9 +1,9 @@
-//! Well-formedness and the per-model consistency predicates (Definitions 3.3 to 3.8).
+//! Well-formedness and the per-model consistency predicates.
 //!
-//! `consistent(G)` is well-formedness and `consistent_M(G)` for every model `M` that a
-//! send in `G` uses. The graph is never physically restricted to one model's events: the
-//! model brackets inside `so` already select the sends of model `M`, while `porf` ranges
-//! over the whole graph, so causal chains may pass through events of other models.
+//! `consistent(G)` is well-formedness plus `consistent_M(G)` for every model `M` a send in
+//! `G` uses. The graph is never physically restricted to one model's events: the model
+//! brackets inside `so` already select that model's sends, while `porf` ranges over the
+//! whole graph, so causal chains may pass through events of other models.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,7 +28,7 @@ thread_local! {
     static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
 }
 
-/// `consistent(G)` (Definition 3.8).
+/// Full consistency: well-formed, and consistent under every model in use.
 pub fn consistent(g: &ExecutionGraph) -> bool {
     well_formed(g) && models_consistent(g)
 }
@@ -40,29 +40,28 @@ fn models_consistent(g: &ExecutionGraph) -> bool {
             Some(Model::P2p) => p2p = true,
             Some(Model::Cd) => cd = true,
             Some(Model::Mbox) => mbox = true,
-            // asyn adds nothing beyond well-formedness (Definition 3.4).
+            // asyn adds nothing beyond well-formedness.
             Some(Model::Asyn) | None => {}
         }
     }
     (!p2p || consistent_p2p(g)) && (!cd || consistent_cd(g)) && (!mbox || consistent_mbox(g))
 }
 
-/// Well-formedness (Definition 3.3), minus the send/receive model-match clause (a
-/// receive carries no model).
+/// Well-formedness, minus the send/receive model-match clause (a receive carries no model).
 pub fn well_formed(g: &ExecutionGraph) -> bool {
-    let clauses_1_to_4 = SCRATCH.with(|s| {
+    let rf_ok = SCRATCH.with(|s| {
         let sources = &mut s.borrow_mut().sources;
         sources.clear();
         for r in g.iter_recvs() {
             match g.reads_from(r) {
-                // (1) only a non-blocking receive may read nothing.
+                // Reading nothing is only well-formed for a non-blocking receive.
                 None => {
                     if g.label(r).blocking() != Some(false) {
                         return false;
                     }
                 }
-                // (4) rf links a send to a matching receive on the right thread; the
-                // model-match part is dropped because a receive carries no model.
+                // rf must link a matching send on the receiver's thread (the model-match
+                // part is dropped because a receive carries no model).
                 Some(s) => {
                     if !g.contains(s) || !g.label(s).is_send() || !g.matches(s, r) {
                         return false;
@@ -71,29 +70,27 @@ pub fn well_formed(g: &ExecutionGraph) -> bool {
                 }
             }
         }
-        // (3) every send is read at most once (2 is automatic: rf is stored per receive):
-        // sort the read sources and look for an adjacent duplicate.
+        // Every send is read at most once (the reverse is automatic — rf holds one source
+        // per receive): sort the sources and look for a duplicate.
         sources.sort_unstable();
         !sources.windows(2).any(|w| w[0] == w[1])
     });
-    // (5) porf is irreflexive: no causal cycle (a DFS over po ∪ rf).
-    clauses_1_to_4 && g.is_porf_acyclic()
+    // porf must be irreflexive: no causal cycle.
+    rf_ok && g.is_porf_acyclic()
 }
 
 /// Incremental `consistent(G)` for a graph that is a consistent parent plus one freshly
 /// added, `≤_G`-maximal receive `r` (with its rf already set). Returns exactly
-/// `consistent(G)` but re-checks only the clauses `r` can violate.
+/// `consistent(G)` but re-checks only the clauses `r` can violate:
 ///
-/// Justification (Definitions 3.3, 3.5, 3.6 and the backward-revisit invariants):
-/// * porf-acyclicity (well-formedness clause 5) is skipped: a maximal event has only
-///   incoming porf edges (po from `r-1`, rf from its source) and no outgoing ones, so it
-///   cannot lie on a cycle, and the parent was acyclic.
-/// * "each send read ≤ once" can only break via the pair containing `r`, so we check just
-///   that `r`'s source is not already read by another receive.
-/// * the model so-clauses (b)/(c) can only gain obligations that mention `r`: `r` is always
-///   the *later* receive `r2` in clause (c), and adding `r` does not perturb porf among the
-///   older events. Only the model of the send `r` reads is relevant (a receive of a foreign
-///   model is skipped by every other model's clauses).
+/// * porf-acyclicity is skipped — a maximal event has only incoming porf edges (po from its
+///   predecessor, rf from its source) and none outgoing, so it cannot lie on a cycle, and
+///   the parent was already acyclic.
+/// * "each send is read at most once" can only break through the pair containing `r`, so we
+///   check only that `r`'s source is not already read by another receive.
+/// * the model ordering clauses can only gain obligations that mention `r`: it is always the
+///   later of the two receives, and adding it does not reorder the older events. Only the
+///   model of the send `r` reads matters.
 ///
 /// This is NOT valid after a backward revisit (which points an earlier receive at a later
 /// send and can create a cycle); those paths keep the full [`consistent`].
@@ -102,17 +99,15 @@ pub fn consistent_after_recv(g: &ExecutionGraph, r: EventId) -> bool {
         g.label(r).is_recv(),
         "consistent_after_recv target must be a receive"
     );
-    // well-formedness, restricted to `r` (clauses 1/3/4; clause 5 skipped, clause 2 is
-    // automatic).
     let s = match g.reads_from(r) {
-        // (1) only a non-blocking receive may read nothing.
+        // Reading nothing is only well-formed for a non-blocking receive.
         None => return g.label(r).blocking() == Some(false),
-        // (4) rf links a matching send on the right thread.
+        // rf must link a matching send on the receiver's thread...
         Some(s) => {
             if !g.contains(s) || !g.label(s).is_send() || !g.matches(s, r) {
                 return false;
             }
-            // (3) `r` reading `s` must not make `s` read twice.
+            // ...and reading `s` must not make `s` read twice.
             if g.iter_recvs().any(|o| o != r && g.reads_from(o) == Some(s)) {
                 return false;
             }
@@ -130,8 +125,8 @@ pub fn consistent_after_recv(g: &ExecutionGraph, r: EventId) -> bool {
     }
 }
 
-/// The so-clause half of [`consistent_after_recv`] for p2p/cd: clause (b) for the new
-/// receive `r` (reading `s`), and clause (c) with `r` as the later receive `r2`.
+/// The send-order half of [`consistent_after_recv`] for p2p/cd, checking only the two
+/// obligations the new receive `r` (reading `s`) can create.
 fn so_after_recv(g: &ExecutionGraph, r: EventId, s: EventId, model: Model) -> bool {
     let is_model = |e: EventId| g.send_model(e) == Some(model);
     let so = |a: EventId, b: EventId| {
@@ -150,17 +145,17 @@ fn so_after_recv(g: &ExecutionGraph, r: EventId, s: EventId, model: Model) -> bo
         sources.extend(g.iter_recvs().filter_map(|rr| g.reads_from(rr)));
         sources.sort_unstable();
 
-        // (b): no unread send u that is so-before s and matches r.
+        // `r` must read the earliest deliverable send: no unread matching send is so-before `s`.
         for u in g.iter_sends() {
             if sources.binary_search(&u).is_ok() {
-                continue; // read → not in G.US
+                continue; // read, so not unread
             }
             if so(u, s) && g.matches(u, r) {
                 return false;
             }
         }
-        // (c): r is ≤_G-maximal, hence the later receive r2; pair it with each earlier
-        // receive r1 in its own thread.
+        // `r` is the later receive: forbid taking a message out of order with each earlier
+        // receive on its thread.
         for idx in 0..r.idx {
             let r1 = EventId::new(r.tid, idx);
             if !g.label(r1).is_recv() {

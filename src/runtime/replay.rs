@@ -164,10 +164,10 @@ impl ThreadCell {
         }
     }
 
-    /// `NondetFuture::poll`. Mirrors `poll_recv` but for a data non-determinism choice
-    /// (ND, Algorithm 1 line 6): it never touches `recv_index`, a committed slot is always
-    /// a value (a nondet event never reads nothing), and parking emits `Label::nondet(set)`.
-    /// Advances `cursor` on a committed replay so po position stays in step.
+    /// `NondetFuture::poll`. Mirrors `poll_recv` but for a data non-determinism choice: it
+    /// never touches `recv_index`, a committed slot is always a value (a nondet event never
+    /// reads nothing), and parking emits `Label::nondet(set)`. Advances `cursor` on a
+    /// committed replay so po position stays in step.
     pub(crate) fn poll_nondet(&mut self, set: &mut Option<Vec<Val>>) -> Poll<Val> {
         // Once the next event is recorded (or the thread finished) further awaits park.
         if self.halted() || self.over_budget() {
