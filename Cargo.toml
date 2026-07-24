@@ -10,7 +10,7 @@ documentation = "https://docs.rs/must-mc"
 readme = "README.md"
 keywords = ["model-checking", "concurrency", "dpor", "message-passing", "verification"]
 categories = ["concurrency", "development-tools::testing", "algorithms"]
-exclude = ["PLAN.md", "CLAUDE.md", "/.github"]
+exclude = ["/.github"]
 
 # The published crate is `must-mc`, but it is imported as `must`.
 [lib]
