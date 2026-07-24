@@ -1,10 +1,9 @@
 //! Per-model execution-count oracles. Each program is parameterised by the communication
-//! [`Model`] so the same shape is checked under asyn/p2p/cd/mbox; the expected counts
-//! encode how much each model constrains delivery.
+//! [`Model`] so the same shape is checked under asyn/p2p/cd/mbox; the expected counts show
+//! how much each model constrains delivery.
 //!
-//! Thread numbering: the paper's `T1/T2/T3` (1-based) are the 0-based tids `0/1/2/...`
-//! here, and every `send(k, ...)` argument is already the 0-based destination -- the
-//! translation from the paper's mixed T-notation is done in each builder's doc comment.
+//! Thread numbering: the paper's 1-based `T1/T2/...` are the 0-based tids `0/1/...` here,
+//! and every `send(k, ...)` argument is already the 0-based destination.
 
 mod common;
 
@@ -25,12 +24,10 @@ fn expected(model: Model, counts: (usize, usize, usize, usize)) -> usize {
 
 // -- Example 3.1 ------------------------------------------------------------------
 
-/// `T0: send(2,"1"); send(1,"2") || T1: recv(); send(2,"3") || T2: recv(); recv()`
-/// (the paper's 1-based form: `T1: send(3,1); send(2,2) || T2: recv(); send(3,3) ||
-/// T3: recv(); recv()`). T2 receives both "1" (from T0) and "3" (from T1). Under cd/mbox,
-/// "3" is causally after "1" (T0->"1", then T0->"2"->T1.recv->T1->"3"), so it must arrive
-/// second: 1 graph. Under asyn/p2p the two sends have different senders, so both orders
-/// survive: 2.
+/// `T0: send(2,"1"); send(1,"2") || T1: recv(); send(2,"3") || T2: recv(); recv()`.
+/// T2 receives both "1" (from T0) and "3" (from T1). Under cd/mbox "3" is causally after
+/// "1", so it must arrive second: 1 graph. Under asyn/p2p the two sends have different
+/// senders, so both orders survive: 2.
 fn example_3_1(model: Model) -> SeqProgram {
     SeqProgram::new(vec![
         vec![send(model, 2, "1"), send(model, 1, "2")],
@@ -75,12 +72,10 @@ fn m1_all_models() {
 
 // -- One receive, a causally-ordered pair of sends --------------------------------
 
-/// `T0: send(2,"1"); send(1,"go") || T1: recv(); send(2,"2") || T2: recv()`
-/// (the paper's 1-based form: `send(3,1); send(2,go) || recv(); send(3,2) || recv()`).
+/// `T0: send(2,"1"); send(1,"go") || T1: recv(); send(2,"2") || T2: recv()`.
 /// T2's single receive may read "1" (from T0) or "2" (from T1). Under cd/mbox "2" is
-/// causally after "1" (T0->"1"->...->"go"->T1.recv->T1->"2"), and reading "2" while "1"
-/// is unread is inconsistent: 1 graph. Under asyn/p2p the two sends have different
-/// senders: 2.
+/// causally after "1", and reading "2" while "1" is unread is inconsistent: 1 graph.
+/// Under asyn/p2p the two sends have different senders: 2.
 fn m3(model: Model) -> SeqProgram {
     SeqProgram::new(vec![
         vec![send(model, 2, "1"), send(model, 1, "go")],
@@ -100,11 +95,9 @@ fn m3_all_models() {
 // -- XCHG: a cross-mailbox mbox cycle ---------------------------------------------
 
 /// `T0: send(2,"a1"); send(3,"b1") || T1: send(3,"b2"); send(2,"a2") ||
-///  T2: recv(); recv() || T3: recv(); recv()` (the paper's 1-based T1..T4 -> tids 0..3,
-/// `send(3,...)` -> tid 2, `send(4,...)` -> tid 3). Under mbox the global enqueue order
-/// across the two mailboxes (tid 2 and tid 3) forbids one of the four otherwise-
-/// independent orderings: 3 instead of 4 -- the case a per-destination mbox check would
-/// miss.
+///  T2: recv(); recv() || T3: recv(); recv()`. Under mbox the global enqueue order across
+/// the two mailboxes (tids 2 and 3) forbids one of the four otherwise-independent
+/// orderings: 3 instead of 4 -- the case a per-destination mbox check would miss.
 fn xchg(model: Model) -> SeqProgram {
     SeqProgram::new(vec![
         vec![send(model, 2, "a1"), send(model, 3, "b1")],
@@ -130,11 +123,10 @@ fn xchg_all_models() {
 
 // -- A1: repeated revisit of one receive ------------------------------------------
 
-/// `T0: recv() || T1: send(0,"a"); send(0,"b") || T2: send(0,"c")` (the paper's 1-based
-/// `send(1,...)` targets tid 0). The single receive may read any of a/b/c under asyn (3);
-/// under p2p/cd/mbox reading "b" while the earlier same-sender "a" is unread is
-/// inconsistent, so only a or c (2). Under asyn this stresses repeated backward revisits
-/// of one receive by porf-connected sends, which p2p masks -- hence all permutations.
+/// `T0: recv() || T1: send(0,"a"); send(0,"b") || T2: send(0,"c")`. The single receive
+/// may read any of a/b/c under asyn (3); under p2p/cd/mbox reading "b" while the earlier
+/// same-sender "a" is unread is inconsistent, so only a or c (2). Under asyn this stresses
+/// repeated backward revisits of one receive, which p2p masks -- hence all permutations.
 fn a1(model: Model) -> SeqProgram {
     SeqProgram::new(vec![
         vec![recv()],

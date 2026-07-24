@@ -110,7 +110,7 @@ fn nsr_5() {
 
 #[test]
 fn nsr_8() {
-    // 9 threads: default + reverse + rotation. 8 executions, trivially cheap.
+    // 9 threads: a sample of permutations.
     assert_oracle("ns+r(8)", &ns_r(8), &sample_perms(9), 8, 0);
 }
 
@@ -123,8 +123,7 @@ fn nsnr_2() {
 
 #[test]
 fn nsnr_4() {
-    // 24 = 4! interpolates the N! law (Table 1 tabulates only N = 2/5/8). 5 threads =
-    // 120 permutations; each yields 24 executions.
+    // 24 = 4! interpolates the N! law (Table 1 lists only N = 2/5/8).
     assert_oracle("ns+nr(4)", &ns_nr(4), &permutations(5), factorial(4), 0);
 }
 
@@ -180,8 +179,7 @@ fn example_2_8_one_full() {
 
 #[test]
 fn nworkers_3() {
-    // 12 = 2*3! by the 2*N! identity (Table 1 tabulates only N >= 7). 5
-    // threads; all 120 permutations, 12 executions each.
+    // 12 = 2*3! by the 2*N! identity (Table 1 lists only N >= 7).
     assert_oracle(
         "nworkers(3)",
         &nworkers(3),
@@ -193,7 +191,7 @@ fn nworkers_3() {
 
 #[test]
 fn nworkers_4() {
-    // 48 = 2*4! (formula). 6 threads; sample of permutations.
+    // 48 = 2*4! (formula).
     assert_oracle(
         "nworkers(4)",
         &nworkers(4),

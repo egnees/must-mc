@@ -2,8 +2,8 @@
 //! models: models as columns, execution count and time per cell, at small instances.
 //!
 //! Two qualitative findings are checked:
-//!   * Monitors are nearly free. The paper reports under 20% extra executions; the
-//!     selective-notification monitors here add exactly 0%. Asserted.
+//!   * Monitors are nearly free. The selective-notification monitors here add exactly 0%
+//!     extra executions, well under the 20% cap the test enforces. Asserted.
 //!   * mbox is the slowest check (global acyclicity versus the cheaper ordering checks of
 //!     p2p and cd). Printed for inspection, since wall-clock time is environment dependent.
 //!
@@ -91,7 +91,7 @@ fn cross_model_table() {
     );
 }
 
-/// Monitors are nearly free: the paper reports `< 20%` extra executions, ours add 0%.
+/// Monitors are nearly free: ours add 0% extra executions, well under the 20% cap.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "benchmark; run with --release")]
 fn monitor_overhead() {
@@ -102,13 +102,13 @@ fn monitor_overhead() {
     let overhead = (cm as f64 / cb as f64 - 1.0) * 100.0;
     println!("base : execs={cb:>7}  {tb:>8.2}ms");
     println!("+mon : execs={cm:>7}  {tm:>8.2}ms   (exec overhead {overhead:.1}%)");
-    // Factor-1 on the count (selective notifications), well inside the paper's < 20%.
+    // Factor-1 on the count (selective notifications), well inside the 20% cap.
     assert_eq!(
         cb, cm,
         "monitor must not change the execution count (factor-1)"
     );
     assert!(
         cm as f64 <= 1.2 * cb as f64,
-        "monitor exec overhead exceeded the paper's 20% bound"
+        "monitor exec overhead exceeded the 20% bound"
     );
 }

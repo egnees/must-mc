@@ -89,11 +89,11 @@ fn example_3_1(model: Model, crossed: bool) -> ExecutionGraph {
     let r_t3_b = g.add_event(2, recv(Pred::any()));
     g.set_rf(r_t2, Some(s_t2_2));
     if crossed {
-        g.set_rf(r_t3_a, Some(s_t3_3)); // reads 3
-        g.set_rf(r_t3_b, Some(s_t3_1)); // reads 1
+        g.set_rf(r_t3_a, Some(s_t3_3));
+        g.set_rf(r_t3_b, Some(s_t3_1));
     } else {
-        g.set_rf(r_t3_a, Some(s_t3_1)); // reads 1
-        g.set_rf(r_t3_b, Some(s_t3_3)); // reads 3
+        g.set_rf(r_t3_a, Some(s_t3_1));
+        g.set_rf(r_t3_b, Some(s_t3_3));
     }
     g
 }
@@ -162,8 +162,8 @@ fn p2p_clause_c_forbids_receiving_same_source_out_of_order() {
     let s2 = g.add_event(0, Label::send(Model::P2p, 1, "2"));
     let ra = g.add_event(1, recv(Pred::any()));
     let rb = g.add_event(1, recv(Pred::any()));
-    g.set_rf(ra, Some(s2)); // first receive reads the later send
-    g.set_rf(rb, Some(s1)); // second receive reads the earlier send
+    g.set_rf(ra, Some(s2));
+    g.set_rf(rb, Some(s1));
     assert!(!consistent_p2p(&g));
 }
 

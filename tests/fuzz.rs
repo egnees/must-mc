@@ -1,52 +1,36 @@
 //! Deterministic differential fuzzing: random straight-line programs, explorer vs a
-//! brute-force reference over the **whole** terminal set [[P]]. A long-lived regression
-//! that stresses the explorer far beyond the hand-picked oracles.
+//! brute-force reference over the whole terminal set [[P]]. Stresses the explorer far
+//! beyond the hand-picked oracles.
 //!
-//! ## What the brute-force reference covers
+//! ## The brute-force reference
 //!
-//! [[P]] has two kinds of terminal execution, and the reference enumerates
-//! *both*:
-//!   * **Full executions** - every thread runs to completion, every receive reads a
-//!     send, the graph is consistent.
-//!   * **Blocked executions** - *maximal consistent prefixes* in which some thread is
-//!     stuck on a blocking receive that has no matching unread send and cannot be
-//!     consistently extended.
+//! [[P]] has two kinds of terminal execution, and the reference enumerates both:
+//!   * **Full** - every thread finished, every receive read a send, graph consistent.
+//!   * **Blocked** - a maximal consistent prefix where some thread is stuck on a blocking
+//!     receive that has no matching unread send.
 //!
-//! The reference enumerates [[P]] by choosing, per thread, a *maximal-prefix boundary*
-//! (finished, or just before one of the thread's blocking receives - never before a
-//! send/error or a *non-blocking* receive, all of which would still be addable), and
-//! every rf assignment over the included receives. Each receive's rf ranges over every
-//! send, plus nothing for a **non-blocking** receive (`recv_timeout`) - and nothing may
-//! be chosen by several non-blocking receives at once, exactly as in the DPOR. A blocking
-//! receive cannot read nothing. A candidate is kept iff it is
-//! `must::consistent` **and** maximal: every stopped thread's next receive has no
-//! matching unread send. Maximality reuses the explorer's own addability rule
-//! (scheduler.rs: a blocking receive is addable iff some unread send matches its
-//! predicate/destination; a non-blocking receive is always addable), so the two sides
-//! classify blocked vs extendable identically.
+//! It enumerates [[P]] by choosing, per thread, a maximal-prefix boundary (finished, or
+//! just before a blocking receive) and every rf assignment over the included receives. A
+//! receive's rf ranges over every send, plus nothing for a non-blocking receive - a
+//! blocking receive cannot read nothing, and no two non-blocking receives may read nothing
+//! at once, exactly as in the DPOR. A candidate is kept iff it is `must::consistent` and
+//! maximal. Maximality reuses the explorer's own addability rule (scheduler.rs), so the two
+//! sides classify blocked vs extendable identically.
 //!
-//! ## What is asserted, per generated program
+//! ## Asserted, per generated program
 //!
-//!   1. **Completeness + optimality of full executions.** The set of canonical keys of
-//!      the explorer's *full* executions equals the reference's full set.
-//!   2. **Completeness of the whole terminal set.** The set of canonical keys of the
-//!      explorer's *terminal* executions (full union blocked) equals the reference's
-//!      terminal set - this closes the earlier full-vs-blocked asymmetry: a
-//!      priority-independent blocked-classification or blocked-completeness bug now fails
-//!      the test.
-//!   3. **No duplicates.** Terminal canonical keys are pairwise distinct under every
-//!      priority permutation.
-//!   4. **Priority invariance.** The set of terminal canonical keys, and the (full,
-//!      blocked) counts, are identical across all priority permutations.
+//!   1. **Full executions** - the explorer's full canonical keys equal the reference's.
+//!   2. **Whole terminal set** - the explorer's terminal keys (full ∪ blocked) equal the
+//!      reference's; a blocked-classification or blocked-completeness bug fails here.
+//!   3. **No duplicates** - terminal keys are pairwise distinct under every priority.
+//!   4. **Priority invariance** - the terminal key set and (full, blocked) counts are
+//!      identical across all priority permutations.
 //!
-//! Both sides use the same `must::consistent` predicate: the fuzzer validates the
-//! *explorer* (its search completeness, optimality and terminal classification), not the
-//! consistency predicate itself (that is `consistency.rs`'s job). Programs are
-//! straight-line (value-independent), which is what makes the enumeration a valid oracle:
-//! every thread's event sequence is fixed, so the only freedom is the prefix boundary, the
-//! rf choice per receive, and the value of each nondet event - the reference
-//! enumerates the last as an extra independent radix dimension, since a nondet value never
-//! changes downstream events in a straight-line program.
+//! Both sides use the same `must::consistent`, so the fuzzer validates the *explorer*
+//! (search completeness, optimality, terminal classification), not the predicate itself
+//! (that is `consistency.rs`'s job). Straight-line programs make the enumeration a valid
+//! oracle: each thread's event sequence is fixed, so the only freedom is the prefix
+//! boundary, the rf choice per receive, and each nondet value.
 
 mod common;
 

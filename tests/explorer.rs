@@ -62,7 +62,7 @@ fn ssr_mock() -> SeqProgram {
 fn ssr_br_mock() -> SeqProgram {
     SeqProgram {
         threads: vec![
-            vec![send(0, "0"), recv()], // T0 sends to itself, then receives
+            vec![send(0, "0"), recv()],
             vec![send(3, "1")],
             vec![send(3, "2")],
             vec![recv()],
@@ -339,7 +339,6 @@ fn blocked_execution_via_runtime() {
             c.send(1, "a", Model::P2p);
         });
         sys.add(|c| async move {
-            // waits for "b", which is never sent
             let _ = c.recv(|x| x == "b").await;
         });
         sys
