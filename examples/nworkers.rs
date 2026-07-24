@@ -1,8 +1,8 @@
-//! Dump a `must-viz` trace of a small worker/coordinator run.
+//! Dump a JSON trace of a small worker/coordinator run.
 //!
 //! `cargo run --example nworkers -- [-n N] [-o out.trace.json] [--threads W]`
-//! Defaults: `-n 2 -o nworkers.trace.json --threads 1`. The trace loads directly in
-//! `must-viz/web`. Keep `--threads 1` for one clean depth-first log.
+//! Defaults: `-n 2 -o nworkers.trace.json --threads 1`. Keep `--threads 1` for one clean
+//! depth-first log.
 //!
 //! The program extends the `nworkers` model: `n` workers each report to a coordinator,
 //! which gathers them all, replies to `main`, then broadcasts "done" back to the workers.

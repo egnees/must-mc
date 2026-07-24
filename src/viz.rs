@@ -1,11 +1,19 @@
-//! Dumping a run for the `must-viz` web visualizer.
+//! Dumping a run as a JSON trace.
 //!
-//! [`TraceObserver`] is a [`Observer`](crate::Observer) that records every explorer
-//! callback as one JSON *step* carrying a full snapshot of the execution graph, producing
-//! a single document shaped exactly per `must-viz/TRACE_FORMAT.md` (version 1) — the
-//! contract shared with the web renderer. [`dump`](TraceObserver::dump) writes that
-//! document to any [`std::io::Write`] (a file, an in-memory buffer, a socket — anything
-//! playing the "writer"/output-stream role).
+//! [`TraceObserver`] is an [`Observer`] that records every explorer callback as one JSON
+//! *step* carrying a full snapshot of the execution graph, producing a single
+//! self-describing document that external tooling can replay or inspect.
+//! [`dump`](TraceObserver::dump) writes it to any [`std::io::Write`] — a file, an in-memory
+//! buffer, a socket.
+//!
+//! # Format
+//!
+//! ```text
+//! { "version": 1,
+//!   "meta":    { "program", "num_threads", "generator" },
+//!   "steps":   [ { "kind", ...fields, "graph" }, ... ],
+//!   "summary": { ...nine per-kind counts } }
+//! ```
 //!
 //! ```no_run
 //! use must::event::Model;
@@ -30,23 +38,18 @@
 //! footprint:
 //!
 //! - **Sharded by worker.** Each worker thread appends to its *own* buffer, chosen by the
-//!   same per-worker id [`CountingObserver`](crate::CountingObserver) uses. With at least
-//!   as many shards as workers (the default), two workers never touch the same shard, so
-//!   the per-shard lock is always uncontended — the hot path is a lock/serialize/unlock
-//!   with no cross-thread traffic.
-//! - **Streamed, not staged.** A callback serializes its step straight to compact JSON
-//!   bytes in the shard buffer. Nothing intermediate is kept: no `serde`, no owned mirror
-//!   structs, and — unlike [`RecordingObserver`](crate::RecordingObserver) — no clone of
-//!   the graph. Memory is the size of the finished trace text, nothing more.
-//! - **No format version-2 knobs.** The output is byte-for-byte the v1 shape the web app
-//!   validates; see `must-viz/TRACE_FORMAT.md`.
+//!   same per-worker id [`CountingObserver`](crate::CountingObserver) uses. With at least as
+//!   many shards as workers (the default), two workers never touch the same shard, so the
+//!   per-shard lock is always uncontended.
+//! - **Streamed, not staged.** A callback serializes its step straight to compact JSON bytes
+//!   in the shard buffer — no intermediate structures, and (unlike
+//!   [`RecordingObserver`](crate::RecordingObserver)) no clone of the graph. Memory is the
+//!   size of the finished trace text, nothing more.
 //!
 //! [`dump`](TraceObserver::dump) concatenates the shard buffers in worker order. A
-//! single-threaded run (the default) therefore yields one clean depth-first log, exactly
-//! what the renderer reconstructs the exploration tree from. A parallel run stays
-//! well-formed and complete, but its steps interleave the workers' subtrees (the same
-//! caveat [`RecordingObserver`](crate::RecordingObserver) carries) — run with
-//! `Config { threads: 1, .. }` when you want the animation to read as one search.
+//! single-threaded run (the default) yields one clean depth-first log; a parallel run stays
+//! well-formed but interleaves the workers' subtrees, so use a single thread when you want
+//! the trace to read as one search.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -58,8 +61,8 @@ use crate::explorer::{Execution, ExecutionKind};
 use crate::graph::ExecutionGraph;
 use crate::observer::{default_shards, worker_id, Observer};
 
-/// Trace format version this observer emits (`meta.version`); the web reader rejects any
-/// other value.
+/// Format version stamped into the trace's `meta.version`, so a consumer can reject an
+/// unfamiliar shape.
 const VERSION: u32 = 1;
 
 /// One worker's slice of the trace: the serialized steps it produced (each already
@@ -91,9 +94,8 @@ impl Shard {
     }
 }
 
-/// Per-kind step counts, matching `must-viz`'s `summary` object and the semantics of
-/// [`CountingObserver`](crate::CountingObserver). Summed across shards at dump time; the
-/// web reader checks these equal the per-kind step counts (spec rule 4).
+/// Per-kind step counts, mirroring [`CountingObserver`](crate::CountingObserver). Summed
+/// across shards at dump time and written as the trace's `summary` object.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Summary {
     pub events_added: usize,
@@ -121,8 +123,7 @@ impl Summary {
     }
 }
 
-/// A [`must::Observer`](crate::Observer) that dumps a whole `explore` run as a single
-/// `must-viz` trace document (`must-viz/TRACE_FORMAT.md`, version 1).
+/// An [`Observer`] that dumps a whole `explore` run as a single JSON trace document.
 ///
 /// Construct it with the verified program's name and its true thread count `N`, share it
 /// across the run (callbacks take `&self`), then [`dump`](Self::dump) the trace. See the
@@ -146,8 +147,8 @@ impl TraceObserver {
     /// exactly.
     ///
     /// `num_threads` must be the program's true thread count (typically
-    /// `Program::num_threads`): the spec requires every snapshot to carry exactly that many
-    /// thread lanes, and it must not be smaller than any graph the run produces.
+    /// `Program::num_threads`): every snapshot carries exactly that many thread lanes, so it
+    /// must not be smaller than any graph the run produces.
     pub fn new(program: impl Into<String>, num_threads: usize) -> Self {
         Self::with_shards(program, num_threads, default_shards())
     }
@@ -188,7 +189,7 @@ impl TraceObserver {
     }
 
     /// Write the whole trace, as compact JSON, to `w` (a file, an in-memory buffer, a
-    /// socket — any [`std::io::Write`]). The bytes are exactly the `must-viz` v1 shape.
+    /// socket — any [`std::io::Write`]).
     ///
     /// Call this after `explore` returns (every worker has joined, so the shards are
     /// complete). It streams the header, then each shard's buffer in worker order, then the
@@ -308,8 +309,7 @@ impl Observer for TraceObserver {
             |buf| {
                 // `g` is the pre-restriction graph (revisit.rs calls this before
                 // `restrict`), so every `deleted` event — including the revisiting send `s`,
-                // which survives — is still present in this snapshot, exactly as the spec's
-                // "backward_revisit" semantics require.
+                // which survives — is still present in this snapshot.
                 buf.extend_from_slice(br#"{"kind":"backward_revisit","r":"#);
                 push_eid(buf, r);
                 buf.extend_from_slice(br#","s":"#);
@@ -380,13 +380,11 @@ impl Observer for TraceObserver {
 
 // -- JSON writers ------------------------------------------------------------------
 //
-// Compact, allocation-light encoders matching serde_json's compact output byte for byte
-// (same escape set, no space, non-ASCII passed through), so a trace from this observer is
-// indistinguishable from one the standalone `must-trace` crate produced.
+// Compact, allocation-light encoders that write minimal JSON (no spaces, only the required
+// escapes, non-ASCII passed through), so the crate needs no JSON dependency.
 
-/// `,"graph":{"threads":[ ... ]}` — a full snapshot of `g` per the spec's "Graph" section:
-/// exactly `num_threads` lanes (empty arrays for threads with no events yet), each event in
-/// program order.
+/// `,"graph":{"threads":[ ... ]}` — a full snapshot of `g`: exactly `num_threads` lanes
+/// (empty arrays for threads with no events yet), each event in program order.
 fn push_graph_field(buf: &mut Vec<u8>, g: &ExecutionGraph, num_threads: usize) {
     debug_assert!(
         g.num_threads() <= num_threads,
@@ -416,9 +414,8 @@ fn push_graph_field(buf: &mut Vec<u8>, g: &ExecutionGraph, num_threads: usize) {
     buf.extend_from_slice(b"]}");
 }
 
-/// One graph event: `{"label":{..},"stamp":N}` plus, per the spec, `"rf"` on every recv
-/// (present, `null` = ⊥) and `"chosen"` on every nondet (present, `null` = not yet picked),
-/// and neither on sends/errors.
+/// One graph event: `{"label":{..},"stamp":N}` plus `"rf"` on every receive (`null` = ⊥)
+/// and `"chosen"` on every nondet (`null` = not yet picked); neither on sends or errors.
 fn push_event(buf: &mut Vec<u8>, g: &ExecutionGraph, e: EventId) {
     let label = g.label(e);
     buf.extend_from_slice(br#"{"label":"#);
@@ -442,8 +439,7 @@ fn push_event(buf: &mut Vec<u8>, g: &ExecutionGraph, e: EventId) {
     buf.push(b'}');
 }
 
-/// An event label, tagged by `"type"` (spec "Label"). Field order matches the spec's
-/// examples so the bytes read the same.
+/// An event label, tagged by `"type"`.
 fn push_label(buf: &mut Vec<u8>, label: &Label) {
     match label {
         Label::Send { model, dst, val } => {
@@ -480,7 +476,7 @@ fn push_label(buf: &mut Vec<u8>, label: &Label) {
     }
 }
 
-/// The nine `summary` counters, in the spec's field order.
+/// The nine `summary` counters.
 fn write_summary(buf: &mut Vec<u8>, s: &Summary) {
     let fields: [(&[u8], usize); 9] = [
         (b"events_added", s.events_added),
@@ -547,10 +543,10 @@ fn push_uint(buf: &mut Vec<u8>, mut n: u64) {
     buf.extend_from_slice(&tmp[i..]);
 }
 
-/// A JSON string literal, escaping exactly the set `serde_json` escapes: `"`, `\`, the
+/// A JSON string literal, escaping exactly what the JSON standard requires: `"`, `\`, the
 /// named control chars (`\b \t \n \f \r`), and any other `< 0x20` as `\u00XX`. Bytes
 /// `>= 0x80` pass through verbatim (valid UTF-8, never split — we iterate the original
-/// `&str`'s bytes), so non-ASCII payloads round-trip unchanged, matching serde_json.
+/// `&str`'s bytes), so non-ASCII payloads round-trip unchanged.
 fn push_json_str(buf: &mut Vec<u8>, s: &str) {
     buf.push(b'"');
     let bytes = s.as_bytes();
@@ -565,7 +561,7 @@ fn push_json_str(buf: &mut Vec<u8>, s: &str) {
             0x0c => b"\\f",
             0x0d => b"\\r",
             0x00..=0x1f => {
-                // Other control chars: \u00XX (two lowercase hex digits, as serde_json).
+                // Other control chars: \u00XX (two lowercase hex digits).
                 buf.extend_from_slice(&bytes[start..i]);
                 buf.extend_from_slice(b"\\u00");
                 buf.push(hex_digit(b >> 4));
@@ -604,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn json_string_escapes_match_serde_set() {
+    fn json_string_escaping() {
         let cases = [
             ("plain", r#""plain""#),
             ("a\"b", r#""a\"b""#),

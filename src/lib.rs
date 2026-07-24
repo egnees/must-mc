@@ -65,7 +65,7 @@
 //! - [`scheduler`]: the scheduling policy the explorer follows.
 //! - [`explorer`]: the exploration itself, [`explore`].
 //! - [`observer`] / [`render`]: inspecting and displaying a run.
-//! - [`viz`]: dumping a run as a `must-viz` JSON trace for the web visualizer.
+//! - [`viz`]: dumping a run as a JSON trace.
 
 pub mod consistency;
 pub mod event;

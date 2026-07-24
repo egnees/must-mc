@@ -1,10 +1,9 @@
 //! Conformance + thread-safety tests for [`must::viz::TraceObserver`].
 //!
 //! The library is dependency-free, so these tests carry their own tiny (std-only) JSON
-//! parser and an independent re-check of every rule in `must-viz/TRACE_FORMAT.md`
-//! (version 1). That validator is written against the *spec*, not against the observer's
-//! encoder, so a bug shared between the two could not hide — exactly the guarantee the
-//! standalone `must-trace` crate got from validating with `serde_json::Value`.
+//! parser and an independent re-check of every rule of the trace format produced by
+//! `src/viz.rs`. The validator is written against the format itself, not against the
+//! observer's encoder, so a bug shared between the two could not hide.
 
 use std::collections::BTreeSet;
 
@@ -226,10 +225,10 @@ fn utf8_len(lead: u8) -> usize {
 }
 
 // ===================================================================================
-// Independent validator against TRACE_FORMAT.md v1.
+// Independent validator for the trace format.
 // ===================================================================================
 
-/// Per-kind step tally, in the spec's summary field order.
+/// Per-kind step tally, in the trace's summary field order.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Counts {
     events_added: usize,
@@ -243,7 +242,7 @@ struct Counts {
     errors: usize,
 }
 
-/// Parse `json`, re-check every TRACE_FORMAT.md v1 rule, and return the (validated) step
+/// Parse `json`, re-check every trace-format rule, and return the (validated) step
 /// count so callers can assert coverage. Panics with a rule reference on any violation.
 fn validate(json: &str) -> usize {
     let root = Parser::parse(json);
@@ -680,8 +679,10 @@ fn dump_apis_agree() {
         "dump and dump_to_string agree byte-for-byte"
     );
 
-    let path =
-        std::env::temp_dir().join(format!("must-viz-test-{}.trace.json", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "must-mc-trace-test-{}.trace.json",
+        std::process::id()
+    ));
     obs.dump_to_file(&path).unwrap();
     let from_file = std::fs::read(&path).unwrap();
     std::fs::remove_file(&path).ok();
