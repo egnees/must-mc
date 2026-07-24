@@ -621,9 +621,9 @@ mod tests {
     fn empty_run_is_a_well_formed_empty_trace() {
         let obs = TraceObserver::new("empty", 2);
         let s = obs.dump_to_string();
-        assert_eq!(
-            s,
-            r#"{"version":1,"meta":{"program":"empty","num_threads":2,"generator":"must-mc 0.1.0"},"steps":[],"summary":{"events_added":0,"rf_choices":0,"inconsistent":0,"backward_revisits":0,"revisits_rejected":0,"threads_blocked":0,"full":0,"blocked":0,"errors":0}}"#
-        );
+        // `VERSION` stands in for the crate version so a version bump never breaks this.
+        let want = r#"{"version":1,"meta":{"program":"empty","num_threads":2,"generator":"must-mc VERSION"},"steps":[],"summary":{"events_added":0,"rf_choices":0,"inconsistent":0,"backward_revisits":0,"revisits_rejected":0,"threads_blocked":0,"full":0,"blocked":0,"errors":0}}"#
+            .replace("VERSION", env!("CARGO_PKG_VERSION"));
+        assert_eq!(s, want);
     }
 }
