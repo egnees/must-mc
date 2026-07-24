@@ -24,8 +24,8 @@ pub struct StoredEvent {
     /// [`reads_from`](ExecutionGraph::reads_from). `None` for every non-receive event and
     /// never read for them.
     rf: Option<EventId>,
-    /// The value a nondet event resolved to (Algorithm 1, line 6): `Some` once assigned,
-    /// `None` before assignment and for every non-nondet event.
+    /// The value a nondet event resolved to: `Some` once assigned, `None` before assignment
+    /// and for every non-nondet event.
     nd: Option<Val>,
 }
 
@@ -36,17 +36,15 @@ pub struct StoredEvent {
 /// sets valid.
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionGraph {
-    /// `threads[t]` holds the events of thread `t` in program order; the vector
-    /// index is the event's `idx`, so `po` is exactly the vector order. Each event carries
-    /// its own `rf`/`nd` inline (see [`StoredEvent`]). No inverse (read-by) map is cached:
-    /// `is_read`/`unread_sends` scan the events, which stays correct even through the
-    /// transient double-read states that arise during exploration.
+    /// `threads[t]` holds thread `t`'s events in program order, so the vector index is the
+    /// event's `idx` and `po` is exactly the vector order. Each event carries its `rf`/`nd`
+    /// inline. No inverse (read-by) map is cached; `is_read`/`unread_sends` scan the events,
+    /// which stays correct through the transient double-read states that exploration creates.
     ///
-    /// Each thread's vector sits behind an `Arc` with copy-on-write. Cloning a graph shares
-    /// the thread vectors (a refcount bump per thread); a mutation
-    /// (`add_event`/`set_rf`/`set_nd`) copies only the one thread it touches, and only while
-    /// that thread is still shared with another graph. This is what a child graph exploits:
-    /// it differs from its parent by a single appended event in one thread.
+    /// Each thread's vector sits behind a copy-on-write `Arc`: cloning a graph only bumps
+    /// refcounts, and a mutation copies just the one thread it touches, but only while that
+    /// thread is still shared. A child graph relies on this — it differs from its parent by a
+    /// single appended event in one thread.
     threads: Vec<Arc<Vec<StoredEvent>>>,
     /// Monotonic insertion counter; the next added event gets this stamp.
     next_stamp: u64,
@@ -139,8 +137,7 @@ impl ExecutionGraph {
         self.iter_events().any(|e| self.stored(e).rf == Some(s))
     }
 
-    /// Assign the chosen value `v` to nondet event `e` (Algorithm 1, line 6), replacing
-    /// any previous choice.
+    /// Assign the chosen value `v` to nondet event `e`, replacing any previous choice.
     pub fn set_nd(&mut self, e: EventId, v: Val) {
         debug_assert!(
             self.contains(e) && self.label(e).is_nondet(),
@@ -160,8 +157,7 @@ impl ExecutionGraph {
 
     /// All nondet events in `(tid, idx)` order.
     pub fn nondet_events(&self) -> Vec<EventId> {
-        self.all_events()
-            .into_iter()
+        self.iter_events()
             .filter(|&e| self.label(e).is_nondet())
             .collect()
     }
@@ -204,20 +200,14 @@ impl ExecutionGraph {
     }
 
     pub fn sends(&self) -> Vec<EventId> {
-        self.all_events()
-            .into_iter()
-            .filter(|&e| self.label(e).is_send())
-            .collect()
+        self.iter_sends().collect()
     }
 
     pub fn recvs(&self) -> Vec<EventId> {
-        self.all_events()
-            .into_iter()
-            .filter(|&e| self.label(e).is_recv())
-            .collect()
+        self.iter_recvs().collect()
     }
 
-    /// Unread sends `G.US`: sends no receive reads.
+    /// Sends that no receive reads.
     pub fn unread_sends(&self) -> Vec<EventId> {
         let read: BTreeSet<EventId> = self
             .iter_events()
@@ -229,8 +219,8 @@ impl ExecutionGraph {
             .collect()
     }
 
-    /// `matches(s, r)`: `mval` with destination, i.e. `dst(s) = tid(r)` and `val(s)` is
-    /// in `vals(r)`.
+    /// Whether send `s` matches receive `r`: `s`'s destination is `r`'s thread and `r`'s
+    /// predicate accepts `s`'s value.
     pub fn matches(&self, s: EventId, r: EventId) -> bool {
         let (Label::Send { dst, val, .. }, Label::Recv { pred, .. }) =
             (self.label(s), self.label(r))
@@ -555,8 +545,8 @@ mod tests {
 
     #[test]
     fn read_bookkeeping_survives_transient_double_read() {
-        // Regression: with a cached inverse map, set_rf(r2, Some(s)); set_rf(r2, None)
-        // used to erase the fact that r1 still reads s.
+        // A transient double-read (r2 points at s, then away) must not disturb the fact that
+        // r1 still reads s — read state is derived from the events, never cached.
         let mut g = ExecutionGraph::new();
         let s = g.add_event(0, Label::send(Model::P2p, 1, "1"));
         let r1 = g.add_event(1, Label::recv(Pred::any()));
