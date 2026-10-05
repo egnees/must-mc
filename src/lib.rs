@@ -87,9 +87,9 @@ pub use event::{Event, EventId, Label, Model, Pred, ReceiveTiming, Tid, Val, Win
 pub use explorer::{explore, CertifiedTimeConfig, Config, Execution, ExecutionKind, SourceOrder};
 pub use graph::ExecutionGraph;
 pub use observer::{
-    CountingObserver, DeadBranchDetector, ExecutionCollector, FrozenTimeEvent, FrozenTimeOutcome,
-    NullObserver, Observer, RecordingObserver, Step, StepKind, TimeCertificateEvent,
-    TimeCertificateOutcome,
+    CountingObserver, DeadBranchDetector, EventCountingObserver, ExecutionCollector,
+    FrozenTimeEvent, FrozenTimeOutcome, NullObserver, Observer, RecordingObserver, Step, StepKind,
+    TimeCertificateEvent, TimeCertificateOutcome,
 };
 pub use program::{Program, ThreadNext, TraceLabel};
 pub use runtime::{Ctx, NondetFuture, RecvFuture, RecvTimeoutFuture, System, DEFAULT_MAX_EVENTS};

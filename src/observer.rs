@@ -95,6 +95,48 @@ pub struct FrozenTimeEvent {
 
 /// Callbacks fired by the explorer. Every method defaults to a no-op.
 pub trait Observer {
+    /// Whether event-added notifications may be replaced by a final count.
+    /// Opt in only if event graphs, identities, ordering and intermediate counts
+    /// are unused. The explorer then flushes once on worker exit (also on unwind).
+    fn allows_buffered_events(&self) -> bool {
+        false
+    }
+    /// Final added-event count from one explorer worker. Opt-in implementations
+    /// must count it without panicking, including when called during unwinding.
+    fn on_events_added_batch(&self, _count: usize) {}
+    /// Whether structurally rejected RF trials contribute observable callbacks.
+    ///
+    /// Return `false` only when `on_rf_choice` and `on_inconsistent` ignore trials
+    /// whose source has the wrong destination or is already consumed. Those
+    /// universally inconsistent trials may then be omitted entirely. This is
+    /// stronger than ignoring their graph: metadata-counting observers must
+    /// retain the conservative default. Other source checks and bottom remain.
+    fn observes_rejected_rf_trials(&self) -> bool {
+        true
+    }
+
+    /// Whether RF-choice and inconsistency callbacks inspect or retain their graph.
+    ///
+    /// The conservative default preserves fully materialized trial graphs. Return
+    /// `false` only when both [`Self::on_rf_choice`] and [`Self::on_inconsistent`]
+    /// ignore the graph argument: rejected choices may then report their metadata
+    /// against a preceding trial or host graph, without storing the rejected RF
+    /// edge. Callback order and counts remain unchanged; accepted RF choices
+    /// still receive their actual graph.
+    fn inspects_rf_trial_graphs(&self) -> bool {
+        true
+    }
+
+    /// Whether candidate/arm-rejection callbacks inspect or retain their target graph.
+    /// Return `false` only when [`Self::on_revisit_candidate`] and
+    /// [`Self::on_revisit_arm_rejected`] ignore their `target` argument. Untimed
+    /// Asyn trials may then provide the host graph in its place and materialize
+    /// the target only when canonical checks accept the revisit. Their host graph,
+    /// event metadata, callback order and counts remain unchanged.
+    fn inspects_revisit_targets(&self) -> bool {
+        true
+    }
+
     /// A fresh event `e`, maximal in insertion order, was added to `g`.
     fn on_event_added(&self, _g: &ExecutionGraph, _e: EventId) {}
     /// Receive `r` was pointed at source `src` (`None` means no message) before a
@@ -271,12 +313,127 @@ pub(crate) fn default_shards() -> usize {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NullObserver;
 
-impl Observer for NullObserver {}
+impl Observer for NullObserver {
+    fn allows_buffered_events(&self) -> bool {
+        true
+    }
+    fn observes_rejected_rf_trials(&self) -> bool {
+        false
+    }
+    fn inspects_rf_trial_graphs(&self) -> bool {
+        false
+    }
+    fn inspects_revisit_targets(&self) -> bool {
+        false
+    }
+}
 
-/// One worker's tallies. Aligned to a cache line so two workers writing adjacent shards
-/// never trigger false sharing; each shard is written by a single thread, so its atomics
-/// are always uncontended.
-#[repr(align(64))]
+// 128-byte padding also separates adjacent worker counters on Apple CPUs with
+// 128-byte cache lines; on 64-byte-line CPUs the extra padding is conservative.
+#[repr(align(128))]
+#[derive(Debug, Default)]
+struct EventShard {
+    events_added: AtomicUsize,
+    full: AtomicUsize,
+    blocked: AtomicUsize,
+    errors: AtomicUsize,
+}
+
+/// Counts added events and reported terminal outcomes, leaving trial diagnostics
+/// disabled. Shards use atomic counters even when several workers share a shard.
+#[derive(Debug)]
+pub struct EventCountingObserver {
+    shards: Vec<EventShard>,
+    buffered_events: bool,
+}
+
+impl Default for EventCountingObserver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventCountingObserver {
+    pub fn new() -> Self {
+        Self::with_shards(default_shards())
+    }
+    /// Use at least one shard; collisions remain safe through atomic increments.
+    pub fn with_shards(shards: usize) -> Self {
+        Self {
+            shards: (0..shards.max(1)).map(|_| EventShard::default()).collect(),
+            buffered_events: false,
+        }
+    }
+    /// Count added events locally in each explorer worker and flush on exit.
+    /// `events_added()` may lag throughout a run, including inside execution
+    /// callbacks; it is complete after `explore` returns. Terminal counts keep
+    /// their usual immediate behavior. Conservative tuple partners retain the
+    /// ordinary per-event notifications.
+    pub fn with_buffered_events(mut self) -> Self {
+        self.buffered_events = true;
+        self
+    }
+    fn shard(&self) -> &EventShard {
+        &self.shards[worker_id() % self.shards.len()]
+    }
+    fn total(&self, pick: impl Fn(&EventShard) -> &AtomicUsize) -> usize {
+        self.shards
+            .iter()
+            .map(|s| pick(s).load(Ordering::Relaxed))
+            .sum()
+    }
+    pub fn events_added(&self) -> usize {
+        self.total(|s| &s.events_added)
+    }
+    pub fn full(&self) -> usize {
+        self.total(|s| &s.full)
+    }
+    pub fn blocked(&self) -> usize {
+        self.total(|s| &s.blocked)
+    }
+    pub fn errors(&self) -> usize {
+        self.total(|s| &s.errors)
+    }
+    pub fn terminal(&self) -> usize {
+        self.full() + self.blocked()
+    }
+}
+
+impl Observer for EventCountingObserver {
+    fn allows_buffered_events(&self) -> bool {
+        self.buffered_events
+    }
+    fn on_events_added_batch(&self, count: usize) {
+        self.shard()
+            .events_added
+            .fetch_add(count, Ordering::Relaxed);
+    }
+    fn observes_rejected_rf_trials(&self) -> bool {
+        false
+    }
+    fn inspects_rf_trial_graphs(&self) -> bool {
+        false
+    }
+    fn inspects_revisit_targets(&self) -> bool {
+        false
+    }
+    fn on_event_added(&self, _g: &ExecutionGraph, _e: EventId) {
+        self.shard().events_added.fetch_add(1, Ordering::Relaxed);
+    }
+    fn on_execution(&self, _exec: &Execution, kind: ExecutionKind) {
+        let shard = self.shard();
+        match kind {
+            ExecutionKind::Full => &shard.full,
+            ExecutionKind::Blocked => &shard.blocked,
+            ExecutionKind::Error => &shard.errors,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One worker's tallies. 128-byte alignment separates adjacent shards even on
+/// CPUs with 128-byte cache lines. Atomics also keep shard collisions safe.
+#[repr(align(128))]
 #[derive(Debug, Default)]
 struct Shard {
     events_added: AtomicUsize,
@@ -508,6 +665,12 @@ impl CountingObserver {
 }
 
 impl Observer for CountingObserver {
+    fn inspects_rf_trial_graphs(&self) -> bool {
+        false
+    }
+    fn inspects_revisit_targets(&self) -> bool {
+        false
+    }
     fn on_frozen_time(&self, _g: &ExecutionGraph, event: &FrozenTimeEvent) {
         let shard = self.shard();
         shard.frozen_checks.fetch_add(1, Ordering::Relaxed);
@@ -931,6 +1094,22 @@ impl Observer for DeadBranchDetector {
 
 /// Compose two observers: every callback fans out to both, `A` before `B`.
 impl<A: Observer, B: Observer> Observer for (A, B) {
+    fn allows_buffered_events(&self) -> bool {
+        self.0.allows_buffered_events() && self.1.allows_buffered_events()
+    }
+    fn on_events_added_batch(&self, count: usize) {
+        self.0.on_events_added_batch(count);
+        self.1.on_events_added_batch(count);
+    }
+    fn observes_rejected_rf_trials(&self) -> bool {
+        self.0.observes_rejected_rf_trials() || self.1.observes_rejected_rf_trials()
+    }
+    fn inspects_rf_trial_graphs(&self) -> bool {
+        self.0.inspects_rf_trial_graphs() || self.1.inspects_rf_trial_graphs()
+    }
+    fn inspects_revisit_targets(&self) -> bool {
+        self.0.inspects_revisit_targets() || self.1.inspects_revisit_targets()
+    }
     fn on_frozen_time(&self, g: &ExecutionGraph, event: &FrozenTimeEvent) {
         self.0.on_frozen_time(g, event);
         self.1.on_frozen_time(g, event);
