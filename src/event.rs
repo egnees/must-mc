@@ -34,14 +34,15 @@ impl fmt::Display for Model {
     }
 }
 
-/// Delivery window `[lo, hi]` (closed) of a send: its message arrives at some time in
-/// `occ(s) + [lo, hi]` (see the time-intervals extension). `hi = None` is ∞ (no upper
+/// Relative time window `[lo, hi]` (closed), used for message delivery and timed receives.
+/// A send's message arrives at some time in `occ(s) + [lo, hi]` (see the time-intervals
+/// extension). `hi = None` is ∞ (no upper
 /// bound). Fields are private, so every `Window` is well-formed by construction
 /// (`lo <= hi`, bounds `<= MAX_BOUND`) — the only ways to build one validate.
 ///
 /// The default [`ASAP`](Self::ASAP) `= [0, ∞)` is the window of every ordinary
-/// [`Label::send`]; a graph whose sends all carry `ASAP` is *untimed* and stays
-/// byte-identical to the pre-window key/label format everywhere.
+/// [`Label::send`]. An ordinary send retains its pre-window key/label format. An
+/// explicitly timed receive remains timed even when its window is `ASAP`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Window {
     lo: u64,
@@ -103,6 +104,48 @@ impl fmt::Display for Window {
     }
 }
 
+/// Timing contract of a receive. The outcome remains a reads-from edge (or no message);
+/// the chosen completion time is a verifier witness, not an additional program value.
+/// Equal-time actions may race, subject to causal and communication-model order.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum ReceiveTiming {
+    /// Existing receive semantics. A blocking receive waits eagerly; a nonblocking
+    /// receive has no timing constraint and does not advance the process clock.
+    #[default]
+    Abstract,
+    /// The timeout fires within this window after invocation. Success may occur before
+    /// the lower bound, but must occur no later than the upper bound. Both outcomes
+    /// advance the process clock to completion.
+    Timeout(Window),
+    /// Check the mailbox at a time in this window after invocation. Both success and
+    /// empty completion lie in the window and advance the process clock.
+    Poll(Window),
+}
+
+impl ReceiveTiming {
+    /// The explicit receive window, or `None` for the existing abstract contract.
+    pub fn window(self) -> Option<Window> {
+        match self {
+            Self::Abstract => None,
+            Self::Timeout(window) | Self::Poll(window) => Some(window),
+        }
+    }
+
+    pub fn is_timed(self) -> bool {
+        !matches!(self, Self::Abstract)
+    }
+}
+
+impl fmt::Display for ReceiveTiming {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Abstract => f.write_str("abstract"),
+            Self::Timeout(window) => write!(f, "timeout{window}"),
+            Self::Poll(window) => write!(f, "poll{window}"),
+        }
+    }
+}
+
 /// Predicate of a selective receive. `vals(r)` from Definition 3.1 is the set of values
 /// accepted by `test`; `repr` is a human-readable tag used for `Debug`/`Display` and for
 /// the canonical key of a graph.
@@ -132,6 +175,24 @@ impl Pred {
         Pred {
             repr: Arc::from(repr.into()),
             test: Arc::new(test),
+            eq_target: None,
+        }
+    }
+
+    /// [`new`](Self::new) for a caller that already holds the tag and a boxed closure — the
+    /// replay driver, which re-creates the same predicate on every single replay.
+    ///
+    /// Two allocations disappear per emitted receive: the tag is a shared `Arc<str>` rather
+    /// than a fresh `format!`, and the closure moves straight into the `Arc` instead of
+    /// being wrapped as `Arc<Box<dyn Fn>>` (which also costs a second indirection on every
+    /// `test`). The resulting `Pred` is indistinguishable from `Pred::new(tag, closure)`.
+    pub(crate) fn from_boxed(
+        repr: Arc<str>,
+        test: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    ) -> Self {
+        Pred {
+            repr,
+            test: Arc::from(test),
             eq_target: None,
         }
     }
@@ -212,6 +273,9 @@ pub enum Label {
     Recv {
         pred: Arc<Pred>,
         blocking: bool,
+        /// Explicit timeout/poll contracts are nonblocking in MUST: an empty outcome
+        /// completes the operation. Use the constructors to keep this invariant.
+        timing: ReceiveTiming,
     },
     /// Data non-determinism ND (Algorithm 1, lines 6 and 19). `set` is the finite option
     /// set `S`, kept sorted and deduplicated so `min(S) = set[0]` and enumeration is
@@ -250,6 +314,7 @@ impl Label {
         Label::Recv {
             pred: Arc::new(pred),
             blocking: true,
+            timing: ReceiveTiming::Abstract,
         }
     }
 
@@ -258,6 +323,27 @@ impl Label {
         Label::Recv {
             pred: Arc::new(pred),
             blocking: false,
+            timing: ReceiveTiming::Abstract,
+        }
+    }
+
+    /// Eager receive with a timeout window. Success can precede `window.lo()`; empty
+    /// completion lies inside the window. Either outcome advances the local clock.
+    pub fn recv_timeout_timed(pred: Pred, window: Window) -> Self {
+        Label::Recv {
+            pred: Arc::new(pred),
+            blocking: false,
+            timing: ReceiveTiming::Timeout(window),
+        }
+    }
+
+    /// Check the mailbox within a polling window. Both success and empty completion
+    /// lie inside the window, and either outcome advances the local clock.
+    pub fn recv_poll_timed(pred: Pred, window: Window) -> Self {
+        Label::Recv {
+            pred: Arc::new(pred),
+            blocking: false,
+            timing: ReceiveTiming::Poll(window),
         }
     }
 
@@ -289,6 +375,9 @@ impl Label {
     }
     pub fn is_recv(&self) -> bool {
         matches!(self, Label::Recv { .. })
+    }
+    pub fn is_timed_recv(&self) -> bool {
+        self.receive_timing().is_some_and(ReceiveTiming::is_timed)
     }
     pub fn is_nondet(&self) -> bool {
         matches!(self, Label::Nondet { .. })
@@ -342,6 +431,14 @@ impl Label {
     pub fn blocking(&self) -> Option<bool> {
         match self {
             Label::Recv { blocking, .. } => Some(*blocking),
+            _ => None,
+        }
+    }
+    /// A receive's timing contract (`None` for non-receives). Unlike send
+    /// [`window`](Self::window), explicit `ASAP` receive windows are still timed.
+    pub fn receive_timing(&self) -> Option<ReceiveTiming> {
+        match self {
+            Label::Recv { timing, .. } => Some(*timing),
             _ => None,
         }
     }

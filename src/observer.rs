@@ -26,6 +26,73 @@ use crate::event::{EventId, Label, Tid, Val};
 use crate::explorer::{Execution, ExecutionKind};
 use crate::graph::ExecutionGraph;
 
+/// Outcome of one certificate-pruning attempt. Only `Pruned` changes exploration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeCertificateOutcome {
+    CompletionUnknown,
+    CompletionWitness,
+    OwnershipUnknown,
+    Pruned,
+}
+
+/// Diagnostic cost of semantic lookahead and construction-coverage checking.
+/// Counts include proof work that was inconclusive. They are separate from main Visits
+/// and reported executions; proof search never invokes execution callbacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeCertificateEvent {
+    pub outcome: TimeCertificateOutcome,
+    pub completion_states: usize,
+    pub completion_events: usize,
+    pub completion_cases: usize,
+    pub completion_temporal_checks: usize,
+    pub ownership_states: usize,
+    pub ownership_events: usize,
+    pub ownership_temporal_checks: usize,
+    pub revisit_candidates: usize,
+    pub canonical_checks: usize,
+}
+
+/// Result of checking the immutable part of an original-MUST construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrozenTimeOutcome {
+    /// The graph is outside the supported Asyn/P2p fragment.
+    Unsupported,
+    /// No contradiction was certified; ordinary exploration continues.
+    Feasible,
+    /// An immutable-core or first-alteration sender certificate rejects the subtree.
+    Pruned,
+}
+
+/// Cost of one immutable-core and first-alteration sender check. Separate from future-completion and
+/// no-escape proof walks. A solver call is a query, not one internal solver step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrozenTimeEvent {
+    pub outcome: FrozenTimeOutcome,
+    pub cache_hit: bool,
+    pub solver_calls: usize,
+    /// Number of immutable events in this query's core.
+    pub core_events: usize,
+    /// Deterministic effects appended to the proof graph, never to the search graph.
+    pub mandatory_events: usize,
+    /// Full untimed consistency trials used to establish blocking-receive anchors.
+    pub blocker_trials: usize,
+    pub program_steps: usize,
+    /// Attempts to refute every possible sender of a first change to the old graph.
+    pub source_checks: usize,
+    /// Subset of Pruned outcomes certified by the first-alteration sender rule.
+    pub source_prunes: usize,
+    /// Temporal queries for the old graph and sender causal cores.
+    pub source_solver_calls: usize,
+    /// Sum of event counts across those temporal query graphs.
+    pub source_core_events: usize,
+    /// Program calls to determine which old thread traces have finished.
+    pub source_program_steps: usize,
+    /// Unfinished sender obligations inspected; no future execution states are enumerated.
+    pub source_tails: usize,
+    /// Sound future-alphabet queries used to exclude processes that cannot send.
+    pub source_future_queries: usize,
+}
+
 /// Callbacks fired by the explorer. Every method defaults to a no-op.
 pub trait Observer {
     /// A fresh event `e`, maximal in insertion order, was added to `g`.
@@ -47,10 +114,48 @@ pub trait Observer {
     }
     /// A candidate backward revisit setting `rf(r)` to `s` was rejected.
     fn on_revisit_rejected(&self, _g: &ExecutionGraph, _r: EventId, _s: EventId) {}
-    /// A backward revisit setting `rf(r)` to `s` passed `RevisitCondition` but was pruned by the
-    /// eager-time forced-closure gate (`Config::time_predicate`, T2_PLAN §2c line 13): its
-    /// obligatory continuation is eager-infeasible. A diagnostic hook only — it does not change
-    /// any count.
+    /// A backward-revisit target passed consistency and any enabled time gate, and its
+    /// canonical arms are about to be checked. `g` is the send-add host; `target` is the
+    /// restricted graph with `r` redirected to `s`. Diagnostic-only, with no graph cloning
+    /// or extra oracle work unless the observer requests it.
+    fn on_revisit_candidate(
+        &self,
+        _g: &ExecutionGraph,
+        _r: EventId,
+        _s: EventId,
+        _target: &ExecutionGraph,
+    ) {
+    }
+    /// A canonical condition rejected the candidate. For ordinary arms, this identifies
+    /// the first false arm; preceding oracle callbacks identify any smaller viable
+    /// alternative. A certified-owner rejection first emits `on_revisit_owner_certified`
+    /// and reports the victim receive here. Other arms can reject for structural or
+    /// candidate-membership reasons.
+    fn on_revisit_arm_rejected(
+        &self,
+        _g: &ExecutionGraph,
+        _r: EventId,
+        _s: EventId,
+        _target: &ExecutionGraph,
+        _event: EventId,
+    ) {
+    }
+    /// An alternate canonical owner was certified by replay from the root. `owner` has
+    /// the exact insertion order required to produce the same restricted target state.
+    /// This certificate rejects the current redundant backward edge; it is not a general
+    /// completeness certificate for T2. `replay_events` is the number of replayed events.
+    fn on_revisit_owner_certified(
+        &self,
+        _g: &ExecutionGraph,
+        _r: EventId,
+        _s: EventId,
+        _owner: &ExecutionGraph,
+        _replay_events: usize,
+    ) {
+    }
+    /// A backward revisit setting `rf(r)` to `s` was pruned by the eager-time forced-closure
+    /// gate. This check runs before the canonical arms, so it does not imply they passed.
+    /// A diagnostic hook only — it does not change any count.
     fn on_forced_closure_pruned(&self, _g: &ExecutionGraph, _r: EventId, _s: EventId) {}
     /// The nondet-arm existential canon oracle ([`crate::time::viable`], T2_ORACLE_SPEC §1.1)
     /// returned `verdict` for re-pinning `ep` to `v` in `base` while testing the revisit by the
@@ -65,6 +170,20 @@ pub trait Observer {
         _base: &ExecutionGraph,
         _ep: EventId,
         _v: Val,
+        _revisiting: EventId,
+        _rev_label: &Label,
+        _verdict: bool,
+    ) {
+    }
+    /// Debug-only held-value query for a nonminimum nondeterministic canonical arm.
+    /// Unlike `on_viable_verdict`, this is a diagnostic, not a smaller alternative used
+    /// to reject a holder. A false answer is possible on an infeasible send-add host or
+    /// a candidate later rejected by another arm; it must not abort the main search.
+    fn on_held_viable_verdict(
+        &self,
+        _base: &ExecutionGraph,
+        _ep: EventId,
+        _value: Val,
         _revisiting: EventId,
         _rev_label: &Label,
         _verdict: bool,
@@ -87,14 +206,22 @@ pub trait Observer {
     }
     /// A Visit node `Visit_P(G)` is being entered (once per `visit_step` call). Paired with
     /// [`on_visit_exit`](Self::on_visit_exit). The dead-branch detector (T2_PLAN §5а) uses this
-    /// to count Visit nodes and, via `on_visit_exit`'s flag, those whose subtree bore no
-    /// terminal (an optimality-(b) violation under the time predicate).
+    /// to count examined nodes, including certificate-cut boundaries, and via
+    /// `on_visit_exit`'s flag those whose subtree bore no accepted terminal.
     fn on_visit_enter(&self, _g: &ExecutionGraph) {}
     /// The Visit node entered with [`on_visit_enter`](Self::on_visit_enter) is done;
     /// `produced_terminal` is whether its subtree reported at least one terminal. Reliable only
     /// on the sequential path (a donated subtree records on another worker), which is where the
     /// dead-branch detector runs.
     fn on_visit_exit(&self, _g: &ExecutionGraph, _produced_terminal: bool) {}
+    /// Certificate check before expanding a main Visit. `Pruned` means both semantic
+    /// impossibility and absence of escaping canonical revisits were certified.
+    fn on_time_certificate(&self, _g: &ExecutionGraph, _event: &TimeCertificateEvent) {}
+    /// Immutable-core timing check before expanding a main Visit. A pruning result
+    /// preserves every time-valid terminal of original MUST. It either refutes an
+    /// obligatory core or every possible first repairing sender. Mandatory effects
+    /// need only occur in terminal completions, not every prefix.
+    fn on_frozen_time(&self, _g: &ExecutionGraph, _event: &FrozenTimeEvent) {}
     /// A terminal execution (full / blocked / error) was reached.
     fn on_execution(&self, _exec: &Execution, _kind: ExecutionKind) {}
     /// A terminal suppressed by the eager time filter (`Config::time_filter`): the graph is
@@ -158,6 +285,33 @@ struct Shard {
     filtered_blocked: AtomicUsize,
     filtered_errors: AtomicUsize,
     threads_blocked: AtomicUsize,
+    time_certificate_checks: AtomicUsize,
+    time_certificate_prunes: AtomicUsize,
+    time_certificate_unknown: AtomicUsize,
+    time_completion_states: AtomicUsize,
+    time_completion_events: AtomicUsize,
+    time_completion_cases: AtomicUsize,
+    time_ownership_states: AtomicUsize,
+    time_ownership_events: AtomicUsize,
+    time_revisit_candidates: AtomicUsize,
+    time_canonical_checks: AtomicUsize,
+    time_proof_temporal_checks: AtomicUsize,
+    frozen_checks: AtomicUsize,
+    frozen_prunes: AtomicUsize,
+    frozen_unsupported: AtomicUsize,
+    frozen_cache_hits: AtomicUsize,
+    frozen_solver_calls: AtomicUsize,
+    frozen_core_events: AtomicUsize,
+    frozen_mandatory_events: AtomicUsize,
+    frozen_blocker_trials: AtomicUsize,
+    frozen_program_steps: AtomicUsize,
+    frozen_source_checks: AtomicUsize,
+    frozen_source_prunes: AtomicUsize,
+    frozen_source_solver_calls: AtomicUsize,
+    frozen_source_core_events: AtomicUsize,
+    frozen_source_program_steps: AtomicUsize,
+    frozen_source_tails: AtomicUsize,
+    frozen_source_future_queries: AtomicUsize,
 }
 
 /// Running totals of every callback, sharded per worker so counting adds no cross-thread
@@ -245,6 +399,96 @@ impl CountingObserver {
         self.total(|s| &s.threads_blocked)
     }
 
+    pub fn time_certificate_checks(&self) -> usize {
+        self.total(|s| &s.time_certificate_checks) + self.frozen_checks()
+    }
+    pub fn time_certificate_prunes(&self) -> usize {
+        self.total(|s| &s.time_certificate_prunes) + self.frozen_prunes()
+    }
+    pub fn time_certificate_unknown(&self) -> usize {
+        self.total(|s| &s.time_certificate_unknown) + self.frozen_unsupported()
+    }
+    pub fn time_completion_states(&self) -> usize {
+        self.total(|s| &s.time_completion_states)
+    }
+    pub fn time_completion_events(&self) -> usize {
+        self.total(|s| &s.time_completion_events)
+    }
+    pub fn time_completion_cases(&self) -> usize {
+        self.total(|s| &s.time_completion_cases)
+    }
+    pub fn time_ownership_states(&self) -> usize {
+        self.total(|s| &s.time_ownership_states)
+    }
+    pub fn time_ownership_events(&self) -> usize {
+        self.total(|s| &s.time_ownership_events)
+    }
+    pub fn time_revisit_candidates(&self) -> usize {
+        self.total(|s| &s.time_revisit_candidates)
+    }
+    pub fn time_canonical_checks(&self) -> usize {
+        self.total(|s| &s.time_canonical_checks)
+    }
+    /// Temporal feasibility queries in both proof layers, including unsuccessful attempts.
+    /// This counts queries, not the internal work of the disjunctive solver.
+    pub fn time_proof_temporal_checks(&self) -> usize {
+        self.total(|s| &s.time_proof_temporal_checks)
+            + self.frozen_solver_calls()
+            + self.frozen_source_solver_calls()
+    }
+
+    pub fn frozen_checks(&self) -> usize {
+        self.total(|s| &s.frozen_checks)
+    }
+    pub fn frozen_prunes(&self) -> usize {
+        self.total(|s| &s.frozen_prunes)
+    }
+    pub fn frozen_unsupported(&self) -> usize {
+        self.total(|s| &s.frozen_unsupported)
+    }
+    pub fn frozen_cache_hits(&self) -> usize {
+        self.total(|s| &s.frozen_cache_hits)
+    }
+    pub fn frozen_solver_calls(&self) -> usize {
+        self.total(|s| &s.frozen_solver_calls)
+    }
+    /// Sum of core sizes at actual solver queries, excluding cache hits.
+    pub fn frozen_core_events(&self) -> usize {
+        self.total(|s| &s.frozen_core_events)
+    }
+    pub fn frozen_mandatory_events(&self) -> usize {
+        self.total(|s| &s.frozen_mandatory_events)
+    }
+    pub fn frozen_blocker_trials(&self) -> usize {
+        self.total(|s| &s.frozen_blocker_trials)
+    }
+    pub fn frozen_program_steps(&self) -> usize {
+        self.total(|s| &s.frozen_program_steps)
+    }
+
+    pub fn frozen_source_checks(&self) -> usize {
+        self.total(|s| &s.frozen_source_checks)
+    }
+    pub fn frozen_source_prunes(&self) -> usize {
+        self.total(|s| &s.frozen_source_prunes)
+    }
+    pub fn frozen_source_solver_calls(&self) -> usize {
+        self.total(|s| &s.frozen_source_solver_calls)
+    }
+    pub fn frozen_source_core_events(&self) -> usize {
+        self.total(|s| &s.frozen_source_core_events)
+    }
+    pub fn frozen_source_program_steps(&self) -> usize {
+        self.total(|s| &s.frozen_source_program_steps)
+    }
+    pub fn frozen_source_tails(&self) -> usize {
+        self.total(|s| &s.frozen_source_tails)
+    }
+
+    pub fn frozen_source_future_queries(&self) -> usize {
+        self.total(|s| &s.frozen_source_future_queries)
+    }
+
     /// Total terminal executions (full + blocked).
     pub fn terminal(&self) -> usize {
         self.full() + self.blocked()
@@ -252,6 +496,105 @@ impl CountingObserver {
 }
 
 impl Observer for CountingObserver {
+    fn on_frozen_time(&self, _g: &ExecutionGraph, event: &FrozenTimeEvent) {
+        let shard = self.shard();
+        shard.frozen_checks.fetch_add(1, Ordering::Relaxed);
+        match event.outcome {
+            FrozenTimeOutcome::Pruned => {
+                shard.frozen_prunes.fetch_add(1, Ordering::Relaxed);
+            }
+            FrozenTimeOutcome::Unsupported => {
+                shard.frozen_unsupported.fetch_add(1, Ordering::Relaxed);
+            }
+            FrozenTimeOutcome::Feasible => {}
+        }
+        shard
+            .frozen_cache_hits
+            .fetch_add(usize::from(event.cache_hit), Ordering::Relaxed);
+        shard
+            .frozen_solver_calls
+            .fetch_add(event.solver_calls, Ordering::Relaxed);
+        if event.solver_calls != 0 {
+            shard
+                .frozen_core_events
+                .fetch_add(event.core_events, Ordering::Relaxed);
+        }
+        shard
+            .frozen_mandatory_events
+            .fetch_add(event.mandatory_events, Ordering::Relaxed);
+        shard
+            .frozen_blocker_trials
+            .fetch_add(event.blocker_trials, Ordering::Relaxed);
+        shard
+            .frozen_program_steps
+            .fetch_add(event.program_steps, Ordering::Relaxed);
+        shard
+            .frozen_source_checks
+            .fetch_add(event.source_checks, Ordering::Relaxed);
+        shard
+            .frozen_source_prunes
+            .fetch_add(event.source_prunes, Ordering::Relaxed);
+        shard
+            .frozen_source_solver_calls
+            .fetch_add(event.source_solver_calls, Ordering::Relaxed);
+        shard
+            .frozen_source_core_events
+            .fetch_add(event.source_core_events, Ordering::Relaxed);
+        shard
+            .frozen_source_program_steps
+            .fetch_add(event.source_program_steps, Ordering::Relaxed);
+        shard
+            .frozen_source_tails
+            .fetch_add(event.source_tails, Ordering::Relaxed);
+        shard
+            .frozen_source_future_queries
+            .fetch_add(event.source_future_queries, Ordering::Relaxed);
+    }
+    fn on_time_certificate(&self, _g: &ExecutionGraph, event: &TimeCertificateEvent) {
+        let shard = self.shard();
+        shard
+            .time_certificate_checks
+            .fetch_add(1, Ordering::Relaxed);
+        match event.outcome {
+            TimeCertificateOutcome::Pruned => {
+                shard
+                    .time_certificate_prunes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            TimeCertificateOutcome::CompletionUnknown
+            | TimeCertificateOutcome::OwnershipUnknown => {
+                shard
+                    .time_certificate_unknown
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            TimeCertificateOutcome::CompletionWitness => {}
+        }
+        shard
+            .time_completion_states
+            .fetch_add(event.completion_states, Ordering::Relaxed);
+        shard
+            .time_completion_events
+            .fetch_add(event.completion_events, Ordering::Relaxed);
+        shard
+            .time_completion_cases
+            .fetch_add(event.completion_cases, Ordering::Relaxed);
+        shard
+            .time_ownership_states
+            .fetch_add(event.ownership_states, Ordering::Relaxed);
+        shard
+            .time_ownership_events
+            .fetch_add(event.ownership_events, Ordering::Relaxed);
+        shard
+            .time_revisit_candidates
+            .fetch_add(event.revisit_candidates, Ordering::Relaxed);
+        shard
+            .time_canonical_checks
+            .fetch_add(event.canonical_checks, Ordering::Relaxed);
+        shard.time_proof_temporal_checks.fetch_add(
+            event.completion_temporal_checks + event.ownership_temporal_checks,
+            Ordering::Relaxed,
+        );
+    }
     fn on_event_added(&self, _g: &ExecutionGraph, _e: EventId) {
         self.shard().events_added.fetch_add(1, Ordering::Relaxed);
     }
@@ -535,12 +878,10 @@ impl Observer for ExecutionCollector {
     }
 }
 
-/// Dead-branch detector for the eager-time predicate search (T2_PLAN §5а): the direct test
-/// replacing the unproven optimality-(b) lemma. It counts every Visit node and those whose
-/// subtree bore **no** terminal — an optimality violation (a fruitless Visit). On a program
-/// whose `possible_future` is exact (`SeqProgram`), `forced_closure` is exact, so there must be
-/// **zero** dead branches; a coroutine runtime (`possible_future = None`) may leave residual dead
-/// branches (a performance, not correctness, matter — measure, do not hard-fail).
+/// Counts every examined Visit, including certificate-pruned boundaries, and those whose
+/// explored subtree produced **no accepted terminal**. The latter is the measured barren
+/// work of that construction, not a claim that the graph has no semantic continuation.
+/// Solver alternatives and temporary proof graphs are separate work, not Visit nodes.
 ///
 /// Sequential runs only: `on_visit_exit`'s `produced_terminal` is unreliable under parallelism
 /// (a donated subtree records on another worker), so use a single thread.
@@ -558,7 +899,7 @@ impl DeadBranchDetector {
     pub fn visits(&self) -> usize {
         self.visits.load(Ordering::Relaxed)
     }
-    /// Visit nodes whose subtree produced no terminal (must be 0 when `forced_closure` is exact).
+    /// Visit nodes whose explored subtree produced no accepted terminal.
     pub fn dead(&self) -> usize {
         self.dead.load(Ordering::Relaxed)
     }
@@ -575,6 +916,10 @@ impl Observer for DeadBranchDetector {
 
 /// Compose two observers: every callback fans out to both, `A` before `B`.
 impl<A: Observer, B: Observer> Observer for (A, B) {
+    fn on_frozen_time(&self, g: &ExecutionGraph, event: &FrozenTimeEvent) {
+        self.0.on_frozen_time(g, event);
+        self.1.on_frozen_time(g, event);
+    }
     fn on_event_added(&self, g: &ExecutionGraph, e: EventId) {
         self.0.on_event_added(g, e);
         self.1.on_event_added(g, e);
@@ -601,6 +946,40 @@ impl<A: Observer, B: Observer> Observer for (A, B) {
         self.0.on_revisit_rejected(g, r, s);
         self.1.on_revisit_rejected(g, r, s);
     }
+    fn on_revisit_candidate(
+        &self,
+        g: &ExecutionGraph,
+        r: EventId,
+        s: EventId,
+        target: &ExecutionGraph,
+    ) {
+        self.0.on_revisit_candidate(g, r, s, target);
+        self.1.on_revisit_candidate(g, r, s, target);
+    }
+    fn on_revisit_arm_rejected(
+        &self,
+        g: &ExecutionGraph,
+        r: EventId,
+        s: EventId,
+        target: &ExecutionGraph,
+        event: EventId,
+    ) {
+        self.0.on_revisit_arm_rejected(g, r, s, target, event);
+        self.1.on_revisit_arm_rejected(g, r, s, target, event);
+    }
+    fn on_revisit_owner_certified(
+        &self,
+        g: &ExecutionGraph,
+        r: EventId,
+        s: EventId,
+        owner: &ExecutionGraph,
+        replay_events: usize,
+    ) {
+        self.0
+            .on_revisit_owner_certified(g, r, s, owner, replay_events);
+        self.1
+            .on_revisit_owner_certified(g, r, s, owner, replay_events);
+    }
     fn on_forced_closure_pruned(&self, g: &ExecutionGraph, r: EventId, s: EventId) {
         self.0.on_forced_closure_pruned(g, r, s);
         self.1.on_forced_closure_pruned(g, r, s);
@@ -614,8 +993,24 @@ impl<A: Observer, B: Observer> Observer for (A, B) {
         rev_label: &Label,
         verdict: bool,
     ) {
-        self.0.on_viable_verdict(base, ep, v, revisiting, rev_label, verdict);
-        self.1.on_viable_verdict(base, ep, v, revisiting, rev_label, verdict);
+        self.0
+            .on_viable_verdict(base, ep, v, revisiting, rev_label, verdict);
+        self.1
+            .on_viable_verdict(base, ep, v, revisiting, rev_label, verdict);
+    }
+    fn on_held_viable_verdict(
+        &self,
+        base: &ExecutionGraph,
+        ep: EventId,
+        value: Val,
+        revisiting: EventId,
+        rev_label: &Label,
+        verdict: bool,
+    ) {
+        self.0
+            .on_held_viable_verdict(base, ep, value, revisiting, rev_label, verdict);
+        self.1
+            .on_held_viable_verdict(base, ep, value, revisiting, rev_label, verdict);
     }
     fn on_viable_recv_verdict(
         &self,
@@ -626,8 +1021,10 @@ impl<A: Observer, B: Observer> Observer for (A, B) {
         rev_label: &Label,
         verdict: bool,
     ) {
-        self.0.on_viable_recv_verdict(base, ep, src, revisiting, rev_label, verdict);
-        self.1.on_viable_recv_verdict(base, ep, src, revisiting, rev_label, verdict);
+        self.0
+            .on_viable_recv_verdict(base, ep, src, revisiting, rev_label, verdict);
+        self.1
+            .on_viable_recv_verdict(base, ep, src, revisiting, rev_label, verdict);
     }
     fn on_visit_enter(&self, g: &ExecutionGraph) {
         self.0.on_visit_enter(g);
@@ -636,6 +1033,10 @@ impl<A: Observer, B: Observer> Observer for (A, B) {
     fn on_visit_exit(&self, g: &ExecutionGraph, produced_terminal: bool) {
         self.0.on_visit_exit(g, produced_terminal);
         self.1.on_visit_exit(g, produced_terminal);
+    }
+    fn on_time_certificate(&self, g: &ExecutionGraph, event: &TimeCertificateEvent) {
+        self.0.on_time_certificate(g, event);
+        self.1.on_time_certificate(g, event);
     }
     fn on_execution(&self, exec: &Execution, kind: ExecutionKind) {
         self.0.on_execution(exec, kind);

@@ -165,6 +165,9 @@ where
             let time_level = config.time_predicate_level;
             let canon_free = config.time_canon_free;
             let time_zombie = config.time_zombie;
+            let mailbox_time = config.mailbox_time;
+            let certified_time = config.certified_time;
+            let source_order = config.source_order;
             let make_program = &make_program;
             scope.spawn(move || {
                 // Route this worker's tallies to its own shard of a shared observer.
@@ -177,10 +180,14 @@ where
                     stop_on_error,
                     max_executions,
                     time_filter,
+                    mailbox_time,
                     time_predicate,
                     time_level,
                     canon_free,
                     time_zombie,
+                    certified_time,
+                    source_order,
+                    frozen_cache: super::frozen::FrozenCache::default(),
                     viable_memo: crate::time::ViableMemo::new(),
                     terminal_count: 0,
                     terminals_recorded: 0,

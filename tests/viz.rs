@@ -1,9 +1,10 @@
 //! Conformance + thread-safety tests for [`must::viz::TraceObserver`].
 //!
 //! The library is dependency-free, so these tests carry their own tiny (std-only) JSON
-//! parser and an independent re-check of every rule of the trace format produced by
-//! `src/viz.rs`. The validator is written against the format itself, not against the
-//! observer's encoder, so a bug shared between the two could not hide.
+//! parser and an independent re-check of every rule in `must-viz/TRACE_FORMAT.md`
+//! (version 1). That validator is written against the *spec*, not against the observer's
+//! encoder, so a bug shared between the two could not hide — exactly the guarantee the
+//! standalone `must-trace` crate got from validating with `serde_json::Value`.
 
 use std::collections::BTreeSet;
 
@@ -225,10 +226,10 @@ fn utf8_len(lead: u8) -> usize {
 }
 
 // ===================================================================================
-// Independent validator for the trace format.
+// Independent validator against TRACE_FORMAT.md v1.
 // ===================================================================================
 
-/// Per-kind step tally, in the trace's summary field order.
+/// Per-kind step tally, in the spec's summary field order.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Counts {
     events_added: usize,
@@ -242,7 +243,7 @@ struct Counts {
     errors: usize,
 }
 
-/// Parse `json`, re-check every trace-format rule, and return the (validated) step
+/// Parse `json`, re-check every TRACE_FORMAT.md v1 rule, and return the (validated) step
 /// count so callers can assert coverage. Panics with a rule reference on any violation.
 fn validate(json: &str) -> usize {
     let root = Parser::parse(json);
@@ -679,10 +680,8 @@ fn dump_apis_agree() {
         "dump and dump_to_string agree byte-for-byte"
     );
 
-    let path = std::env::temp_dir().join(format!(
-        "must-mc-trace-test-{}.trace.json",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("must-viz-test-{}.trace.json", std::process::id()));
     obs.dump_to_file(&path).unwrap();
     let from_file = std::fs::read(&path).unwrap();
     std::fs::remove_file(&path).ok();
@@ -745,4 +744,59 @@ fn stress_many_shards_no_corruption() {
     let obs = TraceObserver::with_shards("stress", n, 16);
     explore(ssr, &obs, Config::default().with_threads(16));
     validate(&obs.dump_to_string());
+}
+
+#[test]
+fn timed_labels_preserve_mode_and_windows_in_json() {
+    use must::event::{Label, Pred, Window};
+    use must::graph::ExecutionGraph;
+    use must::Observer;
+
+    let observer = TraceObserver::new("timing", 1);
+    let mut graph = ExecutionGraph::new();
+    for label in [
+        Label::send_within(Model::Asyn, 0, "m", Window::new(1, 2)),
+        Label::recv_timeout_timed(Pred::any(), Window::new(5, 10)),
+        Label::recv_poll_timed(Pred::any(), Window::at_least(3)),
+        Label::recv_nb(Pred::any()),
+    ] {
+        let event = graph.add_event(0, label);
+        observer.on_event_added(&graph, event);
+    }
+    let json = observer.dump_to_string();
+    validate(&json);
+    let parsed = Parser::parse(&json);
+    let events = parsed
+        .get("steps")
+        .unwrap()
+        .as_arr()
+        .unwrap()
+        .last()
+        .unwrap()
+        .get("graph")
+        .unwrap()
+        .get("threads")
+        .unwrap()
+        .as_arr()
+        .unwrap()[0]
+        .as_arr()
+        .unwrap();
+    let label = |index: usize| events[index].get("label").unwrap();
+    let send_window = label(0).get("window").unwrap();
+    assert_eq!(send_window.get("lo").and_then(Json::as_uint), Some(1));
+    assert_eq!(send_window.get("hi").and_then(Json::as_uint), Some(2));
+    for (index, mode, lower, upper) in [(1, "timeout", 5, Some(10)), (2, "poll", 3, None)] {
+        let timing = label(index).get("timing").unwrap();
+        assert_eq!(timing.get("mode").and_then(Json::as_str), Some(mode));
+        let window = timing.get("window").unwrap();
+        assert_eq!(window.get("lo").and_then(Json::as_uint), Some(lower));
+        match upper {
+            Some(hi) => assert_eq!(window.get("hi").and_then(Json::as_uint), Some(hi)),
+            None => assert_eq!(window.get("hi"), Some(&Json::Null)),
+        }
+    }
+    assert!(
+        label(3).get("timing").is_none(),
+        "abstract label stays byte-compatible"
+    );
 }

@@ -631,7 +631,13 @@ impl ExecutionGraph {
                 || self.threads[keep_len.len()..].iter().all(|t| t.is_empty()),
             "keep_len must cover every non-empty thread"
         );
-        let len_of = |tid: usize| keep_len.get(tid).copied().unwrap_or(0).min(self.thread_len(tid));
+        let len_of = |tid: usize| {
+            keep_len
+                .get(tid)
+                .copied()
+                .unwrap_or(0)
+                .min(self.thread_len(tid))
+        };
         let kept = |e: EventId| e.idx < len_of(e.tid);
 
         // Nothing removed: the cut is the identity. Stamps are dense (`add_event` counts up
@@ -682,10 +688,10 @@ impl ExecutionGraph {
                 // bit-for-bit the old thread: share it instead of rebuilding (a refcount
                 // bump against a full copy of every event).
                 let unchanged = len == self.threads[tid].len()
-                    && self.threads[tid].last().is_none_or(|ev| ev.stamp < cut_from)
                     && self.threads[tid]
-                        .iter()
-                        .all(|ev| ev.rf.is_none_or(&kept));
+                        .last()
+                        .is_none_or(|ev| ev.stamp < cut_from)
+                    && self.threads[tid].iter().all(|ev| ev.rf.is_none_or(&kept));
                 if unchanged {
                     threads.push(Arc::clone(&self.threads[tid]));
                     continue;
@@ -802,9 +808,18 @@ pub(crate) fn label_key(l: &Label) -> String {
             };
             format!("S{model}({dst},{}:{v}){win}", v.len())
         }
-        Label::Recv { pred, blocking } => {
+        Label::Recv {
+            pred,
+            blocking,
+            timing,
+        } => {
             let b = if *blocking { "b" } else { "nb" };
-            format!("R{b}[{}:{}]", pred.repr().len(), pred.repr())
+            let suffix = if timing.is_timed() {
+                format!("@{timing}")
+            } else {
+                String::new()
+            };
+            format!("R{b}[{}:{}]{suffix}", pred.repr().len(), pred.repr())
         }
         // The option set is program-fixed (identical across all executions), but
         // length-prefixed all the same so it never collides with a neighbouring label.

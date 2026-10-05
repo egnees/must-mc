@@ -320,7 +320,14 @@ pub fn send_m(model: Model, dst: usize, val: &'static str, lo: u64, hi: u64) -> 
         hi,
     }
 }
-pub fn send_if(guard: usize, eq: &'static str, dst: usize, val: &'static str, lo: u64, hi: u64) -> Op {
+pub fn send_if(
+    guard: usize,
+    eq: &'static str,
+    dst: usize,
+    val: &'static str,
+    lo: u64,
+    hi: u64,
+) -> Op {
     Op::SendIf {
         guard,
         eq,
@@ -376,7 +383,11 @@ impl Rng {
 // =====================================================================================
 
 /// Recomputed `Deleted(r, s)` (line 11): strict `<_G`, minus the porf-prefix of `s`.
-pub fn deleted_set(g: &ExecutionGraph, r: EventId, porf_s: &BTreeSet<EventId>) -> BTreeSet<EventId> {
+pub fn deleted_set(
+    g: &ExecutionGraph,
+    r: EventId,
+    porf_s: &BTreeSet<EventId>,
+) -> BTreeSet<EventId> {
     let sr = g.stamp(r);
     g.all_events()
         .into_iter()
@@ -385,7 +396,11 @@ pub fn deleted_set(g: &ExecutionGraph, r: EventId, porf_s: &BTreeSet<EventId>) -
 }
 
 /// Recomputed `Previous(e, s)` (line 20): non-strict `<=_G`, plus the porf-prefix of `s`.
-pub fn previous_set(g: &ExecutionGraph, e: EventId, porf_s: &BTreeSet<EventId>) -> BTreeSet<EventId> {
+pub fn previous_set(
+    g: &ExecutionGraph,
+    e: EventId,
+    porf_s: &BTreeSet<EventId>,
+) -> BTreeSet<EventId> {
     let se = g.stamp(e);
     g.all_events()
         .into_iter()
@@ -514,10 +529,7 @@ impl<P: Program + Clone + Sync> Probe<P> {
 
     fn note_refused(&self, g2: &ExecutionGraph) {
         if must::consistent(g2) && must::eager_feasible(g2) {
-            self.refused_g2
-                .lock()
-                .unwrap()
-                .insert(g2.canonical_key());
+            self.refused_g2.lock().unwrap().insert(g2.canonical_key());
         }
     }
 }

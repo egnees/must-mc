@@ -6,10 +6,15 @@
 //! another's edits.
 
 mod execution;
+pub mod frozen;
+pub mod ownership;
 mod parallel;
+mod repair_owner;
 pub mod revisit;
+pub mod source_order;
 
 pub use execution::{Execution, ExecutionKind};
+pub use source_order::SourceOrder;
 
 use std::sync::Arc;
 
@@ -18,15 +23,37 @@ use crate::event::{EventId, Label, Tid, Val};
 use crate::graph::ExecutionGraph;
 use crate::observer::Observer;
 use crate::program::{Program, ThreadNext};
-use crate::scheduler::{pick, traces_of, NextStep};
+use crate::scheduler::{pick_with_time_semantics, traces_of, NextStep};
 
 use parallel::Spawner;
+
+/// Limits for temporal certificates. A zero limit disables all certificate layers.
+/// Frozen-core extraction and its consistency trials are not bounded by `max_states`.
+/// A partially drained mandatory graph can still certify impossibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CertifiedTimeConfig {
+    /// Maximum states in each legacy semantic/coverage walk, excluding core extraction.
+    pub max_states: usize,
+    /// Maximum mandatory additions per frozen-core check; also bounds each legacy walk.
+    pub max_added_events: usize,
+}
+
+impl Default for CertifiedTimeConfig {
+    fn default() -> Self {
+        Self {
+            max_states: 128,
+            max_added_events: 64,
+        }
+    }
+}
 
 /// Tunables for an `explore` run.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Thread priority permutation for `next_P`. `None` = the default `0..N`.
     pub priorities: Option<Vec<Tid>>,
+    /// Stable total source order for untimed canonical completion. Incompatible with T2.
+    pub source_order: SourceOrder,
     /// Stop the whole exploration at the first `error` event (line 5 of Algorithm 1
     /// says `exit`). Default `true`.
     ///
@@ -60,13 +87,21 @@ pub struct Config {
     /// explorable — a consistent, time-realizable terminal can be reachable only by a
     /// backward revisit *out of* that error graph (revisit completeness, engine_plan §3 B1).
     pub time_filter: bool,
-    /// Enable the full **eager-time predicate** exploration (time-intervals extension, T2 — see
-    /// `T2_PLAN.md`). Unlike [`time_filter`](Self::time_filter) (a post-hoc filter on terminals),
-    /// this drives four coupled changes so the explorer *never enters* the eager-infeasible
-    /// superset in the first place:
+    /// Use direct mailbox delivery and timed timeout/poll completion clocks.
+    /// Supports Asyn, P2p and Mbox sends; abstract nonblocking receives and Cd
+    /// are rejected. Requires terminal filtering and original MUST canonicity.
+    /// This explicit flag also applies to prefixes without a timed receive.
+    pub mailbox_time: bool,
+    /// Enable experimental **eager-time predicate** exploration (T2; see `T2_PLAN.md`).
+    /// Unlike [`time_filter`](Self::time_filter), this applies four coupled changes during
+    /// construction. General completeness is false: a forward gate can discard the
+    /// construction of a later repairing send, even with exact future summaries.
+    /// The constructive owner check repairs some duplicates but does not establish
+    /// general completeness or uniqueness. Use original MUST plus terminal verification
+    /// as the reference.
     ///
     /// * **T-DES** ([`crate::scheduler::pick`]): a discrete-event scheduling order by lower-bound
-    ///   time, replacing the priority order — this fixes the canonical `≤_G` (Lemma 1);
+    ///   time, replacing the priority order and determining insertion order `≤_G`;
     /// * **T-PRED** ([`Explorer::visit_recv`]): an rf-fork is taken only when the resulting
     ///   prefix is eager-time-feasible (`time::check(..).is_feasible()`), not merely consistent;
     /// * **T-CANON** ([`crate::explorer::revisit::get_cons_tiebreaker`]): the canonical source of
@@ -147,20 +182,34 @@ pub struct Config {
     /// `time_filter`) and is mutually exclusive with both `time_filter` and `time_predicate`;
     /// `explore` panics on a violation. Default `false`.
     pub time_zombie: bool,
+    /// Prune using immutable causal cores and mandatory deterministic continuations,
+    /// with an additional bounded semantic/coverage fallback for Asyn programs.
+    /// Requires `time_filter` or `time_zombie`, `collect_errors`, and untimed canonicity
+    /// (`time_predicate` and `time_canon_free` false).
+    ///
+    /// Legacy timing requires the WHOLE program, including future sends, to use
+    /// Asyn/P2p channels. With `mailbox_time`, Asyn/P2p/Mbox are supported using
+    /// portable immutable anchors and first-alteration supports; the older bounded
+    /// semantic/coverage fallback is disabled. Unknown retains the subtree.
+    /// This rule need not reject every infeasible subtree; timestamps are not graph identity.
+    pub certified_time: Option<CertifiedTimeConfig>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             priorities: None,
+            source_order: SourceOrder::default(),
             stop_on_error: true,
             max_executions: None,
             threads: 1,
             time_filter: false,
+            mailbox_time: false,
             time_predicate: false,
             time_predicate_level: 4,
             time_canon_free: false,
             time_zombie: false,
+            certified_time: None,
         }
     }
 }
@@ -169,6 +218,13 @@ impl Config {
     /// Run under an explicit priority permutation.
     pub fn with_priorities(mut self, priorities: Vec<Tid>) -> Self {
         self.priorities = Some(priorities);
+        self
+    }
+    /// Set the total source order without filtering any untimed-consistent candidates.
+    /// The default is original EventId order; self-send preference can strengthen
+    /// immutable-core certificates for protocols whose timers are self-messages.
+    pub fn with_source_order(mut self, order: SourceOrder) -> Self {
+        self.source_order = order;
         self
     }
     /// Keep exploring after an error instead of stopping.
@@ -185,6 +241,13 @@ impl Config {
     /// Must be combined with [`collect_errors`](Self::collect_errors), or `explore` panics.
     pub fn with_time_filter(mut self) -> Self {
         self.time_filter = true;
+        self
+    }
+    /// Select the timed mailbox semantics described in `docs/P2P_AND_TIMED_RECEIVES.md`.
+    /// Combine with `collect_errors()` and `with_time_filter()`, `with_time_zombie()`
+    /// or `with_certified_time()`. This selects semantics independently of pruning.
+    pub fn with_mailbox_time(mut self) -> Self {
+        self.mailbox_time = true;
         self
     }
     /// Enable the full eager-time predicate exploration (see
@@ -236,6 +299,30 @@ impl Config {
         self.time_zombie = true;
         self
     }
+
+    /// Enable certificate pruning with untimed MUST canonicity. Uses DES unless
+    /// `with_time_filter()` already selected the priority policy. Requires
+    /// `collect_errors()` and a whole program using only Asyn/P2p sends; see
+    /// [`certified_time`](Self::certified_time) for the semantic scope.
+    pub fn with_certified_time(mut self) -> Self {
+        self.certified_time.get_or_insert_with(Default::default);
+        if !self.time_filter {
+            self.time_zombie = true;
+        }
+        self
+    }
+
+    /// Set certificate budgets. A zero limit disables all checks and callbacks,
+    /// preserving the construction for the selected source order. Nonzero limits
+    /// bound proof continuations, not immutable-core extraction or solver complexity.
+    pub fn with_certified_time_budget(self, max_states: usize, max_added_events: usize) -> Self {
+        let mut config = self.with_certified_time();
+        config.certified_time = Some(CertifiedTimeConfig {
+            max_states,
+            max_added_events,
+        });
+        config
+    }
 }
 
 /// Verify a program, notifying `observer` throughout.
@@ -254,6 +341,26 @@ where
     P: Program,
     O: Observer + Sync,
 {
+    assert!(
+        !config.mailbox_time
+            || ((config.time_filter || config.time_zombie)
+                && !config.time_predicate
+                && !config.time_canon_free),
+        "mailbox timing requires terminal filtering with original MUST canonical rules"
+    );
+    assert!(
+        config.source_order == SourceOrder::EventId || !config.time_predicate,
+        "custom source order is incompatible with time_predicate"
+    );
+    assert!(
+        config.certified_time.is_none()
+            || ((config.time_filter || config.time_zombie)
+                && !config.time_predicate
+                && !config.time_canon_free
+                && !config.stop_on_error),
+        "certified timing requires collect_errors(), time_filter or time_zombie, and \
+         original canonical rules (no time_predicate or time_canon_free)"
+    );
     // B1 (engine_plan §3): the time filter needs the whole error-subtree to stay explorable,
     // because a realizable terminal can be reachable only by a backward revisit out of a
     // time-infeasible error graph. `stop_on_error` truncates those subtrees, so the
@@ -311,13 +418,17 @@ where
         program: &program,
         observer,
         priorities,
+        source_order: config.source_order,
         stop_on_error: config.stop_on_error,
         max_executions: config.max_executions,
         time_filter: config.time_filter,
+        mailbox_time: config.mailbox_time,
         time_predicate: config.time_predicate,
         time_level: config.time_predicate_level,
         canon_free: config.time_canon_free,
         time_zombie: config.time_zombie,
+        certified_time: config.certified_time,
+        frozen_cache: frozen::FrozenCache::default(),
         viable_memo: crate::time::ViableMemo::new(),
         terminal_count: 0,
         terminals_recorded: 0,
@@ -361,6 +472,7 @@ pub(crate) struct Explorer<'a, P: Program, O: Observer> {
     /// [`record`](Self::record); `eager_feasible` is a pure function of the graph, so this
     /// carries no cross-branch state and is safe to copy into every parallel worker.
     time_filter: bool,
+    mailbox_time: bool,
     /// Drive the full eager-time predicate search ([`Config::time_predicate`]). Threaded into
     /// [`pick`](crate::scheduler::pick) (T-DES), [`visit_recv`](Self::visit_recv) (T-PRED),
     /// [`visit_send`](Self::visit_send)/[`backward_revisits`](Self::backward_revisits) (T-GATE)
@@ -387,6 +499,12 @@ pub(crate) struct Explorer<'a, P: Program, O: Observer> {
     /// filter, everything else untimed. Read in [`visit_step`](Self::visit_step) (the des bit of
     /// [`pick`](crate::scheduler::pick)) and [`record`](Self::record) only.
     pub(crate) time_zombie: bool,
+    /// Immutable per-worker limits; proof checks carry no shared ownership state.
+    certified_time: Option<CertifiedTimeConfig>,
+    source_order: SourceOrder,
+    /// One timing-result cache per worker; immutable anchors are derived afresh from
+    /// each graph, including after donated tasks and backward cuts.
+    frozen_cache: frozen::FrozenCache,
     /// Memo of the existential canon oracle ([`crate::time::viable`], T2_ORACLE_SPEC §1.3),
     /// used by the nondet arm of `RevisitCondition` under `time_predicate`. Per worker (this
     /// struct is per worker), so the memo is effectively sharded across a parallel run; a
@@ -445,6 +563,29 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                 && *nexts == self.program.next(traces),
             "threaded traces/nexts drifted from a fresh recompute"
         );
+        for next in nexts.iter().filter_map(ThreadNext::label) {
+            if self.mailbox_time {
+                assert!(
+                    !matches!(
+                        next,
+                        Label::Send {
+                            model: crate::Model::Cd,
+                            ..
+                        }
+                    ),
+                    "mailbox timing does not support Cd sends"
+                );
+                assert!(
+                    next.blocking() != Some(false) || next.is_timed_recv(),
+                    "mailbox timing requires an explicit timeout or poll window on nonblocking receives"
+                );
+            } else if self.time_filter || self.time_zombie || self.time_predicate {
+                assert!(
+                    !next.is_timed_recv(),
+                    "timed receives in exploration require Config::with_mailbox_time()"
+                );
+            }
+        }
         // Dead-branch detector (T2_PLAN §5а): a `visit_step` call *is* one logical Visit_P(G)
         // node (every logical Visit reaches exactly one `visit_step`, via `visit` or
         // `branch_memo`). Snapshot the running terminal count so `on_visit_exit` can report
@@ -452,9 +593,21 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         // same `self`) bumps `terminals_recorded`, so the delta is the subtree's terminal count.
         self.observer.on_visit_enter(g);
         let terminals_before = self.terminals_recorded;
+        if self.certified_prune(g) {
+            // A certificate examines this Visit too. Count its boundary vertex and
+            // classify it as barren rather than hiding pruning work from observers.
+            self.observer.on_visit_exit(g, false);
+            return;
+        }
         // The des bit: both the predicate (T-DES) and the zombie regime run under the DES
         // insertion order; zombie changes nothing else about the walk.
-        match pick(g, nexts, &self.priorities, self.time_predicate || self.time_zombie) {
+        match pick_with_time_semantics(
+            g,
+            nexts,
+            &self.priorities,
+            self.time_predicate || self.time_zombie,
+            self.mailbox_time,
+        ) {
             // line 4: next_P(G) = nothing - a terminal execution.
             NextStep::Terminal { blocked } => {
                 // In collect-errors mode a branch that ran through an error reaches its
@@ -485,6 +638,110 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         }
         self.observer
             .on_visit_exit(g, self.terminals_recorded > terminals_before);
+    }
+
+    /// Prune a whole construction subtree only when both layers certify it. Forward
+    /// impossibility alone cannot discard a path that discovers a repairing revisit.
+    /// The coverage layer checks the same original canonical helper used by the main
+    /// explorer and conservatively refuses any admitted escape. Unknown leaves the
+    /// original search untouched. All certificates are freshly bound to this program,
+    /// graph, construction stamps, and policy; none are reused across revisits.
+    fn certified_prune(&mut self, g: &ExecutionGraph) -> bool {
+        use crate::observer::{TimeCertificateEvent, TimeCertificateOutcome};
+        use crate::time::future::{check_completion, CompletionCheck, LookaheadBudget};
+        use ownership::{certify_no_escape_with_order, OwnershipBudget, OwnershipCheck};
+
+        let Some(limits) = self.certified_time else {
+            return false;
+        };
+        if limits.max_states == 0 || limits.max_added_events == 0 {
+            return false;
+        }
+        // Without an existing blocking consumption, there is no old eager race for
+        // these certificates to reject. Skipping the check only forgoes pruning.
+        if !self.mailbox_time && !g.iter_recvs().any(|r| g.label(r).blocking() == Some(true)) {
+            return false;
+        }
+        let frozen = self.frozen_cache.check_with_time_semantics(
+            g,
+            self.program,
+            limits.max_added_events,
+            self.source_order,
+            self.mailbox_time,
+        );
+        self.observer.on_frozen_time(g, &frozen);
+        if frozen.outcome == crate::observer::FrozenTimeOutcome::Pruned {
+            return true;
+        }
+        // The older semantic/coverage fallback assumes transparent NB receives.
+        // New timing uses the immutable-core and first-alteration certificates only.
+        if self.mailbox_time {
+            return false;
+        }
+        let completion = check_completion(
+            g,
+            self.program,
+            LookaheadBudget {
+                max_states: limits.max_states,
+                max_added_events: limits.max_added_events,
+            },
+        );
+        let mut event = TimeCertificateEvent {
+            outcome: TimeCertificateOutcome::CompletionUnknown,
+            completion_states: completion.stats().expanded_states,
+            completion_events: completion.stats().added_events,
+            completion_cases: completion.stats().expanded_cases,
+            completion_temporal_checks: completion.stats().temporal_checks,
+            ownership_states: 0,
+            ownership_events: 0,
+            ownership_temporal_checks: 0,
+            revisit_candidates: 0,
+            canonical_checks: 0,
+        };
+        let pruned = match completion {
+            CompletionCheck::Unknown(_) => false,
+            CompletionCheck::Witness(_) => {
+                event.outcome = TimeCertificateOutcome::CompletionWitness;
+                false
+            }
+            CompletionCheck::Impossible(certificate) => {
+                debug_assert!(certificate.applies_to(g));
+                let coverage = certify_no_escape_with_order(
+                    self.program,
+                    g,
+                    &self.priorities,
+                    self.time_zombie,
+                    OwnershipBudget {
+                        max_states: limits.max_states,
+                        max_added_events: limits.max_added_events,
+                    },
+                    self.source_order,
+                );
+                event.ownership_states = coverage.stats().states;
+                event.ownership_events = coverage.stats().added_events;
+                event.ownership_temporal_checks = coverage.stats().forward_terminals;
+                event.revisit_candidates = coverage.stats().revisit_candidates;
+                event.canonical_checks = coverage.stats().canonical_checks;
+                match coverage {
+                    OwnershipCheck::Certified(proof) => {
+                        debug_assert!(proof.applies_to_with_order(
+                            g,
+                            &self.priorities,
+                            self.time_zombie,
+                            self.source_order
+                        ));
+                        event.outcome = TimeCertificateOutcome::Pruned;
+                        true
+                    }
+                    OwnershipCheck::Unknown { .. } | OwnershipCheck::FeasibleTerminal { .. } => {
+                        event.outcome = TimeCertificateOutcome::OwnershipUnknown;
+                        false
+                    }
+                }
+            }
+        };
+        self.observer.on_time_certificate(g, &event);
+        pruned
     }
 
     /// Append `entry` to thread `tid`'s trace, recompute just that thread's next event, run
@@ -802,8 +1059,16 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         if self.time_filter || self.time_zombie || self.time_predicate {
             // The v1 model guard is a precondition of the time extension, not an invariant of
             // any regime, so it runs on every timed terminal regardless of level or profile.
-            crate::time::assert_supported_models(exec.graph());
-            if !crate::time::eager_feasible(exec.graph()) {
+            let feasible = if self.mailbox_time {
+                // Feasibility only: the same verdict as `check_mailbox(..).is_feasible()`
+                // (which it re-runs in full on the accepted case), without building the
+                // explanation tables for the rejected one.
+                crate::time::eager_mailbox_feasible(exec.graph())
+            } else {
+                crate::time::assert_supported_models(exec.graph());
+                crate::time::eager_feasible(exec.graph())
+            };
+            if !feasible {
                 // T-GATE / record (T2_PLAN §2c): under the predicate at level 4 every terminal
                 // reached is eager-feasible by construction (T-PRED gates receives, T-GATE gates
                 // sends / revisits), so landing here at all is a bug in that invariant. Debug

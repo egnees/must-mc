@@ -17,14 +17,15 @@
 //! * [`ORIGIN`] is variable 0. Assignments are reported anchored at the origin
 //!   (`model[i] = π[i] − π[ORIGIN]`, so `model[ORIGIN] = 0`); the builder in
 //!   [`crate::time`] adds `v ≥ ORIGIN` edges for every time variable, which pins the origin
-//!   to time 0 and makes the reported schedule the pointwise-earliest one.
+//!   to time 0. After rollback a satisfying assignment may retain slack; earliest bounds
+//!   require the separate lower-bound relaxation in [`crate::time`].
 //!
-//! # Overflow invariant
+//! # Arithmetic and indices
 //!
-//! Every weight is a finite window bound, `|w| ≤ Window::MAX_BOUND = 2^40`. A potential (or
-//! Bellman–Ford distance) is a sum of at most `|E|` such weights, so `|π[i]| ≤ |E| · 2^40`,
-//! which stays well inside `i64` for any graph the explorer can build. All arithmetic is
-//! plain `i64`; no saturating/checked ops are needed.
+//! Public weights and schedules use `i64`; all propagation arithmetic uses `i128`.
+//! Converting an origin-anchored model back to `i64` is checked and fails explicitly
+//! if that API cannot represent it. Variable counts and edge indices are validated;
+//! impossible sizes and out-of-range values never wrap into a feasibility verdict.
 //!
 //! Determinism: only `Vec`/`BTreeMap`; the propagation heap breaks ties by variable id.
 
@@ -99,6 +100,16 @@ pub struct Conflict {
 /// are dropped — only its minimality is lost).
 pub trait DiffCore {
     fn new(n_vars: u32) -> Self;
+    /// Return to the state of `new(n_vars)`, reusing whatever storage this instance already
+    /// holds. Semantically identical to `*self = Self::new(n_vars)`; overriding it is purely
+    /// an allocation optimisation ([`solve`] keeps one [`PotentialCore`] per thread alive
+    /// across the millions of systems the terminal filter solves).
+    fn reset(&mut self, n_vars: u32)
+    where
+        Self: Sized,
+    {
+        *self = Self::new(n_vars);
+    }
     fn assert_edge(&mut self, e: Edge) -> Result<(), Conflict>;
     fn push(&mut self);
     fn pop(&mut self);
@@ -114,7 +125,7 @@ const NO_REASON: usize = usize::MAX;
 /// edge's tail, reports the negative cycle it closed.
 pub struct PotentialCore {
     /// Valid potential: `pot[tail] + w − pot[head] ≥ 0` on every recorded arc.
-    pot: Vec<i64>,
+    pot: Vec<i128>,
     /// Adjacency by graph tail: `out[y]` holds `(head, w, edge_id)` for each arc `y ─w→ head`.
     out: Vec<Vec<(VarId, i64, usize)>>,
     /// Every asserted edge by id (insertion order); backs cycle recovery and rollback.
@@ -123,7 +134,7 @@ pub struct PotentialCore {
     checkpoints: Vec<usize>,
     // --- reusable propagation scratch (reset via `dirty` after each assert) ---
     /// `gamma[v] < 0` is the pending decrement of `pot[v]`; `0` means "untouched".
-    gamma: Vec<i64>,
+    gamma: Vec<i128>,
     /// `reason[v]` is the arc that set `gamma[v]` (its head is `v`); used to recover a cycle.
     reason: Vec<usize>,
     /// Whether `v` has been finalized (potential committed) in this propagation.
@@ -131,7 +142,10 @@ pub struct PotentialCore {
     /// Variables touched this propagation, to reset `gamma`/`reason`/`finalized` cheaply.
     dirty: Vec<VarId>,
     /// Min-heap on `(gamma, VarId)`: pops the most-negative gamma first, ties by smallest id.
-    heap: BinaryHeap<(Reverse<i64>, Reverse<VarId>)>,
+    heap: BinaryHeap<(Reverse<i128>, Reverse<VarId>)>,
+    /// Potential decrements committed during the current propagation, for rollback on a
+    /// cycle. A field rather than a local so the allocation survives across asserts.
+    committed: Vec<(VarId, i128)>,
 }
 
 impl PotentialCore {
@@ -176,6 +190,7 @@ impl PotentialCore {
 
 impl DiffCore for PotentialCore {
     fn new(n_vars: u32) -> Self {
+        assert!(n_vars > 0, "time solver requires an origin variable");
         let n = n_vars as usize;
         PotentialCore {
             pot: vec![0; n],
@@ -187,10 +202,45 @@ impl DiffCore for PotentialCore {
             finalized: vec![false; n],
             dirty: Vec::new(),
             heap: BinaryHeap::new(),
+            committed: Vec::new(),
         }
     }
 
+    /// Reuse this core for a fresh `n_vars`-variable system. Every buffer is cleared and
+    /// resized in place, so a steady-state caller allocates nothing: the per-tail adjacency
+    /// rows in particular keep their capacity, which is where the old
+    /// `PotentialCore::new` spent one allocation per variable.
+    fn reset(&mut self, n_vars: u32) {
+        assert!(n_vars > 0, "time solver requires an origin variable");
+        let n = n_vars as usize;
+        // Every row is cleared, including rows beyond `n`: a later, larger system would
+        // otherwise index a row still holding arcs of this one.
+        for row in self.out.iter_mut() {
+            row.clear();
+        }
+        if self.out.len() < n {
+            self.out.resize_with(n, Vec::new);
+        }
+        self.pot.clear();
+        self.pot.resize(n, 0);
+        self.gamma.clear();
+        self.gamma.resize(n, 0);
+        self.reason.clear();
+        self.reason.resize(n, NO_REASON);
+        self.finalized.clear();
+        self.finalized.resize(n, false);
+        self.edges.clear();
+        self.checkpoints.clear();
+        self.dirty.clear();
+        self.heap.clear();
+        self.committed.clear();
+    }
+
     fn assert_edge(&mut self, e: Edge) -> Result<(), Conflict> {
+        assert!(
+            (e.x as usize) < self.pot.len() && (e.y as usize) < self.pot.len(),
+            "time solver edge variable out of bounds"
+        );
         let id = self.edges.len();
         self.edges.push(e);
         self.out[e.y as usize].push((e.x, e.w, id));
@@ -207,7 +257,7 @@ impl DiffCore for PotentialCore {
 
         let head = e.x;
         let tail = e.y;
-        let slack = self.pot[tail as usize] + e.w - self.pot[head as usize];
+        let slack = self.pot[tail as usize] + i128::from(e.w) - self.pot[head as usize];
         if slack >= 0 {
             return Ok(()); // fast path: potential already valid for the new arc
         }
@@ -220,7 +270,7 @@ impl DiffCore for PotentialCore {
         self.heap.push((Reverse(slack), Reverse(head)));
 
         // Potential decrements committed this round, for rollback if a cycle is found.
-        let mut committed: Vec<(VarId, i64)> = Vec::new();
+        self.committed.clear();
         let mut cycle_found = false;
 
         while let Some((Reverse(g), Reverse(s))) = self.heap.pop() {
@@ -229,7 +279,7 @@ impl DiffCore for PotentialCore {
             }
             let delta = self.gamma[s as usize];
             self.pot[s as usize] += delta;
-            committed.push((s, delta));
+            self.committed.push((s, delta));
             self.finalized[s as usize] = true;
 
             // Iterate out[s] by index: we mutate `self` (gamma/pot/heap) inside the loop.
@@ -239,7 +289,7 @@ impl DiffCore for PotentialCore {
                 if self.finalized[t as usize] {
                     continue;
                 }
-                let d = self.pot[s as usize] + c - self.pot[t as usize];
+                let d = self.pot[s as usize] + i128::from(c) - self.pot[t as usize];
                 if d < self.gamma[t as usize] {
                     if t == tail {
                         // Reached the inserted edge's tail: a negative cycle through it.
@@ -262,7 +312,8 @@ impl DiffCore for PotentialCore {
         if cycle_found {
             // Undo this round's partial potential changes so `π` stays valid for the edge
             // set minus the offending arc (which remains recorded until the caller pops).
-            for &(v, delta) in &committed {
+            for i in 0..self.committed.len() {
+                let (v, delta) = self.committed[i];
                 self.pot[v as usize] -= delta;
             }
             let cyc = self.recover_cycle(tail, head);
@@ -291,7 +342,10 @@ impl DiffCore for PotentialCore {
 
     fn model(&self) -> Vec<i64> {
         let anchor = self.pot[ORIGIN as usize];
-        self.pot.iter().map(|&p| p - anchor).collect()
+        self.pot
+            .iter()
+            .map(|&p| i64::try_from(p - anchor).expect("time solver assignment exceeds i64"))
+            .collect()
     }
 }
 
@@ -311,12 +365,12 @@ impl BellmanFordCore {
         if n == 0 {
             return None;
         }
-        let mut dist = vec![0i64; n];
+        let mut dist = vec![0i128; n];
         let mut pred_edge = vec![NO_REASON; n];
         for iter in 0..n {
             let mut changed: Option<usize> = None;
             for (id, e) in self.edges.iter().enumerate() {
-                let (y, x, w) = (e.y as usize, e.x as usize, e.w);
+                let (y, x, w) = (e.y as usize, e.x as usize, i128::from(e.w));
                 if dist[y] + w < dist[x] {
                     dist[x] = dist[y] + w;
                     pred_edge[x] = id;
@@ -353,6 +407,7 @@ impl BellmanFordCore {
 
 impl DiffCore for BellmanFordCore {
     fn new(n_vars: u32) -> Self {
+        assert!(n_vars > 0, "time solver requires an origin variable");
         BellmanFordCore {
             n: n_vars as usize,
             edges: Vec::new(),
@@ -361,6 +416,10 @@ impl DiffCore for BellmanFordCore {
     }
 
     fn assert_edge(&mut self, e: Edge) -> Result<(), Conflict> {
+        assert!(
+            (e.x as usize) < self.n && (e.y as usize) < self.n,
+            "time solver edge variable out of bounds"
+        );
         self.edges.push(e); // stays recorded on conflict, mirroring PotentialCore
         match self.find_negative_cycle() {
             Some(cycle) => Err(Conflict { cycle }),
@@ -379,11 +438,11 @@ impl DiffCore for BellmanFordCore {
 
     fn model(&self) -> Vec<i64> {
         let n = self.n;
-        let mut dist = vec![0i64; n];
+        let mut dist = vec![0i128; n];
         for _ in 0..n {
             let mut changed = false;
             for e in &self.edges {
-                let (y, x, w) = (e.y as usize, e.x as usize, e.w);
+                let (y, x, w) = (e.y as usize, e.x as usize, i128::from(e.w));
                 if dist[y] + w < dist[x] {
                     dist[x] = dist[y] + w;
                     changed = true;
@@ -394,21 +453,45 @@ impl DiffCore for BellmanFordCore {
             }
         }
         let anchor = dist[ORIGIN as usize];
-        dist.iter().map(|&d| d - anchor).collect()
+        dist.iter()
+            .map(|&d| i64::try_from(d - anchor).expect("time solver assignment exceeds i64"))
+            .collect()
     }
+}
+
+thread_local! {
+    /// One [`PotentialCore`] per thread, kept alive between [`solve`] calls. The terminal
+    /// filter solves one system per terminal candidate (millions of them), and a fresh core
+    /// costs an allocation per variable for its adjacency rows; reusing the buffers makes
+    /// the steady state allocation-free. A pool (rather than a single slot) keeps the code
+    /// safe if a future caller ever solves from inside a solve.
+    static CORE_POOL: std::cell::RefCell<Vec<PotentialCore>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Solve `sys` with [`PotentialCore`]. See [`solve_with`].
 pub fn solve(sys: &System) -> Verdict {
-    solve_with::<PotentialCore>(sys)
+    let mut core = CORE_POOL
+        .with(|p| p.borrow_mut().pop())
+        .unwrap_or_else(|| PotentialCore::new(sys.n_vars.max(1)));
+    DiffCore::reset(&mut core, sys.n_vars);
+    let verdict = solve_in(&mut core, sys);
+    CORE_POOL.with(|p| p.borrow_mut().push(core));
+    verdict
 }
 
 /// Solve `sys` with the given [`DiffCore`]: assert the hard edges, then a DPLL search over
 /// the clauses (unit propagation by forward checking + chronological branching + semantic
 /// branching on binary single-edge alternatives; research.md "Дизъюнкционный слой").
 pub fn solve_with<C: DiffCore>(sys: &System) -> Verdict {
+    let mut core = C::new(sys.n_vars);
+    solve_in(&mut core, sys)
+}
+
+/// [`solve_with`] over a caller-owned (possibly recycled) core, already `reset` for `sys`.
+fn solve_in<C: DiffCore>(core: &mut C, sys: &System) -> Verdict {
     let mut d = Dpll {
-        core: C::new(sys.n_vars),
+        core,
         sys,
         chosen: vec![None; sys.clauses.len()],
         stack: Vec::new(),
@@ -436,8 +519,8 @@ pub fn solve_with<C: DiffCore>(sys: &System) -> Verdict {
 }
 
 /// DPLL search state over the disjunctive layer.
-struct Dpll<'a, C: DiffCore> {
-    core: C,
+struct Dpll<'a, 'c, C: DiffCore> {
+    core: &'c mut C,
     sys: &'a System,
     /// `chosen[j] = Some(a)` once clause `j` is committed to alternative `a`.
     chosen: Vec<Option<usize>>,
@@ -447,14 +530,15 @@ struct Dpll<'a, C: DiffCore> {
     witness_choices: Vec<(usize, usize)>,
 }
 
-impl<C: DiffCore> Dpll<'_, C> {
+impl<'a, C: DiffCore> Dpll<'a, '_, C> {
     /// Assert every edge of `alt` (stopping at the first conflict), recording an unsat
     /// witness on conflict. Caller manages the surrounding `push`/`pop`.
     fn assert_alt(&mut self, alt: &[Edge]) -> bool {
         for &e in alt {
             if let Err(c) = self.core.assert_edge(e) {
                 self.witness_cycle = c.cycle;
-                self.witness_choices = self.stack.clone();
+                self.witness_choices.clear();
+                self.witness_choices.extend_from_slice(&self.stack);
                 return false;
             }
         }
@@ -480,7 +564,7 @@ impl<C: DiffCore> Dpll<'_, C> {
             let neg = Edge {
                 x: g.y,
                 y: g.x,
-                w: -g.w - 1,
+                w: !g.w, // exact -w-1, including i64::MIN and i64::MAX
             };
             return self.assert_alt(&[neg]);
         }
@@ -500,12 +584,13 @@ impl<C: DiffCore> Dpll<'_, C> {
                 if self.chosen[j].is_some() {
                     continue;
                 }
-                let n_alts = self.sys.clauses[j].alts.len();
+                let sys: &'a System = self.sys;
+                let n_alts = sys.clauses[j].alts.len();
                 let mut alive: Option<usize> = None;
                 let mut count = 0;
                 for a in 0..n_alts {
-                    let alt = self.sys.clauses[j].alts[a].clone();
-                    if self.probe_alt(&alt) {
+                    let alt: &'a [Edge] = &sys.clauses[j].alts[a];
+                    if self.probe_alt(alt) {
                         count += 1;
                         alive = Some(a);
                         if count > 1 {
@@ -523,8 +608,8 @@ impl<C: DiffCore> Dpll<'_, C> {
                 }
                 if count == 1 {
                     let a = alive.unwrap();
-                    let alt = self.sys.clauses[j].alts[a].clone();
-                    let ok = self.assert_alt(&alt); // probed safe on this exact state
+                    let alt: &'a [Edge] = &sys.clauses[j].alts[a];
+                    let ok = self.assert_alt(alt); // probed safe on this exact state
                     debug_assert!(ok, "forced alternative conflicted after probing clean");
                     let _ = ok;
                     self.chosen[j] = Some(a);
@@ -542,12 +627,13 @@ impl<C: DiffCore> Dpll<'_, C> {
         match open {
             None => true, // all clauses satisfied: leave the core in its satisfying state
             Some(j) => {
-                let n_alts = self.sys.clauses[j].alts.len();
+                let sys: &'a System = self.sys;
+                let n_alts = sys.clauses[j].alts.len();
                 for a in 0..n_alts {
                     self.core.push();
                     self.stack.push((j, a));
-                    let alt = self.sys.clauses[j].alts[a].clone();
-                    let ok = self.assert_alt(&alt) && self.maybe_semantic(j, a);
+                    let alt: &'a [Edge] = &sys.clauses[j].alts[a];
+                    let ok = self.assert_alt(alt) && self.maybe_semantic(j, a);
                     if ok {
                         self.chosen[j] = Some(a);
                         if self.search() {
@@ -571,6 +657,95 @@ impl<C: DiffCore> Dpll<'_, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_intermediate_slack_does_not_overflow() {
+        let sys = System {
+            n_vars: 3,
+            hard: vec![
+                Edge {
+                    x: 1,
+                    y: 0,
+                    w: -i64::MAX,
+                },
+                Edge {
+                    x: 2,
+                    y: 0,
+                    w: -i64::MAX,
+                },
+                // Reduced slack involves MAX - (-MAX), beyond i64, but the model fits.
+                Edge {
+                    x: 1,
+                    y: 0,
+                    w: i64::MAX,
+                },
+                Edge { x: 2, y: 1, w: 0 },
+            ],
+            clauses: vec![],
+        };
+        for verdict in [solve(&sys), solve_with::<BellmanFordCore>(&sys)] {
+            let Verdict::Sat { assignment } = verdict else {
+                panic!()
+            };
+            assert_eq!(assignment, vec![0, -i64::MAX, -i64::MAX]);
+        }
+    }
+
+    #[test]
+    fn minimum_weight_semantic_negation_is_exact() {
+        let sys = System {
+            n_vars: 2,
+            hard: vec![Edge { x: 0, y: 1, w: 0 }],
+            clauses: vec![Clause {
+                alts: vec![
+                    vec![Edge {
+                        x: 1,
+                        y: 0,
+                        w: i64::MIN,
+                    }],
+                    vec![],
+                ],
+            }],
+        };
+        assert!(solve(&sys).is_sat());
+    }
+
+    #[test]
+    #[should_panic(expected = "edge variable out of bounds")]
+    fn invalid_variable_is_rejected_explicitly() {
+        solve(&System {
+            n_vars: 1,
+            hard: vec![Edge { x: 1, y: 0, w: 0 }],
+            clauses: vec![],
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "requires an origin variable")]
+    fn missing_origin_is_rejected_explicitly() {
+        solve(&System::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "assignment exceeds i64")]
+    fn out_of_range_schedule_is_never_wrapped_or_called_unsat() {
+        solve(&System {
+            n_vars: 3,
+            hard: vec![
+                Edge {
+                    x: 0,
+                    y: 1,
+                    w: -i64::MAX,
+                },
+                Edge {
+                    x: 1,
+                    y: 2,
+                    w: -i64::MAX,
+                },
+            ],
+            clauses: vec![],
+        });
+    }
 
     // "a >= b + k" as an edge (b - a <= -k).
     fn ge(a: VarId, b: VarId, k: i64) -> Edge {

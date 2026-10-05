@@ -10,10 +10,30 @@
 use std::cell::RefCell;
 use std::task::{Context, Poll, Waker};
 
-use crate::event::{Label, Model, Tid, Val, Window};
+use crate::event::{Label, Model, ReceiveTiming, Tid, Val, Window};
 use crate::program::ThreadNext;
 
 use super::{BoxedPred, LocalFut};
+
+thread_local! {
+    /// `"recv#k"` tags, built once per `k` and shared by every `Pred` for that position.
+    /// A receive label is emitted on essentially every replay, and the `format!` behind that
+    /// tag was one of the largest single costs in the untimed profile; the tag is a pure
+    /// function of `k`, so caching it is byte-identical.
+    static RECV_TAGS: RefCell<Vec<std::sync::Arc<str>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The cached `"recv#k"` tag.
+fn recv_tag(k: usize) -> std::sync::Arc<str> {
+    RECV_TAGS.with(|tags| {
+        let mut tags = tags.borrow_mut();
+        while tags.len() <= k {
+            let next = tags.len();
+            tags.push(std::sync::Arc::from(format!("recv#{next}").as_str()));
+        }
+        tags[k].clone()
+    })
+}
 
 /// Outcome recorded while replaying a single poll of a process body.
 enum Halt {
@@ -132,6 +152,7 @@ impl ThreadCell {
         &mut self,
         pred_fn: &mut Option<BoxedPred>,
         blocking: bool,
+        timing: ReceiveTiming,
     ) -> Poll<Option<Val>> {
         // Once we have recorded the next event (or finished), further awaits just park
         // so the top-level poll unwinds; the recorded outcome takes priority.
@@ -169,11 +190,12 @@ impl ThreadCell {
             let f = pred_fn
                 .take()
                 .expect("recv future polled twice after parking");
-            let pred = crate::event::Pred::new(format!("recv#{k}"), f);
-            let label = if blocking {
-                Label::recv(pred)
-            } else {
-                Label::recv_nb(pred)
+            let pred = crate::event::Pred::from_boxed(recv_tag(k), f);
+            let label = match timing {
+                ReceiveTiming::Abstract if blocking => Label::recv(pred),
+                ReceiveTiming::Abstract => Label::recv_nb(pred),
+                ReceiveTiming::Timeout(window) => Label::recv_timeout_timed(pred, window),
+                ReceiveTiming::Poll(window) => Label::recv_poll_timed(pred, window),
             };
             self.halt = Halt::Emit(label);
             Poll::Pending

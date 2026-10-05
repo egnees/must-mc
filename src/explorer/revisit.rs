@@ -9,6 +9,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 
+use super::source_order::SourceOrder;
 use crate::consistency::consistent;
 use crate::event::{EventId, Label, Val};
 use crate::graph::ExecutionGraph;
@@ -52,7 +53,7 @@ fn restrict_prefix(g: &ExecutionGraph, pred: impl Fn(EventId) -> bool) -> Execut
 
 /// `G|_Previous` for [`previous_set`]'s set, cut through [`restrict_prefix`] instead of
 /// through a materialised `BTreeSet` (same graph, same stamps).
-fn restrict_previous(
+pub(super) fn restrict_previous(
     g: &ExecutionGraph,
     e: EventId,
     porf_s: &BTreeSet<EventId>,
@@ -101,9 +102,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             // `deleted_set` itself is deferred below to the survivors of the two rejection
             // tests — it is a pure function of `(g, r, porf_e)`, so nothing else moves.
             let sr = g.stamp(r);
-            let mut g2 = restrict_prefix(g, |x| {
-                g.stamp(x) <= sr || porf_e.contains(&x) || x == e
-            });
+            let mut g2 = restrict_prefix(g, |x| g.stamp(x) <= sr || porf_e.contains(&x) || x == e);
             g2.set_rf(r, Some(e));
 
             // line 13's `VisitIfConsistent`, evaluated here rather than at the recursion (so the
@@ -150,6 +149,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             // `Deleted` is walked, not built: the set object is only needed by the observer
             // on the accepted path below, and the predicate is the same one the keep-lengths
             // above use.
+            self.observer.on_revisit_candidate(g, r, e, &g2);
             let mut all_ok = true;
             for ep in g
                 .iter_events()
@@ -157,6 +157,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                 .chain(std::iter::once(r))
             {
                 if !self.revisit_condition(g, ep, &porf_e, e) {
+                    self.observer.on_revisit_arm_rejected(g, r, e, &g2, ep);
                     all_ok = false;
                     break;
                 }
@@ -167,6 +168,36 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                 // Keep scanning other candidates - never `break`: the monotonicity that
                 // would justify an early exit is unproven for the tiebreaker.
                 continue;
+            }
+
+            // A repairing send can make every old holder fail the viability oracle even
+            // though its rewritten target is feasible. PASS then admits several holders.
+            // Reject one only when a bounded replay proves that an all-minimum owner
+            // reaches the identical target, including insertion stamps. That owner's
+            // path is forward-only and its final canonical arms are unconditional minima,
+            // so this rejection cannot remove its replacement. Unsupported/over-budget
+            // cases retain the existing decision; this is not a general T2 proof.
+            if self.time_predicate && self.time_level >= 4 && !self.canon_free {
+                if let Some(owner) = super::repair_owner::certify_forward_minimum_owner(
+                    self.program,
+                    &self.priorities,
+                    g,
+                    r,
+                    e,
+                    &g2,
+                    256,
+                ) {
+                    self.observer.on_revisit_owner_certified(
+                        g,
+                        r,
+                        e,
+                        &owner.host,
+                        owner.replay_events,
+                    );
+                    self.observer.on_revisit_arm_rejected(g, r, e, &g2, r);
+                    self.observer.on_revisit_rejected(g, r, e);
+                    continue;
+                }
             }
 
             self.observer
@@ -184,17 +215,16 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     /// Under `time_predicate` the nondet canon is the **existential PASS rule**
     /// (T2_ORACLE_SPEC §1.1): a `Deleted` nondet passes iff *no strictly smaller value is
     /// viable* — [`crate::time::viable`], an order-free DFS over completions of
-    /// [`viability_base`]. The held value itself is never tested: `g` is its own witness (its
-    /// region is consistent and feasible with `s` present-unread by construction). A min-holder
-    /// therefore passes with **zero** oracle calls — on a value-independent program the rule is
-    /// behaviourally the untimed min rule. `&mut self` only for the oracle memo.
+    /// [`viability_base`]. PASS does not require the held value itself to be viable; debug
+    /// builds report that separate diagnostic for nonminimum holders. A minimum holder
+    /// passes with **zero** oracle calls. `&mut self` is used for the oracle memo.
     ///
     /// The blocking-receive canon (line 22) is now the **same existential rule** — see
     /// [`Self::pass_recv`]. It used to be the local `(avail,tid,idx)` tiebreaker, whose
     /// `earliest_times(trial)` filter tests *local* feasibility, a strict over-approximation of
     /// viability; that gap (risk R1) turned out to be a real, machine-confirmed completeness loss
-    /// (`tests/r1_line22.rs`), not a theoretical one. Off the flag both arms are the exact untimed
-    /// rules, byte-for-byte.
+    /// (`tests/r1_line22.rs`), not a theoretical one. Off the flag both arms use the untimed
+    /// rules and the configured total consistent-source selector (EventId by default).
     fn revisit_condition(
         &mut self,
         g: &ExecutionGraph,
@@ -202,6 +232,17 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         porf_s: &BTreeSet<EventId>,
         revisiting: EventId,
     ) -> bool {
+        if !self.time_predicate && !self.canon_free {
+            if self.source_order == SourceOrder::EventId {
+                return super::ownership::untimed_revisit_condition(g, ep, porf_s);
+            }
+            return super::ownership::untimed_revisit_condition_with_order(
+                g,
+                ep,
+                porf_s,
+                self.source_order,
+            );
+        }
         match g.label(ep) {
             // line 18: a non-blocking receive is canonical iff it reads bottom. Under the
             // predicate that is the **existential PASS rule** too — see [`Self::pass_nb`]. The
@@ -263,13 +304,11 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                         .copied()
                         .filter(|&v| crate::intern::resolve(v) < held_str)
                         .collect();
-                    smaller.sort_by(|a, b| {
-                        crate::intern::resolve(*a).cmp(crate::intern::resolve(*b))
-                    });
+                    smaller
+                        .sort_by(|a, b| crate::intern::resolve(*a).cmp(crate::intern::resolve(*b)));
                     if smaller.is_empty() {
-                        // Min-holder: zero oracle calls (the frequent path). The held value is
-                        // NOT tested — `g` is its own witness (its region is consistent and
-                        // eager-feasible, with `s` present-unread, by construction).
+                        // The minimum passes by the definition of PASS, without an oracle
+                        // call. This does not assert that the held value is itself viable.
                         return true;
                     }
                     let base = viability_base(g, ep, porf_s);
@@ -289,7 +328,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                             .on_viable_verdict(&base, ep, v, revisiting, &rev_label, verdict);
                         verdict
                     });
-                    self.assert_self_witness(&base, ep, v_held, revisiting, &rev_label);
+                    self.report_self_viability(&base, ep, v_held, revisiting, &rev_label);
                     !refuted
                 } else {
                     let min = set.iter().min_by(|a, b| {
@@ -307,41 +346,27 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                 // send, and most deleted events are sends). `Previous` is
                 // `{x | x <=G ep} ∪ porf(s)`, so membership is the stamp test below.
                 let se = g.stamp(ep);
-                !g.iter_recvs()
-                    .any(|rp| g.reads_from(rp) == Some(ep) && (g.stamp(rp) <= se || porf_s.contains(&rp)))
+                !g.iter_recvs().any(|rp| {
+                    g.reads_from(rp) == Some(ep) && (g.stamp(rp) <= se || porf_s.contains(&rp))
+                })
             }
         }
     }
 
-    /// The **self-witness detector** (`C1_HARDENING_SPEC` §0.7): in debug builds, check that the
-    /// *held* choice is itself viable.
+    /// Report held-value viability in debug builds without treating it as an invariant.
     ///
-    /// Why it matters. PASS is antitone in the viable set `V`, so `PASS(x) ⟺ x ≤ min(V)`: the
-    /// number of holders that pass is `|{v ∈ R : v ≤ min(V)}|`, and `V = ∅` is the limiting case
-    /// where **every** reaching holder passes and each non-minimal one is a duplicate
-    /// (`T2_GAMMA_FRONTIER` §Ⅰ/§Ⅳ — which refutes §0.7's "discontinuous" phrasing but not its
-    /// direction). "The held choice is always viable" (the strengthened form of `T2_PROOFS_B`
-    /// B1.a) is exactly the statement whose falsity means `V = ∅`; this is its machine detector,
-    /// and a red one is a *finding*, not a nuisance.
+    /// Backward candidates are evaluated even when this send's forward gate failed. An
+    /// individual arm can also run before another arm rejects the candidate. Consequently
+    /// level 4 alone does not imply that the current holder is viable. Aborting here used
+    /// to interrupt enumeration of valid terminals (the two-process regression in
+    /// `tests/t2_diagnostics.rs`). A false answer remains observable for proof audits but
+    /// does not change PASS or exploration. It also does not imply the whole viable set
+    /// is empty, nor establish that a duplicate will be reported.
     ///
-    /// # Scope: only the coherent, fully-gated regime (`time_level >= 4`)
-    ///
-    /// B1.a is proved **only under premise (H)** — "the line-9 forward gate passed for this
-    /// `g_add`". The diagnostic ladder's rung L2 (`Config::time_predicate_level == 2`, T-PRED and
-    /// both T-GATEs off) evaluates the canon on graphs for which (H) was never established, so the
-    /// assertion is *out of contract* there and a violation carries no information about the
-    /// shipping regime. Measured on the directed canon corpus (`tests/ladder.rs`): 36 of 400
-    /// programs violate it at **L2**, and none at L1, L3, L4 or L2′ — likewise 2 of 2000 on the
-    /// value-dependent corpus, again L2-only. Restricting the check to `time_level >= 4` is
-    /// therefore a *scope correction*, not a weakening: the shipping regime (and plain
-    /// `with_time_predicate()`, whose level is 4) is checked exactly as before. To re-measure the
-    /// L2 rate, drop the guard below and run `ladder_canon_self_witness_probe`.
-    ///
-    /// Only checked on the paths that already call the oracle (a non-min holder). A min holder
-    /// passes vacuously under both the old and the new rule, so `V = ∅` costs nothing there —
-    /// and checking it would put an oracle call on the hot path of every revisit.
+    /// As before, only nonminimum nondeterministic holders at level 4 are queried. The
+    /// release implementation does no additional work.
     #[cfg(debug_assertions)]
-    fn assert_self_witness(
+    fn report_self_viability(
         &mut self,
         base: &ExecutionGraph,
         ep: EventId,
@@ -349,7 +374,6 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         revisiting: EventId,
         rev_label: &Label,
     ) {
-        // Premise (H) is only established when the line-9 gate ran — see the scope note above.
         if self.time_level < 4 {
             return;
         }
@@ -363,16 +387,13 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             rev_label,
             &mut self.viable_memo,
         );
-        assert!(
-            held_viable,
-            "self-witness (C1_HARDENING_SPEC §0.7): held nondet value at {ep} is not viable \
-             ⇒ V = ∅ ⇒ every reaching holder PASSes ⇒ duplicate risk"
-        );
+        self.observer
+            .on_held_viable_verdict(base, ep, v_held, revisiting, rev_label, held_viable);
     }
 
     /// No-op outside debug builds — see the `cfg(debug_assertions)` twin.
     #[cfg(not(debug_assertions))]
-    fn assert_self_witness(
+    fn report_self_viability(
         &mut self,
         _base: &ExecutionGraph,
         _ep: EventId,
@@ -419,7 +440,8 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     /// * **Price**: duplicates (optimality-(a)), never loss — and discontinuously so: while some
     ///   `≺`-smaller candidate stays viable exactly one holder passes, but once *all* of them are
     ///   non-viable every reaching holder passes (`C1_HARDENING_SPEC` §0.7). The debug
-    ///   self-witness assertion below is the detector for that regime.
+    ///   held-value diagnostic records evidence relevant to that question without asserting
+    ///   that an individual failed query implies a duplicate.
     /// * **Untimed projection**: off the flag this function is not called at all (the caller
     ///   short-circuits to the plain `(tid, idx)` minimum), so "flag OFF ⇒ byte-identical" holds
     ///   syntactically rather than by argument.
@@ -733,6 +755,41 @@ pub fn get_cons_tiebreaker(
     found
 }
 
+/// A total untimed-consistent source selector under the configured stable order.
+///
+/// Unlike the T2 candidate path, this never rejects a source for temporal infeasibility.
+/// The old held RF is erased, all matching unread sources remain eligible, and full
+/// untimed consistency decides admissibility. The public original-order API above is
+/// unchanged, including its early-exit fast path.
+pub(crate) fn get_cons_tiebreaker_with_order(
+    h: &ExecutionGraph,
+    e: EventId,
+    order: SourceOrder,
+) -> Option<EventId> {
+    if order == SourceOrder::EventId {
+        return get_cons_tiebreaker(h, e, false);
+    }
+    let mut trial = h.clone();
+    trial.set_rf(e, None);
+    let mut candidates: Vec<_> = trial
+        .iter_sends()
+        .filter(|&s| {
+            trial.matches(s, e)
+                && !trial
+                    .iter_recvs()
+                    .any(|r| r != e && trial.reads_from(r) == Some(s))
+        })
+        .collect();
+    candidates.sort_by_key(|&s| order.key(&trial, s));
+    for source in candidates {
+        trial.set_rf(e, Some(source));
+        if consistent(&trial) {
+            return Some(source);
+        }
+    }
+    None
+}
+
 /// Every send `e` could canonically read on `h`, in the tiebreaker order — `(avail_lb, tid, idx)`
 /// under `time_predicate`, plain `(tid, idx)` off it. [`get_cons_tiebreaker`] is its head; the
 /// R1 rule (§D.5, [`super::Explorer::revisit_condition`]) needs the whole ordered list, because
@@ -787,6 +844,69 @@ pub(crate) fn cons_candidates(
 }
 
 #[cfg(test)]
+mod source_order_tests {
+    use super::*;
+    use crate::event::{Model, Pred, Window};
+
+    #[test]
+    fn self_send_order_is_rf_blind_and_does_not_filter_late_sources() {
+        let mut g = ExecutionGraph::new();
+        let remote = g.add_event(
+            0,
+            Label::send_within(Model::Asyn, 1, "remote", Window::new(1, 1)),
+        );
+        let local = g.add_event(
+            1,
+            Label::send_within(Model::Asyn, 1, "local", Window::new(10, 10)),
+        );
+        let r = g.add_event(1, Label::recv(Pred::any()));
+        for held in [remote, local] {
+            g.set_rf(r, Some(held));
+            assert_eq!(get_cons_tiebreaker(&g, r, false), Some(remote));
+            assert_eq!(
+                get_cons_tiebreaker_with_order(&g, r, SourceOrder::SelfSendFirst),
+                Some(local)
+            );
+        }
+        assert!(!crate::time::check(&g).is_feasible());
+    }
+
+    #[test]
+    fn preferred_source_still_requires_full_untimed_consistency() {
+        for model in [Model::Asyn, Model::P2p, Model::Cd, Model::Mbox] {
+            let mut g = ExecutionGraph::new();
+            let remote = g.add_event(0, Label::send(model, 1, "remote"));
+            let r = g.add_event(1, Label::recv(Pred::any()));
+            g.set_rf(r, Some(remote));
+            let cyclic = g.add_event(1, Label::send(model, 1, "too-late"));
+            assert!(
+                SourceOrder::SelfSendFirst.key(&g, cyclic)
+                    < SourceOrder::SelfSendFirst.key(&g, remote)
+            );
+            assert_eq!(
+                get_cons_tiebreaker_with_order(&g, r, SourceOrder::SelfSendFirst),
+                Some(remote)
+            );
+        }
+    }
+
+    #[test]
+    fn preferred_source_consumed_by_another_receive_is_excluded() {
+        let mut g = ExecutionGraph::new();
+        let remote = g.add_event(0, Label::send(Model::Asyn, 1, "remote"));
+        let local = g.add_event(1, Label::send(Model::Asyn, 1, "local"));
+        let first = g.add_event(1, Label::recv(Pred::eq("local")));
+        g.set_rf(first, Some(local));
+        let next = g.add_event(1, Label::recv(Pred::any()));
+        g.set_rf(next, Some(remote));
+        assert_eq!(
+            get_cons_tiebreaker_with_order(&g, next, SourceOrder::SelfSendFirst),
+            Some(remote)
+        );
+    }
+}
+
+#[cfg(test)]
 mod viability_base_tests {
     //! O6 units (T2_ORACLE_SPEC §1.8): the dependency cone is a sound over-approximation —
     //! po-suffix per thread, propagated along rf, readers dropped inclusively — and everything
@@ -826,9 +946,17 @@ mod viability_base_tests {
         // ep survives (its value is re-pinned by the oracle); its po-suffix (s01) is cone;
         // r10 read s01 ⇒ dropped inclusively, s11 goes as its po-suffix; r20 read s11 ⇒ dropped.
         assert_eq!(base.thread_len(0), 1, "only ep survives on thread 0");
-        assert_eq!(base.thread_len(1), 0, "reader of a cone send is dropped inclusively");
+        assert_eq!(
+            base.thread_len(1),
+            0,
+            "reader of a cone send is dropped inclusively"
+        );
         assert_eq!(base.thread_len(2), 0, "second rf hop is dropped too");
-        assert_eq!(base.nd_value(ep), Some(&"a".into()), "ep keeps its (re-pinnable) value");
+        assert_eq!(
+            base.nd_value(ep),
+            Some(&"a".into()),
+            "ep keeps its (re-pinnable) value"
+        );
     }
 
     /// Events independent of `ep` survive with their rf intact.
@@ -847,7 +975,11 @@ mod viability_base_tests {
         assert_eq!(base.thread_len(0), 1);
         assert_eq!(base.thread_len(1), 1);
         assert_eq!(base.thread_len(2), 1);
-        assert_eq!(base.reads_from(r20), Some(s10), "independent rf is preserved");
+        assert_eq!(
+            base.reads_from(r20),
+            Some(s10),
+            "independent rf is preserved"
+        );
     }
 
     /// The base is `G|_Previous` minus the cone — an event outside Previous is dropped even
@@ -865,7 +997,11 @@ mod viability_base_tests {
         let porf_s: BTreeSet<EventId> = vec![s10, r20].into_iter().collect();
         let base = viability_base(&g, ep, &porf_s);
 
-        assert_eq!(base.thread_len(1), 1, "s11 ∉ Previous is cut (po-prefix keeps s10)");
+        assert_eq!(
+            base.thread_len(1),
+            1,
+            "s11 ∉ Previous is cut (po-prefix keeps s10)"
+        );
         assert_eq!(base.reads_from(r20), Some(s10));
     }
 

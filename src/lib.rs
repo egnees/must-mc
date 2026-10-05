@@ -83,15 +83,16 @@ pub mod viz;
 pub use consistency::{
     consistent, consistent_asyn, consistent_cd, consistent_mbox, consistent_p2p, well_formed,
 };
-pub use event::{Event, EventId, Label, Model, Pred, Tid, Val, Window};
-pub use explorer::{explore, Config, Execution, ExecutionKind};
+pub use event::{Event, EventId, Label, Model, Pred, ReceiveTiming, Tid, Val, Window};
+pub use explorer::{explore, CertifiedTimeConfig, Config, Execution, ExecutionKind, SourceOrder};
 pub use graph::ExecutionGraph;
 pub use observer::{
-    CountingObserver, DeadBranchDetector, ExecutionCollector, NullObserver, Observer,
-    RecordingObserver, Step, StepKind,
+    CountingObserver, DeadBranchDetector, ExecutionCollector, FrozenTimeEvent, FrozenTimeOutcome,
+    NullObserver, Observer, RecordingObserver, Step, StepKind, TimeCertificateEvent,
+    TimeCertificateOutcome,
 };
 pub use program::{Program, ThreadNext};
 pub use runtime::{Ctx, NondetFuture, RecvFuture, RecvTimeoutFuture, System, DEFAULT_MAX_EVENTS};
 pub use scheduler::{next_step, traces_of, NextStep};
-pub use time::{check, eager_feasible, TimedVerdict};
+pub use time::{check, check_mailbox, eager_feasible, TimedVerdict};
 pub use viz::{Summary as TraceSummary, TraceObserver};

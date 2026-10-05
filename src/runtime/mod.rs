@@ -21,8 +21,9 @@
 //!   rather than progress and bounds nothing - it must be a function of the trace.
 //! * Signal assertion failures with [`Ctx::assert_that`] (which emits `Label::Error`),
 //!   never `panic!` - a `panic!` inside a body crashes the checker.
-//! * A body may only `.await` the futures returned by [`Ctx::recv`], [`Ctx::recv_timeout`]
-//!   and [`Ctx::nondet`]. Awaiting any other future is reported as a `Label::Error`.
+//! * A body may only `.await` the futures returned by [`Ctx::recv`], [`Ctx::recv_timeout`],
+//!   [`Ctx::recv_timeout_timed`], [`Ctx::recv_poll_timed`] and [`Ctx::nondet`]. Awaiting
+//!   any other future is reported as a `Label::Error`.
 
 mod replay;
 
@@ -31,7 +32,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 
-use crate::event::{Label, Model, Tid, Val, Window};
+use crate::event::{Label, Model, ReceiveTiming, Tid, Val, Window};
 use crate::program::{Program, ThreadNext};
 
 use replay::{run_once, ThreadCell};
@@ -301,6 +302,8 @@ impl Ctx {
     /// and - unlike a send - may be read by several non-blocking receives at once. This is
     /// deliberately not a nondet-encoded timeout: N threads each doing one `recv_timeout`
     /// explore exactly one execution, not `2^N`.
+    /// This existing operation is time-transparent; use [`recv_timeout_timed`](Self::recv_timeout_timed)
+    /// or [`recv_poll_timed`](Self::recv_poll_timed) for an explicit time window.
     pub fn recv_timeout(
         &self,
         pred: impl Fn(&str) -> bool + Send + Sync + 'static,
@@ -308,6 +311,38 @@ impl Ctx {
         RecvTimeoutFuture {
             cell: self.cell.clone(),
             pred_fn: Some(Box::new(pred)),
+            timing: ReceiveTiming::Abstract,
+        }
+    }
+
+    /// Eager selective receive with a timeout chosen within `window` after invocation.
+    /// A successful receive can return before the lower bound, but not after the upper
+    /// bound. An empty return lies inside the window. Both advance the process clock.
+    /// The return value records the message or absence; actual time is a verifier witness.
+    pub fn recv_timeout_timed(
+        &self,
+        pred: impl Fn(&str) -> bool + Send + Sync + 'static,
+        window: Window,
+    ) -> RecvTimeoutFuture {
+        RecvTimeoutFuture {
+            cell: self.cell.clone(),
+            pred_fn: Some(Box::new(pred)),
+            timing: ReceiveTiming::Timeout(window),
+        }
+    }
+
+    /// Check the mailbox at a time within `window` after invocation. Both message and
+    /// empty outcomes complete inside the window and advance the process clock.
+    /// Equal-time delivery/check races respect causal and communication-model order.
+    pub fn recv_poll_timed(
+        &self,
+        pred: impl Fn(&str) -> bool + Send + Sync + 'static,
+        window: Window,
+    ) -> RecvTimeoutFuture {
+        RecvTimeoutFuture {
+            cell: self.cell.clone(),
+            pred_fn: Some(Box::new(pred)),
+            timing: ReceiveTiming::Poll(window),
         }
     }
 
@@ -346,7 +381,7 @@ impl Future for RecvFuture {
         let mut cell = this.cell.borrow_mut();
         // The graph stores payloads as interned `Sym`s; the process body works in `String`,
         // so resolve at the await boundary.
-        match cell.poll_recv(&mut this.pred_fn, true) {
+        match cell.poll_recv(&mut this.pred_fn, true, ReceiveTiming::Abstract) {
             Poll::Ready(Some(v)) => Poll::Ready(crate::intern::resolve(v).to_owned()),
             // A blocking receive never resolves to `None`: on a committed no-message read
             // `poll_recv` blocks the thread and returns `Pending` instead of `Ready(None)`.
@@ -356,13 +391,15 @@ impl Future for RecvFuture {
     }
 }
 
-/// Future returned by [`Ctx::recv_timeout`]; resolves to `Some(v)` for a received message
-/// or `None` when the timeout fires (no message). Unlike [`RecvFuture`], a committed
+/// Future returned by [`Ctx::recv_timeout`], [`Ctx::recv_timeout_timed`] and
+/// [`Ctx::recv_poll_timed`]; resolves to `Some(v)` for a received message or `None` for an
+/// empty completion. Unlike [`RecvFuture`], a committed
 /// no-message read resolves the future rather than blocking the thread.
 pub struct RecvTimeoutFuture {
     cell: Rc<RefCell<ThreadCell>>,
     /// Predicate closure, moved into the emitted `Label::recv_nb` when the receive parks.
     pred_fn: Option<BoxedPred>,
+    timing: ReceiveTiming,
 }
 
 impl Future for RecvTimeoutFuture {
@@ -376,7 +413,7 @@ impl Future for RecvTimeoutFuture {
         let this = self.get_mut();
         let mut cell = this.cell.borrow_mut();
         // Resolve the interned payload to a `String` for the body (see `RecvFuture::poll`).
-        match cell.poll_recv(&mut this.pred_fn, false) {
+        match cell.poll_recv(&mut this.pred_fn, false, this.timing) {
             std::task::Poll::Ready(opt) => {
                 std::task::Poll::Ready(opt.map(|v| crate::intern::resolve(v).to_owned()))
             }

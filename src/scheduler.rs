@@ -50,6 +50,25 @@ pub fn traces_of(g: &ExecutionGraph, num_threads: usize) -> Vec<Vec<Option<Val>>
 /// addable only when some unread send matches its predicate and destination.
 fn addable(g: &ExecutionGraph, tid: Tid, label: &Label) -> bool {
     match label {
+        Label::Recv { blocking: true, .. } => {
+            let mut read = crate::graph::PooledMarks::take();
+            crate::consistency::mark_read_sources(g, None, &mut read);
+            addable_with(g, tid, label, &read)
+        }
+        _ => true,
+    }
+}
+
+/// [`addable`] with the "which sends are already read" marks supplied by the caller.
+///
+/// The marks used to be recomputed inside the scan as `g.is_read(s)`, an `O(|E|)` sweep
+/// **per candidate send** — so a single addability query was `O(|S| · |E|)`, and one is run
+/// for every parked thread at every Visit. Marking the read sources once per `next_P`
+/// decision makes it `O(|E| + |S|)`. The candidate tests are also ordered cheapest-first
+/// (destination, then the mark, then the predicate), which only changes how often the
+/// user's predicate closure is evaluated, never the answer.
+fn addable_with(g: &ExecutionGraph, tid: Tid, label: &Label, read: &crate::graph::Marks) -> bool {
+    match label {
         Label::Send { .. } | Label::Error { .. } => true,
         // A nondet choice is always addable; assumption (ii) constrains blocking receives only.
         Label::Nondet { .. } => true,
@@ -57,17 +76,15 @@ fn addable(g: &ExecutionGraph, tid: Tid, label: &Label) -> bool {
         Label::Recv {
             blocking: false, ..
         } => true,
-        // Scanned with `is_read` per candidate rather than through `unread_sends`: the
-        // destination and predicate tests reject almost every send outright, and this runs
-        // for every blocked thread at every step, where a `Vec` per call was pure overhead.
         Label::Recv {
             blocking: true,
             pred,
+            ..
         } => g.iter_sends().any(|s| {
             let lbl = g.label(s);
             lbl.dst() == Some(tid)
+                && !read.contains(s)
                 && lbl.payload().is_some_and(|v| pred.test_sym(v))
-                && !g.is_read(s)
         }),
     }
 }
@@ -93,12 +110,39 @@ pub fn next_step<P: Program>(program: &P, priorities: &[Tid], g: &ExecutionGraph
 /// (`des = time_predicate || time_zombie`, T2_ORACLE_SPEC §2.1); with it `false` this is the
 /// ordinary priority policy and every count is byte-identical to the untimed explorer.
 pub fn pick(g: &ExecutionGraph, nexts: &[ThreadNext], priorities: &[Tid], des: bool) -> NextStep {
+    pick_with_time_semantics(g, nexts, priorities, des, false)
+}
+
+/// Scheduling changes construction order only; it never removes a consistent source.
+/// The explicit semantics bit is needed for send-only prefixes of timed programs.
+pub(crate) fn pick_with_time_semantics(
+    g: &ExecutionGraph,
+    nexts: &[ThreadNext],
+    priorities: &[Tid],
+    des: bool,
+    mailbox_time: bool,
+) -> NextStep {
     if des {
-        return pick_des(g, nexts);
+        return pick_des(g, nexts, mailbox_time);
     }
+    // The read-source marks are shared by every addability query of this decision, and are
+    // built only once a blocking receive actually needs them (the common case is a thread
+    // whose next event is unconditionally addable).
+    let mut read: Option<crate::graph::PooledMarks> = None;
     for &tid in priorities {
         if let ThreadNext::Next(label) = &nexts[tid] {
-            if addable(g, tid, label) {
+            let addable = match label {
+                Label::Recv { blocking: true, .. } => {
+                    let marks = read.get_or_insert_with(|| {
+                        let mut m = crate::graph::PooledMarks::take();
+                        crate::consistency::mark_read_sources(g, None, &mut m);
+                        m
+                    });
+                    addable_with(g, tid, label, marks)
+                }
+                _ => true,
+            };
+            if addable {
                 return NextStep::Event {
                     tid,
                     label: label.clone(),
@@ -126,12 +170,12 @@ fn blocked_threads(nexts: &[ThreadNext]) -> Vec<Tid> {
     blocked
 }
 
-/// The discrete-event `next_P(G)` policy of the time-intervals extension (T2_PLAN §2b, Lemma 1
-/// "drain-first"). It fixes the canonical insertion order `≤_G` by the earliest time each
-/// candidate event *can* occur, so that when a blocking receive is finally woken, every
-/// earlier-in-time send is already present and the receive forks over them as **forward
-/// siblings** (which is what lets T-PRED prune eager-infeasible reads without losing
-/// completeness — T2_PLAN §5).
+/// The discrete-event `next_P(G)` policy of the time-intervals extension. It fixes a
+/// deterministic insertion order using lower bounds from the hard temporal constraints.
+/// Those bounds can be strictly below every full feasible schedule: eager competitor
+/// constraints can raise another process's clock. Also, a receive ranked by one source
+/// can choose a later source in its forward fork. Thus this ordering alone does not prove
+/// that all earlier-arriving sends are present, or that timed pruning is complete.
 ///
 /// The order is a pure function of `g` (not of `priorities`): ties break by `(tid, idx)`, so
 /// `≤_G` is well defined and the whole search is priority-invariant by construction. Under the
@@ -168,12 +212,16 @@ fn blocked_threads(nexts: &[ThreadNext]) -> Vec<Tid> {
 /// so it is woken only when no can-fire receive exists; this is the choice that reproduces the
 /// untimed terminal set (a permanently-unreadable receive is added-and-dies, never a spurious
 /// blocked terminal).
-fn pick_des(g: &ExecutionGraph, nexts: &[ThreadNext]) -> NextStep {
+fn pick_des(g: &ExecutionGraph, nexts: &[ThreadNext], mailbox_time: bool) -> NextStep {
     // `None` only on an eager-infeasible `g`: every Visit the T2-predicate explorer reaches is
-    // gated feasible, so there `Some` and the LBs below are exact. The zombie regime visits
+    // gated feasible, so there `Some`; its hard-only LBs may still be loose. The zombie regime visits
     // infeasible graphs too; there the LBs fall back to 0 and the policy stays a deterministic
     // total function of `g` — the only property `next_P` needs.
-    let earliest = crate::time::earliest_times(g);
+    let earliest = if mailbox_time {
+        crate::time::earliest_mailbox_times(g)
+    } else {
+        crate::time::earliest_times(g)
+    };
 
     // Occ_lb(tid): the fire-LB of the last blocking receive currently on thread `tid`, else 0.
     // The next (not-yet-added) event of `tid` inherits this clock; a send adds its window.lo.
@@ -181,7 +229,7 @@ fn pick_des(g: &ExecutionGraph, nexts: &[ThreadNext]) -> NextStep {
         let len = g.thread_len(tid);
         for idx in (0..len).rev() {
             let e = EventId::new(tid, idx);
-            if g.label(e).blocking() == Some(true) {
+            if g.label(e).blocking() == Some(true) || g.label(e).is_timed_recv() {
                 return earliest.as_ref().and_then(|es| es.fire_lb(e)).unwrap_or(0);
             }
         }
@@ -200,7 +248,7 @@ fn pick_des(g: &ExecutionGraph, nexts: &[ThreadNext]) -> NextStep {
         // Send / error / nondet / non-blocking recv are always addable.
         debug_assert!(addable(g, tid, label));
         let lb = match label {
-            Label::Send { window, .. } => occ_lb(tid) + window.lo() as i64,
+            Label::Send { window, .. } => occ_lb(tid).saturating_add(window.lo() as i64),
             _ => occ_lb(tid), // clock-neutral: nondet / error / non-blocking recv
         };
         if best_a.is_none_or(|(blb, btid)| (lb, tid) < (blb, btid)) {
@@ -210,7 +258,10 @@ fn pick_des(g: &ExecutionGraph, nexts: &[ThreadNext]) -> NextStep {
     if let Some((_, tid)) = best_a {
         return NextStep::Event {
             tid,
-            label: nexts[tid].label().expect("phase-A winner has a next").clone(),
+            label: nexts[tid]
+                .label()
+                .expect("phase-A winner has a next")
+                .clone(),
         };
     }
 
@@ -241,7 +292,10 @@ fn pick_des(g: &ExecutionGraph, nexts: &[ThreadNext]) -> NextStep {
     if let Some((_, _, tid)) = best_b {
         return NextStep::Event {
             tid,
-            label: nexts[tid].label().expect("phase-B winner has a next").clone(),
+            label: nexts[tid]
+                .label()
+                .expect("phase-B winner has a next")
+                .clone(),
         };
     }
 

@@ -38,8 +38,8 @@
 //!   bytes in the shard buffer. Nothing intermediate is kept: no `serde`, no owned mirror
 //!   structs, and — unlike [`RecordingObserver`](crate::RecordingObserver) — no clone of
 //!   the graph. Memory is the size of the finished trace text, nothing more.
-//! - **No format version-2 knobs.** The output is byte-for-byte the v1 shape `must-viz`
-//!   validates; see `must-viz/TRACE_FORMAT.md`.
+//! - Untimed labels retain the v1 shape. Explicitly timed labels add optional `window`
+//!   (send) or `timing` (receive) metadata; see [`ReceiveTiming`].
 //!
 //! [`dump`](TraceObserver::dump) concatenates the shard buffers in worker order. A
 //! single-threaded run (the default) therefore yields one clean depth-first log, exactly
@@ -53,7 +53,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::event::{EventId, Label, Model, Tid};
+use crate::event::{EventId, Label, Model, ReceiveTiming, Tid, Window};
 use crate::explorer::{Execution, ExecutionKind};
 use crate::graph::ExecutionGraph;
 use crate::observer::{default_shards, worker_id, Observer};
@@ -447,7 +447,10 @@ fn push_event(buf: &mut Vec<u8>, g: &ExecutionGraph, e: EventId) {
 fn push_label(buf: &mut Vec<u8>, label: &Label) {
     match label {
         Label::Send {
-            model, dst, val, ..
+            model,
+            dst,
+            val,
+            window,
         } => {
             buf.extend_from_slice(br#"{"type":"send","model":"#);
             push_json_str(buf, model_str(*model));
@@ -455,13 +458,35 @@ fn push_label(buf: &mut Vec<u8>, label: &Label) {
             push_uint(buf, *dst as u64);
             buf.extend_from_slice(br#","val":"#);
             push_json_str(buf, crate::intern::resolve(*val));
+            if !window.is_untimed() {
+                buf.extend_from_slice(br#","window":"#);
+                push_window(buf, *window);
+            }
             buf.push(b'}');
         }
-        Label::Recv { pred, blocking } => {
+        Label::Recv {
+            pred,
+            blocking,
+            timing,
+        } => {
             buf.extend_from_slice(br#"{"type":"recv","pred":"#);
             push_json_str(buf, pred.repr());
             buf.extend_from_slice(br#","blocking":"#);
             buf.extend_from_slice(if *blocking { b"true" } else { b"false" });
+            if let Some(window) = timing.window() {
+                buf.extend_from_slice(br#","timing":{"mode":"#);
+                push_json_str(
+                    buf,
+                    match timing {
+                        ReceiveTiming::Timeout(_) => "timeout",
+                        ReceiveTiming::Poll(_) => "poll",
+                        ReceiveTiming::Abstract => unreachable!(),
+                    },
+                );
+                buf.extend_from_slice(br#","window":"#);
+                push_window(buf, window);
+                buf.push(b'}');
+            }
             buf.push(b'}');
         }
         Label::Nondet { set } => {
@@ -480,6 +505,17 @@ fn push_label(buf: &mut Vec<u8>, label: &Label) {
             buf.push(b'}');
         }
     }
+}
+
+fn push_window(buf: &mut Vec<u8>, window: Window) {
+    buf.extend_from_slice(br#"{"lo":"#);
+    push_uint(buf, window.lo());
+    buf.extend_from_slice(br#","hi":"#);
+    match window.hi() {
+        Some(hi) => push_uint(buf, hi),
+        None => buf.extend_from_slice(b"null"),
+    }
+    buf.push(b'}');
 }
 
 /// The nine `summary` counters, in the spec's field order.

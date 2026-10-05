@@ -149,6 +149,7 @@ fn is_maximal(prog: &SeqProgram, g: &ExecutionGraph, lens: &[usize], full_len: &
             Label::Recv {
                 blocking: true,
                 pred,
+                ..
             } => {
                 let addable = unread.iter().any(|&s| {
                     g.label(s).dst() == Some(t) && pred.test(g.label(s).val().unwrap_or(""))
@@ -548,10 +549,7 @@ fn check_program_zombie(
 
 /// Run `prog` under `Config::with_time_predicate` and assert the G1-accept invariants.
 fn check_program_predicate(case: usize, prog: &SeqProgram, partition: Option<&TimePartition>) {
-    let obs = (
-        ExecutionCollector::new(),
-        must::DeadBranchDetector::new(),
-    );
+    let obs = (ExecutionCollector::new(), must::DeadBranchDetector::new());
     explore(
         || prog.clone(),
         &obs,

@@ -1,6 +1,11 @@
 //! Eager-time realizability filter for terminal execution graphs (time-intervals extension,
 //! phase T1).
 //!
+//! The semantics below describe the legacy raw-arrival API. Explicit timed receive
+//! labels select [`mailbox`]'s direct-delivery semantics instead. Call [`check_mailbox`]
+//! explicitly for that contract on send-only graphs or protected restrictions that no
+//! longer contain timed receives. It supports Asyn/P2p/Mbox and timed timeout/poll returns.
+//!
 //! An untimed-consistent terminal graph `G` (full / blocked / error) is *time-realizable*
 //! when there exist arrival/fire times consistent with the eager receive semantics fixed in
 //! engine_plan §0. This module compiles that semantics into a difference-constraint system
@@ -35,11 +40,13 @@
 //!   the "consumed" test through its po position.
 //! * All comparisons are non-strict; `∞` is the absence of an edge (no sentinel).
 //!
-//! # Monotonicity (documented, licenses forward pruning)
+//! # Monotonicity for fixed-choice extensions
 //!
 //! Extending `G` only adds hard constraints and B-disjuncts (new sends = new competitors of
 //! existing receives; A-clauses are unchanged), so an eager-infeasible prefix stays
-//! infeasible. (The pruning it licenses lives in the explorer, not here.)
+//! infeasible while those choices are retained. This does not license pruning a whole
+//! MUST construction subtree: later sends can trigger backward revisits that replace
+//! an old receive choice. Such pruning additionally needs construction coverage.
 //!
 //! # Model support (v1)
 //!
@@ -49,7 +56,15 @@
 //! both present. [`check`] always runs the full path and assumes Asyn/P2p (the guard is in
 //! [`eager_feasible`]).
 
+pub mod future;
+pub mod mailbox;
 pub mod solver;
+pub mod witness;
+
+pub use mailbox::{
+    assert_mailbox_supported_models, check_mailbox, eager_mailbox_feasible, earliest_mailbox_times,
+    verify_mailbox_schedule, Action, TimedAction,
+};
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -74,12 +89,16 @@ enum TimeVar {
     Avail(EventId),
 }
 
-/// A satisfying eager schedule: arrival time of every send, fire time of every blocking
-/// receive. All values are origin-anchored (`ORIGIN` = 0) and non-negative.
+/// A satisfying eager schedule. In mailbox mode, `arr` is actual delivery and `fire`
+/// includes every receive completion; the legacy mode records raw arrivals and blocking
+/// receives only. All values are origin-anchored (`ORIGIN` = 0) and non-negative.
 #[derive(Clone, Debug, Default)]
 pub struct Schedule {
     pub arr: BTreeMap<EventId, i64>,
     pub fire: BTreeMap<EventId, i64>,
+    /// Complete action order for direct-mailbox schedules, including equal-time races.
+    /// Empty for schedules produced by the legacy raw-arrival verifier.
+    pub actions: Vec<TimedAction>,
 }
 
 /// A structured (best-effort) reason a graph is time-infeasible: the constraint atoms that
@@ -106,6 +125,12 @@ pub enum ExplainAtom {
     Competitor { r: EventId, m: EventId },
     /// A `max` witness of `avail(s)`: `avail(s) ≥/≤ arr(witness)`.
     AvailDef { s: EventId, witness: EventId },
+    /// A timed receive's completion window.
+    ReceiveWindow(EventId),
+    /// A necessary causal, delivery or receive action precedence.
+    MailboxOrder { before: Action, after: Action },
+    /// The graph fails original MUST well-formedness or communication consistency.
+    UntimedInconsistent,
 }
 
 impl fmt::Display for ExplainAtom {
@@ -118,6 +143,9 @@ impl fmt::Display for ExplainAtom {
             ExplainAtom::BranchB(r) => write!(f, "B({r})"),
             ExplainAtom::Competitor { r, m } => write!(f, "competitor({r},{m})"),
             ExplainAtom::AvailDef { s, witness } => write!(f, "avail({s})≥arr({witness})"),
+            ExplainAtom::ReceiveWindow(r) => write!(f, "receive-window({r})"),
+            ExplainAtom::MailboxOrder { before, after } => write!(f, "{before:?} < {after:?}"),
+            ExplainAtom::UntimedInconsistent => f.write_str("untimed-inconsistent"),
         }
     }
 }
@@ -160,6 +188,10 @@ impl TimedVerdict {
 /// `eager_feasible`, a release build under the predicate would never reach it and would check a
 /// Cd/Mbox program silently under asyn time semantics.
 pub fn assert_supported_models(g: &ExecutionGraph) -> bool {
+    if g.iter_recvs().any(|r| g.label(r).is_timed_recv()) {
+        assert_mailbox_supported_models(g);
+        return true;
+    }
     let any_timed = g
         .iter_sends()
         .any(|s| !g.send_window(s).map(|w| w.is_untimed()).unwrap_or(true));
@@ -190,9 +222,13 @@ pub fn eager_feasible(g: &ExecutionGraph) -> bool {
     check(g).is_feasible()
 }
 
-/// Full realizability check with a schedule / explanation. Always runs the complete path (no
-/// fast path), so it is also the vacuity witness for untimed graphs. Assumes Asyn/P2p.
+/// Full realizability check with a schedule / explanation. Explicit timed receive labels
+/// dispatch to [`check_mailbox`]; otherwise this retains the legacy Asyn/P2p contract.
+/// Always runs the complete path (no fast path).
 pub fn check(g: &ExecutionGraph) -> TimedVerdict {
+    if g.iter_recvs().any(|r| g.label(r).is_timed_recv()) {
+        return check_mailbox(g);
+    }
     let builder = Builder::build(g);
     match solve(&builder.system) {
         Verdict::Sat { assignment } => TimedVerdict::Feasible(builder.schedule(&assignment)),
@@ -202,14 +238,14 @@ pub fn check(g: &ExecutionGraph) -> TimedVerdict {
 
 // -- T-LB: earliest (lower-bound) times ------------------------------------------------
 //
-// The DES policy (T2_PLAN §2b) orders `≤_G` insertions by the earliest time an event *can*
-// occur, and the time-aware canon (T2_PLAN §2d) ranks candidate sends by their earliest
-// guaranteed arrival. Both need a lower bound (LB) of `arr`/`avail`/`fire` per event.
+// The DES policy (T2_PLAN §2b) orders `≤_G` insertions using lower bounds on event times,
+// and the time-aware canon (T2_PLAN §2d) ranks candidate sends by arrival lower bounds.
+// These bounds need not be attainable in the full eager system.
 // [`earliest_times`] computes them from the eager system of `g`.
 
-/// Pointwise lower bounds — earliest feasible times — of every time variable of `g`'s eager
-/// system: `arr(s)` and `avail(s)` for sends, `fire(r)` for blocking receives. All values are
-/// origin-anchored (`ORIGIN` = time 0, non-negative).
+/// Pointwise lower bounds from the hard-constraint relaxation of `g`'s eager system:
+/// `arr(s)` and `avail(s)` for sends, `fire(r)` for blocking receives. They need not be
+/// feasible times in the full system. All values are origin-anchored and non-negative.
 #[derive(Clone, Debug, Default)]
 pub struct Earliest {
     arr: BTreeMap<EventId, i64>,
@@ -227,7 +263,8 @@ impl Earliest {
     pub fn avail_lb(&self, s: EventId) -> Option<i64> {
         self.avail.get(&s).copied()
     }
-    /// LB of `fire(r)` for a blocking receive `r`. `None` for any other event.
+    /// LB of completion `fire(r)`. The legacy mode includes blocking receives only;
+    /// [`earliest_mailbox_times`] includes every completed receive.
     pub fn fire_lb(&self, r: EventId) -> Option<i64> {
         self.fire.get(&r).copied()
     }
@@ -252,16 +289,20 @@ impl Earliest {
 /// variables like `fire` come out arbitrarily high), so the LB is taken from an explicit
 /// longest-path fixpoint, not from `solve`.
 ///
-/// In practice the relaxation is *exact* on the shapes T2 needs: with pinned windows
-/// (`lo == hi`) every `arr` is forced, `avail` = max of channel-prefix arrivals is already
-/// forced by the hard `avail ≥ arr(s″)` edges (the dropped max clause only adds the redundant
-/// upper bound `avail ≤ one arr`), and `fire = max(Occ, avail)` is forced by the two hard gate
-/// edges (the dropped A/B clause only adds upper bounds and the competitor conjuncts, neither
-/// of which raises a lower bound). The unit tests pin the exact values (`p2p_gating`:
-/// `fire_lb(r) == 50`; asyn windows). A looser (still sound) LB can only appear where a
-/// disjunct is the *sole* raiser of some variable's minimum, which none of the eager clauses
-/// are for `arr`/`avail`/`fire`.
+/// These bounds can be strictly loose for interval windows. For example, a process receives
+/// its own `w[1,20]` and sends `c[1,1]`; another process is committed to a matching message at
+/// time 20. Eager competition can require `arr(c) >= 20`, hence `fire(recv(w)) >= 19`, while
+/// the hard relaxation still reports a fire lower bound of 1. Dropped competitor clauses can
+/// therefore raise not just message arrivals but another process's clock through correlation.
+///
+/// Exactness holds in the restricted feasible, blocking-only, fixed positive-point fragment:
+/// all windows are `[d,d]` with `d > 0`, pinned RF and process order determine the clocks
+/// recursively, and the least hard assignment realizes that same recurrence. This special
+/// case does not justify treating general interval lower bounds as attainable timestamps.
 pub fn earliest_times(g: &ExecutionGraph) -> Option<Earliest> {
+    if g.iter_recvs().any(|r| g.label(r).is_timed_recv()) {
+        return earliest_mailbox_times(g);
+    }
     let builder = Builder::build(g);
     // Feasibility: full disjunctive system (the hard core alone would be unsound — it accepts
     // the Conditional-Extensibility counterexample).
@@ -362,7 +403,9 @@ pub fn forced_closure<P: Program>(
                     closure.set_nd(e, set[0]); // singleton nondet = its only value
                     acted = true;
                 }
-                Label::Recv { blocking: false, .. } => {
+                Label::Recv {
+                    blocking: false, ..
+                } => {
                     let e = closure.add_event(tid, label.clone());
                     closure.set_rf(e, None); // nb-recv canon = ⊥ (T2_PLAN §2d)
                     acted = true;
@@ -731,20 +774,49 @@ pub fn viable_recv_bot<P: Program>(
 /// One DFS node of [`viable`]: drain → prune → success test → branch. Takes `h` by value (the
 /// callers hand over freshly built children).
 fn viable_search<P: Program>(
-    mut h: ExecutionGraph,
+    h: ExecutionGraph,
     program: &P,
     priorities: &[Tid],
     revisiting: EventId,
     rev_label: &Label,
     memo: &mut ViableMemo,
 ) -> bool {
+    match viable_search_with(
+        h,
+        program,
+        priorities,
+        revisiting,
+        rev_label,
+        memo,
+        &mut witness::NoDiagnostics,
+    ) {
+        Ok(verdict) => verdict,
+        Err(never) => match never {},
+    }
+}
+
+/// Shared search: the production controller is zero-sized and cannot stop. The diagnostic
+/// controller records a concrete success and can stop without caching an incomplete result.
+#[allow(clippy::too_many_arguments)]
+fn viable_search_with<P: Program, C: witness::SearchControl>(
+    mut h: ExecutionGraph,
+    program: &P,
+    priorities: &[Tid],
+    revisiting: EventId,
+    rev_label: &Label,
+    memo: &mut ViableMemo,
+    control: &mut C,
+) -> Result<bool, C::Stop> {
+    control.enter_state()?;
     let key = (
         h.canonical_key(),
         revisiting,
         crate::graph::label_key(rev_label),
     );
     if let Some(cached) = memo.get(&key) {
-        return cached;
+        if control.use_cached(cached) {
+            return Ok(cached);
+        }
     }
     let n = program.num_threads();
 
@@ -765,9 +837,11 @@ fn viable_search<P: Program>(
             };
             match label {
                 Label::Send { .. } | Label::Error { .. } => {
+                    control.add_event(true)?;
                     h.add_event(tid, label.clone());
                 }
                 Label::Nondet { set } if set.len() == 1 => {
+                    control.add_event(true)?;
                     let e = h.add_event(tid, label.clone());
                     h.set_nd(e, set[0]);
                 }
@@ -781,7 +855,7 @@ fn viable_search<P: Program>(
                 && h.label(revisiting) != rev_label
             {
                 memo.put(key, false);
-                return false;
+                return Ok(false);
             }
             acted = true;
             break; // one event per round: recompute `nexts` (the program may branch)
@@ -800,11 +874,11 @@ fn viable_search<P: Program>(
     if h.thread_len(revisiting.tid) > revisiting.idx {
         if h.label(revisiting) != rev_label {
             memo.put(key, false);
-            return false;
+            return Ok(false);
         }
     } else if nexts[revisiting.tid].is_finished() {
         memo.put(key, false);
-        return false;
+        return Ok(false);
     }
     // Prefix-closedness (§3.2.1 contrapositive) and L1-fwd: an inconsistent or
     // eager-infeasible state has no consistent/feasible extension — prune. This also covers
@@ -828,7 +902,7 @@ fn viable_search<P: Program>(
     // this same `h`. Shares the worker's gate memo with lines 9/13 (H2).
     if !consistent(&h) || !gate_feasible_cached(&h, program, priorities, memo) {
         memo.put(key, false);
-        return false;
+        return Ok(false);
     }
 
     // 3. SUCCESS (§1.4): `s` present-unread with the right label. The visitability gate — the
@@ -839,26 +913,29 @@ fn viable_search<P: Program>(
     // success state reaches this same test at its quiescence).
     let s_present = h.thread_len(revisiting.tid) > revisiting.idx;
     if s_present && !h.is_read(revisiting) {
+        control.success(&h);
         memo.put(key, true);
-        return true;
+        return Ok(true);
     }
     // Permanent failure: `s` present but read — rf is never unset on the forward walk, so no
     // descendant can have it unread again.
     if s_present && h.is_read(revisiting) {
         memo.put(key, false);
-        return false;
+        return Ok(false);
     }
 
     // 4. BRANCH over (thread × option). Every pending choice point of every thread is tried:
     // a blocking receive over each present *consistent* source (feasibility is left to the
     // child's own step-2 check — one solver call either way, and the memo dedupes), a
     // non-blocking receive over those plus ⊥, a nondet (|S| ≥ 2) over each value.
+    control.branch_state();
     for (tid, next) in nexts.iter().enumerate() {
         let ThreadNext::Next(label) = next else {
             continue;
         };
         match label {
             Label::Recv { .. } => {
+                control.add_event(false)?;
                 let mut trial = h.clone();
                 let e = trial.add_event(tid, label.clone());
                 // Present sends in (tid, idx) order, then ⊥. Reading `revisiting` itself is
@@ -876,35 +953,40 @@ fn viable_search<P: Program>(
                     if !crate::consistency::consistent_after_recv(&trial, e) {
                         continue;
                     }
-                    if viable_search(
+                    control.branch_child();
+                    if viable_search_with(
                         trial.clone(),
                         program,
                         priorities,
                         revisiting,
                         rev_label,
                         memo,
-                    ) {
+                        control,
+                    )? {
                         memo.put(key, true);
-                        return true;
+                        return Ok(true);
                     }
                 }
             }
             Label::Nondet { set } => {
                 // set.len() >= 2 here — singletons were drained in step 1.
+                control.add_event(false)?;
                 let mut trial = h.clone();
                 let e = trial.add_event(tid, label.clone());
                 for &v2 in set.iter() {
                     trial.set_nd(e, v2);
-                    if viable_search(
+                    control.branch_child();
+                    if viable_search_with(
                         trial.clone(),
                         program,
                         priorities,
                         revisiting,
                         rev_label,
                         memo,
-                    ) {
+                        control,
+                    )? {
                         memo.put(key, true);
-                        return true;
+                        return Ok(true);
                     }
                 }
             }
@@ -914,7 +996,7 @@ fn viable_search<P: Program>(
     }
 
     memo.put(key, false);
-    false
+    Ok(false)
 }
 
 /// The consistent unread matching sources of a blocking receive `label` on thread `tid`,
@@ -924,7 +1006,11 @@ fn viable_search<P: Program>(
 /// `pub(crate)` because the DES scheduler (T2 §2b, [`crate::scheduler::pick`]) needs the same
 /// "consistent unread matching sources" set to compute a blocking receive's `fire`-LB when it
 /// decides which receive to wake.
-pub(crate) fn consistent_sources(closure: &ExecutionGraph, tid: Tid, label: &Label) -> Vec<EventId> {
+pub(crate) fn consistent_sources(
+    closure: &ExecutionGraph,
+    tid: Tid,
+    label: &Label,
+) -> Vec<EventId> {
     let mut trial = closure.clone();
     let e = trial.add_event(tid, label.clone());
     // Candidates: unread sends to `tid` whose payload satisfies the receive predicate.
@@ -972,8 +1058,13 @@ fn force_source<P: Program>(
         [s] => *s,
         _ => return None,
     };
-    let pred = label.pred().expect("a blocking receive carries a predicate");
-    let s_val = closure.label(s).payload().expect("a send carries a payload");
+    let pred = label
+        .pred()
+        .expect("a blocking receive carries a predicate");
+    let s_val = closure
+        .label(s)
+        .payload()
+        .expect("a send carries a payload");
 
     // (2) no unfinished thread other than `tid` can emit a future send matching `r`.
     for (t, next) in nexts.iter().enumerate() {
@@ -1078,12 +1169,13 @@ impl<'g> Builder<'g> {
         };
         b.allocate();
         b.emit();
-        b.system.n_vars = b.vars.len() as u32;
+        b.system.n_vars =
+            u32::try_from(b.vars.len()).expect("time solver variable count exceeds u32");
         b
     }
 
     fn alloc(&mut self, v: TimeVar) -> VarId {
-        let id = self.vars.len() as VarId;
+        let id = VarId::try_from(self.vars.len()).expect("time solver variable count exceeds u32");
         self.vars.push(v);
         id
     }
@@ -1148,7 +1240,7 @@ impl<'g> Builder<'g> {
         let n = self.vars.len();
         // Every variable carries an origin lower bound `v ≥ ORIGIN` (emitted in `emit`), so 0
         // is a valid starting lower bound; relaxation only raises values.
-        let mut e = vec![0i64; n];
+        let mut e = vec![0i128; n];
         for _ in 0..n {
             let mut changed = false;
             for edge in &self.system.hard {
@@ -1157,7 +1249,7 @@ impl<'g> Builder<'g> {
                 if edge.y == ORIGIN {
                     continue;
                 }
-                let cand = e[edge.x as usize] - edge.w;
+                let cand = e[edge.x as usize] - i128::from(edge.w);
                 if cand > e[edge.y as usize] {
                     e[edge.y as usize] = cand;
                     changed = true;
@@ -1169,11 +1261,13 @@ impl<'g> Builder<'g> {
         }
         debug_assert!(
             !self.system.hard.iter().any(|edge| {
-                edge.y != ORIGIN && e[edge.x as usize] - edge.w > e[edge.y as usize]
+                edge.y != ORIGIN && e[edge.x as usize] - i128::from(edge.w) > e[edge.y as usize]
             }),
             "earliest_lb did not converge (positive cycle ⇒ infeasible hard core)"
         );
-        e
+        e.into_iter()
+            .map(|bound| i64::try_from(bound).expect("time lower bound exceeds i64"))
+            .collect()
     }
 
     // Edge constructors in the fixed `Edge{x,y,w} == (x − y ≤ w)` convention.
@@ -1532,7 +1626,11 @@ mod tests {
         let e = earliest_times(&g).expect("A-clause graph is feasible");
         assert_eq!(e.arr_lb(t), Some(100));
         assert_eq!(e.fire_lb(r0), Some(100));
-        assert_eq!(e.fire_lb(r1), Some(100), "occ(r1)=fire(r0)=100 dominates avail(x)=10");
+        assert_eq!(
+            e.fire_lb(r1),
+            Some(100),
+            "occ(r1)=fire(r0)=100 dominates avail(x)=10"
+        );
         assert_eq!(e.fire_lb(r2), Some(100));
     }
 
@@ -1544,7 +1642,10 @@ mod tests {
         let m = g.add_event(1, timed(Model::Asyn, 2, "m", 40, 60));
         let r = g.add_event(2, Label::recv(Pred::any()));
         g.set_rf(r, Some(m));
-        assert!(earliest_times(&g).is_none(), "reading the late m is infeasible");
+        assert!(
+            earliest_times(&g).is_none(),
+            "reading the late m is infeasible"
+        );
         g.set_rf(r, Some(s));
         let e = earliest_times(&g).expect("reading the early s is feasible");
         assert_eq!(e.arr_lb(s), Some(1));
@@ -1625,13 +1726,13 @@ mod tests {
     fn l3_program() -> Straight {
         Straight {
             threads: vec![
-                vec![Label::recv(Pred::any())], // T0: r = recv(any)
+                vec![Label::recv(Pred::any())],           // T0: r = recv(any)
                 vec![timed(Model::Asyn, 0, "a", 1, 100)], // T1: a
                 vec![
                     Label::recv(Pred::eq("g")),
                     timed(Model::Asyn, 0, "b0", 0, 0),
                 ], // T2: rg; m
-                vec![timed(Model::Asyn, 2, "g", 5, 5)], // T3: g
+                vec![timed(Model::Asyn, 2, "g", 5, 5)],   // T3: g
                 vec![Label::recv(Pred::eq("x")), timed(Model::Asyn, 0, "b", 0, 0)], // T4: rs; s
                 vec![timed(Model::Asyn, 4, "x", 30, 30)], // T5: x
             ],
@@ -1708,7 +1809,10 @@ mod tests {
             "the C1-unsafe receive r must not be forced"
         );
         // rk←k IS force-safe, so the closure still drains T2/T3.
-        assert!(closure.contains(EventId::new(2, 1)), "m is drained after rk←k");
+        assert!(
+            closure.contains(EventId::new(2, 1)),
+            "m is drained after rk←k"
+        );
 
         // The gate must NOT reject Visit(∅): the subtree holds a realizable terminal.
         assert!(

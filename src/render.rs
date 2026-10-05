@@ -27,9 +27,18 @@ fn label_cell(l: &Label) -> String {
             };
             format!("S {model}→{dst} \"{}\"{win}", crate::intern::resolve(*val))
         }
-        Label::Recv { pred, blocking } => {
+        Label::Recv {
+            pred,
+            blocking,
+            timing,
+        } => {
             let b = if *blocking { "b" } else { "nb" };
-            format!("R{b}[{}]", pred.repr())
+            let suffix = if timing.is_timed() {
+                format!(" {timing}")
+            } else {
+                String::new()
+            };
+            format!("R{b}[{}]{suffix}", pred.repr())
         }
         Label::Nondet { set } => {
             let vals: Vec<&str> = set.iter().map(|s| crate::intern::resolve(*s)).collect();
