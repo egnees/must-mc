@@ -33,6 +33,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 use crate::event::{Label, Model, ReceiveTiming, Tid, Val, Window};
+pub use crate::program::ReplayBatch;
 use crate::program::{Program, ThreadNext, TraceLabel};
 
 use replay::{poll_once, run_once, ThreadCell};
@@ -80,17 +81,6 @@ struct LiveCheckpoint {
     future: LocalFut,
     cell: Rc<RefCell<ThreadCell>>,
     next: ThreadNext,
-}
-
-/// One replay's deterministic synchronous sends followed by the next await,
-/// error, or completion. `steps[i]` is the next event for the input trace extended
-/// by `i` send slots (`None`); every step except the last is a send.
-///
-/// Annotations retain their original event positions and local order. For the
-/// prefix corresponding to step `i`, use labels with `position <= trace.len()+i`.
-pub struct ReplayBatch {
-    pub steps: Vec<ThreadNext>,
-    pub labels: Vec<TraceLabel>,
 }
 
 impl Default for System {
@@ -374,6 +364,19 @@ impl System {
 }
 
 impl Program for System {
+    fn supports_replay_cache(&self) -> bool {
+        true
+    }
+
+    fn prepare_exploration(&mut self) {
+        self.incremental_replay = true;
+        self.clear_checkpoints();
+    }
+
+    fn replay_batch(&self, tid: Tid, trace: &[Option<Val>]) -> Option<ReplayBatch> {
+        Some(self.next_thread_batch(tid, trace))
+    }
+
     fn num_threads(&self) -> usize {
         self.factories.len()
     }

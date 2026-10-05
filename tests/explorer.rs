@@ -14,6 +14,135 @@ use must::{
 
 // -- Mock program ----------------------------------------------------------------
 
+#[test]
+fn system_exploration_automatically_caches_exact_prefixes_without_changing_graphs() {
+    struct Plain(System);
+    impl Program for Plain {
+        fn num_threads(&self) -> usize {
+            self.0.num_threads()
+        }
+        fn next(&self, traces: &[Vec<Option<Val>>]) -> Vec<ThreadNext> {
+            self.0.next(traces)
+        }
+        fn next_thread(&self, tid: usize, trace: &[Option<Val>]) -> ThreadNext {
+            self.0.next_thread(tid, trace)
+        }
+        fn labels(&self, traces: &[Vec<Option<Val>>]) -> Vec<must::TraceLabel> {
+            self.0.labels(traces)
+        }
+    }
+    fn make(model: Model) -> System {
+        let mut system = System::new();
+        system.add(move |c| async move {
+            c.send(2, "a", model);
+            c.send(2, "b", model);
+        });
+        system.add(move |c| async move {
+            c.send(2, "c", model);
+        });
+        system.add(move |c| async move {
+            c.insert_label("start");
+            let first = c.recv_timeout_any().await;
+            c.insert_label(first.as_deref().unwrap_or("empty"));
+            c.insert_label("same-position");
+            let choice = c.nondet(["good", "bad"]).await;
+            let second = c.recv_any().await;
+            c.insert_label(second.as_str());
+            c.send(0, second, model);
+            c.insert_label("after-send");
+            c.assert_that(choice == "good", "chosen error");
+        });
+        system
+    }
+    fn annotated(collector: &ExecutionCollector) -> Vec<String> {
+        let mut keys: Vec<_> = collector
+            .full()
+            .into_iter()
+            .chain(collector.blocked())
+            .chain(collector.errors())
+            .map(|execution| format!("{}{:?}", execution.canonical_key(), execution.labels()))
+            .collect();
+        keys.sort();
+        keys
+    }
+    for model in [Model::Asyn, Model::P2p, Model::Cd, Model::Mbox] {
+        for threads in [1, 4] {
+            for limit in [None, Some(2)] {
+                for priorities in [vec![0, 1, 2], vec![2, 1, 0]] {
+                    let cached = (CountingObserver::default(), ExecutionCollector::new());
+                    let replay = (CountingObserver::default(), ExecutionCollector::new());
+                    let mut config = Config::default()
+                        .collect_errors()
+                        .with_threads(threads)
+                        .with_priorities(priorities);
+                    config.max_sends = limit;
+                    explore(|| make(model), &cached, config.clone());
+                    explore(|| Plain(make(model)), &replay, config.clone());
+                    assert_eq!(
+                        annotated(&cached.1),
+                        annotated(&replay.1),
+                        "model={model:?}, config={config:?}"
+                    );
+                    assert_eq!(cached.0.events_added(), replay.0.events_added());
+                    assert_eq!(cached.0.full(), replay.0.full());
+                    assert_eq!(cached.0.blocked(), replay.0.blocked());
+                    assert_eq!(cached.0.errors(), replay.0.errors());
+                    assert_eq!(cached.0.send_limit_hits(), replay.0.send_limit_hits());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_system_factories_are_not_replayed_for_each_deterministic_send() {
+    use std::sync::Arc;
+    struct Plain(System);
+    impl Program for Plain {
+        fn num_threads(&self) -> usize {
+            self.0.num_threads()
+        }
+        fn next(&self, traces: &[Vec<Option<Val>>]) -> Vec<ThreadNext> {
+            self.0.next(traces)
+        }
+        fn next_thread(&self, tid: usize, trace: &[Option<Val>]) -> ThreadNext {
+            self.0.next_thread(tid, trace)
+        }
+        fn labels(&self, traces: &[Vec<Option<Val>>]) -> Vec<must::TraceLabel> {
+            self.0.labels(traces)
+        }
+    }
+    fn make(calls: &Arc<AtomicUsize>) -> System {
+        let mut system = System::new();
+        let calls = Arc::clone(calls);
+        system.add(move |c| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            async move {
+                c.insert_label("begin");
+                c.send(0, "a", Model::Asyn);
+                c.send(0, "b", Model::Asyn);
+                let reply = c.recv_any().await;
+                c.insert_label(reply.as_str());
+                c.send(0, reply, Model::Asyn);
+            }
+        });
+        system
+    }
+    let cached_calls = Arc::new(AtomicUsize::new(0));
+    let replay_calls = Arc::new(AtomicUsize::new(0));
+    let cached = ExecutionCollector::new();
+    let replay = ExecutionCollector::new();
+    explore(|| make(&cached_calls), &cached, Config::default());
+    explore(|| Plain(make(&replay_calls)), &replay, Config::default());
+    let mut left = cached.terminal_keys();
+    left.sort();
+    let mut right = replay.terminal_keys();
+    right.sort();
+    assert_eq!(left, right);
+    assert_eq!(cached.full_count(), 2);
+    assert!(cached_calls.load(Ordering::Relaxed) < replay_calls.load(Ordering::Relaxed));
+}
+
 /// A straight-line, value-independent program: `threads[i]` is thread `i`'s ordered
 /// event list. `next` advances by trace length (which equals the number of committed
 /// events of the thread), so it needs no coroutine replay. Adequate for s+s+r and
@@ -1106,6 +1235,8 @@ fn continuation_sidecars_match_plain_replay_across_branches_cuts_and_eviction() 
         replay: AtomicUsize,
         advanced: AtomicUsize,
         refused: AtomicUsize,
+        restored: AtomicUsize,
+        prefix_labels: AtomicUsize,
     }
     struct Handles<P> {
         inner: P,
@@ -1137,6 +1268,68 @@ fn continuation_sidecars_match_plain_replay_across_branches_cuts_and_eviction() 
         }
     }
     impl<P: Program> Program for Handles<P> {
+        fn prefix_namespace(&self) -> Option<u64> {
+            (!self.evict).then_some(self.owner)
+        }
+        fn persist_cursor(&self, tid: Tid, cursor: ProgramCursor) -> Option<u64> {
+            let [owner, epoch, index] = cursor.words();
+            if self.evict || owner != self.owner || epoch != self.epoch.get() {
+                return None;
+            }
+            self.states
+                .borrow()
+                .get(usize::try_from(index).ok()?)
+                .filter(|(thread, _)| *thread == tid)
+                .map(|_| index + 1)
+        }
+        fn next_thread_at_prefix(
+            &self,
+            tid: Tid,
+            token: u64,
+        ) -> Option<(ThreadNext, ProgramCursor)> {
+            if self.evict {
+                return None;
+            }
+            if token == 0 {
+                return Some((
+                    self.inner.next_thread(tid, &[]),
+                    self.remember(tid, Vec::new()),
+                ));
+            }
+            let index = token.checked_sub(1)?;
+            let (_, trace) = self
+                .states
+                .borrow()
+                .get(usize::try_from(index).ok()?)
+                .filter(|(thread, _)| *thread == tid)
+                .cloned()?;
+            self.calls.restored.fetch_add(1, Ordering::Relaxed);
+            Some((
+                self.inner.next_thread(tid, &trace),
+                ProgramCursor::new([self.owner, self.epoch.get(), index]),
+            ))
+        }
+        fn labels_at_prefixes(&self, tokens: &[u64]) -> Option<Vec<TraceLabel>> {
+            if self.evict || tokens.len() != self.num_threads() {
+                return None;
+            }
+            let states = self.states.borrow();
+            let traces: Option<Vec<_>> = tokens
+                .iter()
+                .enumerate()
+                .map(|(tid, &token)| {
+                    if token == 0 {
+                        return Some(Vec::new());
+                    }
+                    states
+                        .get(usize::try_from(token - 1).ok()?)
+                        .filter(|(thread, _)| *thread == tid)
+                        .map(|(_, trace)| trace.clone())
+                })
+                .collect();
+            self.calls.prefix_labels.fetch_add(1, Ordering::Relaxed);
+            traces.map(|traces| self.inner.labels(&traces))
+        }
         fn num_threads(&self) -> usize {
             self.inner.num_threads()
         }
@@ -1345,4 +1538,12 @@ fn continuation_sidecars_match_plain_replay_across_branches_cuts_and_eviction() 
     assert!(calls.replay.load(Ordering::Relaxed) > 0);
     assert!(calls.advanced.load(Ordering::Relaxed) > 0);
     assert!(calls.refused.load(Ordering::Relaxed) > 0);
+    assert!(
+        calls.restored.load(Ordering::Relaxed) > 0,
+        "retained exact prefixes should be recovered after graph cuts"
+    );
+    assert!(
+        calls.prefix_labels.load(Ordering::Relaxed) > 0,
+        "terminal annotations should accept complete persistent prefixes"
+    );
 }

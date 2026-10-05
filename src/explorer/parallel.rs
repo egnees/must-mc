@@ -22,6 +22,7 @@ use std::thread;
 
 use crate::graph::ExecutionGraph;
 use crate::observer::{set_worker_id, Observer};
+use crate::program::replay_cache::CachedProgram;
 use crate::program::Program;
 
 use super::{is_permutation, Config, Explorer};
@@ -178,9 +179,12 @@ where
             scope.spawn(move || {
                 // Route this worker's tallies to its own shard of a shared observer.
                 set_worker_id(w);
-                let program = make_program();
+                let program = CachedProgram::new(make_program());
                 let mut ex = Explorer {
                     program: &program,
+                    prefix_namespace: program
+                        .prefix_namespace()
+                        .filter(|&namespace| namespace != 0),
                     observer,
                     buffer_added_events: observer.allows_buffered_events(),
                     buffered_events_added: 0,

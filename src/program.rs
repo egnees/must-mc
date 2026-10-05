@@ -44,6 +44,8 @@
 
 use crate::event::{Label, Tid, Val};
 
+pub(crate) mod replay_cache;
+
 /// A deterministic local annotation, not an event of the execution graph.
 /// Annotations at the same position retain their insertion order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +54,17 @@ pub struct TraceLabel {
     /// Number of committed events preceding the annotation in this thread.
     pub position: usize,
     pub value: Val,
+}
+
+/// One replay's deterministic synchronous sends followed by the next await,
+/// error, or completion. `steps[i]` is the next event for the input trace extended
+/// by `i` send slots (`None`); every step except the last is a send.
+///
+/// Annotations retain their original event positions and local order. For the
+/// prefix corresponding to step `i`, use labels with `position <= trace.len()+i`.
+pub struct ReplayBatch {
+    pub steps: Vec<ThreadNext>,
+    pub labels: Vec<TraceLabel>,
 }
 
 /// The next step of a single thread under a given trace.
@@ -97,6 +110,23 @@ impl ProgramCursor {
 /// A program as seen by the explorer: a total, deterministic function from per-thread
 /// traces to per-thread next events.
 pub trait Program {
+    /// Opt into the explorer's bounded exact-trace replay cache. Programs whose
+    /// own next-event computation is already cheap can retain direct calls.
+    fn supports_replay_cache(&self) -> bool {
+        false
+    }
+
+    /// Configure per-worker optimization state before exploration. It must not
+    /// change the program's next events or annotation semantics.
+    fn prepare_exploration(&mut self) {}
+
+    /// Optional deterministic send-only successors from one replay. Each answer
+    /// must obey `ReplayBatch`'s exact-prefix and annotation contracts; the cache
+    /// still commits events individually. The default uses ordinary replay.
+    fn replay_batch(&self, _tid: Tid, _trace: &[Option<Val>]) -> Option<ReplayBatch> {
+        None
+    }
+
     /// Number of threads `N`; thread ids are `0..N`.
     fn num_threads(&self) -> usize;
 
@@ -146,6 +176,37 @@ pub trait Program {
         _cursor: ProgramCursor,
         _entry: Option<Val>,
     ) -> Option<(ThreadNext, ProgramCursor)> {
+        None
+    }
+
+    /// Nonzero identity of an immutable, persistent local-prefix arena.
+    /// Equivalent worker programs may share this identity only when constructor
+    /// arguments, process bodies and runtime budgets have identical semantics.
+    /// The default leaves graphs free of program handles.
+    fn prefix_namespace(&self) -> Option<u64> {
+        None
+    }
+
+    /// Encode a validated cursor as a nonzero stable token in this namespace.
+    /// Tokens must never be reused for different traces while the namespace can
+    /// appear in a graph. Retired/unavailable tokens may safely return no answer.
+    fn persist_cursor(&self, _tid: Tid, _cursor: ProgramCursor) -> Option<u64> {
+        None
+    }
+
+    /// Recover the next event and cursor of an issued exact local-prefix token.
+    /// Token zero denotes the empty trace; nonzero tokens were issued through
+    /// `persist_cursor`. Validate thread and arena lifetime; return `None` for
+    /// foreign, stale or unavailable tokens so full-trace replay remains possible.
+    fn next_thread_at_prefix(&self, _tid: Tid, _token: u64) -> Option<(ThreadNext, ProgramCursor)> {
+        None
+    }
+
+    /// Reconstruct annotations directly from one validated token per thread.
+    /// Token zero denotes an empty trace. Preserve the full `labels` contract,
+    /// including local annotation order at the same position; unavailable
+    /// tokens must return `None` and use ordinary annotation reconstruction.
+    fn labels_at_prefixes(&self, _tokens: &[u64]) -> Option<Vec<TraceLabel>> {
         None
     }
 

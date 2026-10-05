@@ -22,6 +22,7 @@ use crate::consistency::consistent;
 use crate::event::{EventId, Label, Tid, Val};
 use crate::graph::ExecutionGraph;
 use crate::observer::Observer;
+use crate::program::replay_cache::CachedProgram;
 use crate::program::{Program, ProgramCursor, ThreadNext};
 use crate::scheduler::{pick_with_read_marks, pooled_traces_of, traces_of, NextStep};
 
@@ -750,7 +751,7 @@ where
         return;
     }
 
-    let program = make_program();
+    let program = CachedProgram::new(make_program());
     let n = program.num_threads();
     let priorities = config
         .priorities
@@ -765,6 +766,9 @@ where
 
     let mut explorer = Explorer {
         program: &program,
+        prefix_namespace: program
+            .prefix_namespace()
+            .filter(|&namespace| namespace != 0),
         observer,
         buffer_added_events: observer.allows_buffered_events(),
         buffered_events_added: 0,
@@ -817,6 +821,7 @@ fn graph_has_error(g: &ExecutionGraph) -> bool {
 /// Carries the shared state of one `explore` run down the recursion.
 pub(crate) struct Explorer<'a, P: Program, O: Observer> {
     pub(crate) program: &'a P,
+    prefix_namespace: Option<u64>,
     pub(crate) observer: &'a O,
     buffer_added_events: bool,
     buffered_events_added: usize,
@@ -923,12 +928,41 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         // trace. Both are threaded down the recursion; adding an event mutates only the
         // acting thread's entry, so only that thread's next is recomputed.
         let mut traces = pooled_traces_of(g, self.program.num_threads());
-        let mut nexts = self.program.next(&traces);
         let mut read = ForwardReads::new(
             g,
             self.program.num_threads(),
             !self.observer.observes_rejected_rf_trials(),
         );
+        let mut nexts = if let Some(namespace) = self.prefix_namespace {
+            g.reset_program_prefix_namespace(namespace);
+            (0..self.program.num_threads())
+                .map(|tid| {
+                    let restored = g
+                        .program_prefix(tid)
+                        .and_then(|token| self.program.next_thread_at_prefix(tid, token));
+                    let (next, cursor) = match restored {
+                        Some((next, cursor)) => (next, Some(cursor)),
+                        None => self.program.next_thread_cursor(tid, &traces[tid]),
+                    };
+                    debug_assert_eq!(
+                        next,
+                        self.program.next_thread(tid, &traces[tid]),
+                        "persistent prefix changed the full-trace next event"
+                    );
+                    if g.thread_len(tid) != 0 {
+                        let token = cursor
+                            .and_then(|cursor| self.program.persist_cursor(tid, cursor))
+                            .filter(|&token| token != 0)
+                            .unwrap_or(0);
+                        g.set_program_prefix(EventId::new(tid, g.thread_len(tid) - 1), token);
+                    }
+                    read.set_cursor(tid, cursor);
+                    next
+                })
+                .collect()
+        } else {
+            self.program.next(&traces)
+        };
         self.visit_step(g, &mut traces, &mut nexts, &mut read);
     }
 
@@ -1146,8 +1180,10 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     /// `body` with updated traces, nexts and its continuation sidecar, then restore all three. `entry` is the value the
     /// new event contributes to its thread's trace: the value a receive read (`None` = ⊥), a
     /// nondet's chosen value, or `None` for a send/error.
+    #[allow(clippy::too_many_arguments)]
     fn with_child_memo(
         &mut self,
+        graph: &mut ExecutionGraph,
         tid: Tid,
         entry: Option<Val>,
         traces: &mut Vec<Vec<Option<Val>>>,
@@ -1155,6 +1191,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         read: &mut ForwardReads,
         body: impl FnOnce(
             &mut Self,
+            &mut ExecutionGraph,
             &mut Vec<Vec<Option<Val>>>,
             &mut Vec<ThreadNext>,
             &mut ForwardReads,
@@ -1173,7 +1210,14 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         );
         let saved = std::mem::replace(&mut nexts[tid], next);
         read.set_cursor(tid, cursor);
-        body(self, traces, nexts, read);
+        if self.prefix_namespace.is_some() {
+            let token = cursor
+                .and_then(|cursor| self.program.persist_cursor(tid, cursor))
+                .filter(|&token| token != 0)
+                .unwrap_or(0);
+            graph.set_program_prefix(EventId::new(tid, traces[tid].len() - 1), token);
+        }
+        body(self, graph, traces, nexts, read);
         nexts[tid] = saved;
         read.set_cursor(tid, saved_cursor);
         traces[tid].pop();
@@ -1391,12 +1435,13 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                 read.consume(tid, source);
             }
             self.with_child_memo(
+                g,
                 tid,
                 entry,
                 traces,
                 nexts,
                 read,
-                |this, traces, nexts, read| {
+                |this, g, traces, nexts, read| {
                     this.branch_memo(&mut first, g, traces, nexts, read);
                 },
             );
@@ -1443,12 +1488,13 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             g.set_nd(e, v);
             // A nondet event's trace entry is its chosen value.
             self.with_child_memo(
+                g,
                 tid,
                 Some(v),
                 traces,
                 nexts,
                 read,
-                |this, traces, nexts, read| {
+                |this, g, traces, nexts, read| {
                     this.branch_memo(&mut first, g, traces, nexts, read);
                 },
             );
@@ -1522,12 +1568,13 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             if forward_ok {
                 // A send contributes no read value to its thread's trace.
                 self.with_child_memo(
+                    g,
                     tid,
                     None,
                     traces,
                     nexts,
                     read,
-                    |this, traces, nexts, read| {
+                    |this, g, traces, nexts, read| {
                         this.branch_memo(&mut first, g, traces, nexts, read);
                     },
                 );
@@ -1557,12 +1604,21 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         kind: ExecutionKind,
         traces: Option<&[Vec<Option<Val>>]>,
     ) -> bool {
-        let labels = match traces {
+        let persistent_labels = self
+            .prefix_namespace
+            .filter(|&namespace| namespace == graph.program_prefix_namespace())
+            .and_then(|_| {
+                (0..self.program.num_threads())
+                    .map(|tid| graph.program_prefix(tid))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .and_then(|tokens| self.program.labels_at_prefixes(&tokens));
+        let labels = persistent_labels.unwrap_or_else(|| match traces {
             Some(traces) => self.program.labels(traces),
             None => self
                 .program
                 .labels(&pooled_traces_of(&graph, self.program.num_threads())),
-        };
+        });
         let exec = Execution::new(graph).with_labels(labels);
         if self.time_filter || self.time_zombie || self.time_predicate {
             // The v1 model guard is a precondition of the time extension, not an invariant of
