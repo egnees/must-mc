@@ -175,13 +175,7 @@ pub(crate) fn consistent_after_recv_with(g: &ExecutionGraph, r: EventId, read: &
 
 /// The so-clause half of [`consistent_after_recv`] for p2p/cd: clause (b) for the new
 /// receive `r` (reading `s`), and clause (c) with `r` as the later receive `r2`.
-fn so_after_recv(
-    g: &ExecutionGraph,
-    r: EventId,
-    s: EventId,
-    model: Model,
-    read: &Marks,
-) -> bool {
+fn so_after_recv(g: &ExecutionGraph, r: EventId, s: EventId, model: Model, read: &Marks) -> bool {
     let is_model = |e: EventId| g.send_model(e) == Some(model);
     let so = |a: EventId, b: EventId| {
         is_model(a)

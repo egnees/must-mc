@@ -500,7 +500,10 @@ fn send_if(guard: usize, eq: &'static str, dst: usize, val: &'static str, lo: u6
     }
 }
 fn brecv(sel: Sel) -> Op {
-    Op::Recv { sel, blocking: true }
+    Op::Recv {
+        sel,
+        blocking: true,
+    }
 }
 fn nbrecv(sel: Sel) -> Op {
     Op::Recv {
@@ -621,11 +624,7 @@ fn attempt4() -> VdProgram {
                 send_if(1, "a", 4, "int", 0, 0),
             ],
             // T4 intermediate victim: q feeder; two receives racing "int" + the pre-fork racers
-            vec![
-                send(3, "q", 1, 1),
-                brecv(Sel::Any),
-                brecv(Sel::Any),
-            ],
+            vec![send(3, "q", 1, 1), brecv(Sel::Any), brecv(Sel::Any)],
             // T5, T6 pre-fork racers into T4 (established reads deleted differently per branch)
             vec![send(4, "p", 0, 1)],
             vec![send(4, "r", 0, 1)],
@@ -678,7 +677,13 @@ fn gen_gamma4(rng: &mut Rng) -> VdProgram {
     let n = 7;
     let monitor = 0;
     let victim = 4; // intermediate victim
-    let m = |rng: &mut Rng| if rng.chance(50) { Model::Asyn } else { Model::P2p };
+    let m = |rng: &mut Rng| {
+        if rng.chance(50) {
+            Model::Asyn
+        } else {
+            Model::P2p
+        }
+    };
 
     // Final relay chain windows.
     let (glo, ghi) = (2 + rng.below(3) as u64, 0);
@@ -693,13 +698,29 @@ fn gen_gamma4(rng: &mut Rng) -> VdProgram {
     // q feeder window.
     let (qlo, qhi) = rwin(rng);
 
-    let final_relay_sel = if rng.chance(50) { Sel::Eq("g") } else { Sel::Any };
-    let victim_sel1 = if rng.chance(50) { Sel::Any } else { Sel::Eq("u") };
-    let victim_sel2 = if rng.chance(50) { Sel::Any } else { Sel::Eq("w") };
+    let final_relay_sel = if rng.chance(50) {
+        Sel::Eq("g")
+    } else {
+        Sel::Any
+    };
+    let victim_sel1 = if rng.chance(50) {
+        Sel::Any
+    } else {
+        Sel::Eq("u")
+    };
+    let victim_sel2 = if rng.chance(50) {
+        Sel::Any
+    } else {
+        Sel::Eq("w")
+    };
 
     let threads = vec![
         // T0 monitor
-        vec![nbrecv(if rng.chance(70) { Sel::Eq("L") } else { Sel::Any })],
+        vec![nbrecv(if rng.chance(70) {
+            Sel::Eq("L")
+        } else {
+            Sel::Any
+        })],
         // T1 final relay → monitor (late L)
         vec![
             Op::Recv {
@@ -790,7 +811,13 @@ fn gen_gamma4(rng: &mut Rng) -> VdProgram {
 /// is genuinely false. On top of that it keeps a pre-fork racer set and a second (intermediate)
 /// victim so the false path co-occurs with divergent bases: the exact γ4 setting.
 fn gen_eager(rng: &mut Rng) -> VdProgram {
-    let m = |rng: &mut Rng| if rng.chance(50) { Model::Asyn } else { Model::P2p };
+    let m = |rng: &mut Rng| {
+        if rng.chance(50) {
+            Model::Asyn
+        } else {
+            Model::P2p
+        }
+    };
     // timer late; fast early enough to beat it (avail(fast) ≤ avail(timer)).
     let tlo = 4 + rng.below(3) as u64;
     let (flo, fhi) = (0u64, rng.below(2) as u64);
@@ -886,7 +913,12 @@ fn gen_eager(rng: &mut Rng) -> VdProgram {
 
 /// Assert the invariants that must hold regardless of γ4; return the report for tallying.
 /// A T2 duplicate NOT present in T1/zombie is the γ4 hit and is printed here.
-fn vet(name: &str, prog: &VdProgram, verbose: bool, hits: &mut Vec<(String, Vec<String>)>) -> Report {
+fn vet(
+    name: &str,
+    prog: &VdProgram,
+    verbose: bool,
+    hits: &mut Vec<(String, Vec<String>)>,
+) -> Report {
     let rep = run_all(prog);
 
     // Completeness is the load-bearing invariant. A T2-vs-T1 full-set divergence is a SEPARATE,
@@ -922,7 +954,9 @@ fn vet(name: &str, prog: &VdProgram, verbose: bool, hits: &mut Vec<(String, Vec<
     // in this run), because it is the mechanism, not just the symptom.
     let bdv = rep.base_dependent_verdicts();
     if !bdv.is_empty() {
-        println!("  ??? [{name}] BASE-DEPENDENT viable verdict (γ4 precondition!) for (s,ep,v)={bdv:#?}");
+        println!(
+            "  ??? [{name}] BASE-DEPENDENT viable verdict (γ4 precondition!) for (s,ep,v)={bdv:#?}"
+        );
         println!("      viable calls: {:#?}", rep.viable_calls);
         println!("      program: {prog:#?}");
     }
@@ -931,7 +965,10 @@ fn vet(name: &str, prog: &VdProgram, verbose: bool, hits: &mut Vec<(String, Vec<
         let dups = rep.dup_keys();
         println!("  !!! [{name}] T2 DUPLICATE canonical keys: {dups:#?}");
         println!("      revisits (r,s,deleted): {:#?}", rep.revisits);
-        println!("      viable calls (base_key, ep, v, s, verdict): {:#?}", rep.viable_calls);
+        println!(
+            "      viable calls (base_key, ep, v, s, verdict): {:#?}",
+            rep.viable_calls
+        );
         println!("      program: {prog:#?}");
         hits.push((name.to_string(), dups));
     }
@@ -1141,7 +1178,13 @@ fn leak_b() -> VdProgram {
 fn gen_leak(rng: &mut Rng) -> VdProgram {
     let victim = 4usize;
     let monitor = 0usize;
-    let m = |rng: &mut Rng| if rng.chance(50) { Model::Asyn } else { Model::P2p };
+    let m = |rng: &mut Rng| {
+        if rng.chance(50) {
+            Model::Asyn
+        } else {
+            Model::P2p
+        }
+    };
 
     let glo = 2 + rng.below(3) as u64;
     let (ulo, uhi) = rwin(rng);
@@ -1158,8 +1201,16 @@ fn gen_leak(rng: &mut Rng) -> VdProgram {
     let val1 = if dst1 == monitor { "L" } else { "p" };
     let val2 = if dst2 == monitor { "L" } else { "r" };
 
-    let victim_sel1 = if rng.chance(50) { Sel::Any } else { Sel::Eq("u") };
-    let victim_sel2 = if rng.chance(50) { Sel::Any } else { Sel::Eq("w") };
+    let victim_sel1 = if rng.chance(50) {
+        Sel::Any
+    } else {
+        Sel::Eq("u")
+    };
+    let victim_sel2 = if rng.chance(50) {
+        Sel::Any
+    } else {
+        Sel::Eq("w")
+    };
 
     let threads = vec![
         // T0 monitor = r_final.
@@ -1245,7 +1296,13 @@ fn gen_leak(rng: &mut Rng) -> VdProgram {
 /// present-unread — a base with it resolved-present ("a") would answer FALSE while a base that
 /// deleted it (parked, re-forkable to "b") would answer TRUE: the exact base-dependence γ4 needs.
 fn gen_eager_parked(rng: &mut Rng) -> VdProgram {
-    let m = |rng: &mut Rng| if rng.chance(50) { Model::Asyn } else { Model::P2p };
+    let m = |rng: &mut Rng| {
+        if rng.chance(50) {
+            Model::Asyn
+        } else {
+            Model::P2p
+        }
+    };
     let tlo = 3 + rng.below(3) as u64; // timer late enough for a fast to beat it
     let (qlo, qhi) = (0u64, rng.below(2) as u64);
     let (p1lo, p1hi) = rwin(rng);
@@ -1337,9 +1394,9 @@ fn gamma4_leak_hunt() {
             return;
         }
         // Did a base-dependent (s,ep,v) actually host a backward revisit whose s == that send?
-        let hosted: bool = bdv.iter().any(|(s, _ep, _v)| {
-            rep.revisits.iter().any(|(_r, rs, _del)| rs == s)
-        });
+        let hosted: bool = bdv
+            .iter()
+            .any(|(s, _ep, _v)| rep.revisits.iter().any(|(_r, rs, _del)| rs == s));
         bdv_reports.push(format!(
             "{name}: base-dependent (s,ep,v)={bdv:?} hosted_revisit={hosted} dup={}",
             rep.t2_has_dup()

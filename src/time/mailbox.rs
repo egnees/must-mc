@@ -505,7 +505,10 @@ impl Builder {
     #[inline]
     fn action_vars(&self, a: Action) -> (VarId, Option<VarId>) {
         let (time, rank) = self.actions[a.kind() * self.index.len() + self.index.of(a.event())];
-        debug_assert_ne!(time, NO_VAR, "order refers to an action that was never created");
+        debug_assert_ne!(
+            time, NO_VAR,
+            "order refers to an action that was never created"
+        );
         (time, (rank != NO_VAR).then_some(rank))
     }
 
@@ -539,7 +542,11 @@ impl Builder {
             for (i, &e) in self.index.events.iter().enumerate() {
                 let (time, rank) = self.actions[kind * n + i];
                 if time != NO_VAR {
-                    f(Action::of_kind(kind, e), time, (rank != NO_VAR).then_some(rank));
+                    f(
+                        Action::of_kind(kind, e),
+                        time,
+                        (rank != NO_VAR).then_some(rank),
+                    );
                 }
             }
         }

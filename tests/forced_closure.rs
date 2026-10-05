@@ -199,7 +199,10 @@ fn forced_closure_stops_at_rf_fork() {
         !closure.contains(EventId::new(2, 0)),
         "the contested receive is not forced"
     );
-    assert!(gated_verdict(&g0, &prog, &prio), "no receive ⇒ vacuously feasible");
+    assert!(
+        gated_verdict(&g0, &prog, &prio),
+        "no receive ⇒ vacuously feasible"
+    );
 }
 
 /// C1 regression (must-expert): a blocking receive whose source is unique only *because a
@@ -222,7 +225,11 @@ fn c1_hidden_competitor_is_not_over_pruned() {
 
     // r must not be forced (S has a hidden competitor m and a second consumer r2).
     let closure = forced_closure(&empty, &prog, &prio);
-    assert_eq!(closure.thread_len(0), 0, "the C1-unsafe receive r is not forced");
+    assert_eq!(
+        closure.thread_len(0),
+        0,
+        "the C1-unsafe receive r is not forced"
+    );
 
     // The gate must NOT reject Visit(∅) — its verdict agrees with the integer reference on the
     // closure, and it is feasible because the subtree holds a realizable terminal.

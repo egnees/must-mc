@@ -599,81 +599,81 @@ mod timed_corpus {
         ])
     }
 
-/// A finite delivery window, drawn from four narrow/wide bands. Never ∞, so the integer
-/// reference stays enumerable (Б3).
-///
-/// Two of the bands are deliberately *separated* — an early `[0, 0..=1]` and a late
-/// `[3..=5, +0..=1]` — so that when both land on one receiver, reading the late one is
-/// filtered (its early competitor has `hi < lo`, and a `lo = 0` reading escapes via the
-/// A-clause). Without such separation a random narrow/wide mix almost never makes the
-/// filter bite, leaving the corpus degenerate. The remaining bands (a mid-narrow window
-/// and the wide `[0, 6]`) keep plenty of overlapping, *un*filtered timed readings too.
-fn timed_window(rng: &mut Rng) -> Window {
-    match rng.below(4) {
-        0 => Window::new(0, rng.below(2) as u64), // early [0, 0..=1]
-        1 => {
-            let lo = 3 + rng.below(3) as u64; // late [3..=5, +0..=1]
-            Window::new(lo, lo + rng.below(2) as u64)
-        }
-        2 => Window::new(0, 6), // wide
-        _ => {
-            let lo = rng.below(4) as u64; // mid-narrow [0..=3, +0..=2]
-            Window::new(lo, lo + rng.below(3) as u64)
-        }
-    }
-}
-
-/// Generate one random timed straight-line program: 2-4 threads, 1-3 events each; ~50%
-/// sends (each with a finite window and an Asyn/P2p model), ~40% receives (~1/3
-/// non-blocking), ~10% nondet. Same shape as `fuzz.rs::gen_program`, restricted to the
-/// timed-supported models with windows added.
-fn gen_program(rng: &mut Rng) -> SeqProgram {
-    let models = [Model::Asyn, Model::P2p];
-    let vals = ["a", "b"];
-    let nt = 2 + rng.below(3);
-    let mut threads = Vec::with_capacity(nt);
-    for _ in 0..nt {
-        let ne = 1 + rng.below(3);
-        let mut evs = Vec::with_capacity(ne);
-        for _ in 0..ne {
-            let roll = rng.below(10);
-            if roll < 5 {
-                // Bias destinations onto the last thread so several sends land on one
-                // receiver — the structural precondition for a *competitor*, and hence for a
-                // filtered reading. Without this the filter almost never bites (a random dst
-                // spreads sends too thin across threads).
-                let dst = if rng.below(2) == 0 {
-                    nt - 1
-                } else {
-                    rng.below(nt)
-                };
-                let val = vals[rng.below(vals.len())];
-                let model = models[rng.below(models.len())];
-                evs.push(Label::send_within(model, dst, val, timed_window(rng)));
-            } else if roll < 9 {
-                let pred = if rng.below(2) == 0 {
-                    Pred::eq(vals[rng.below(vals.len())])
-                } else {
-                    Pred::any()
-                };
-                if rng.below(3) == 0 {
-                    evs.push(Label::recv_nb(pred));
-                } else {
-                    evs.push(Label::recv(pred));
-                }
-            } else {
-                let set: &[&str] = if rng.below(2) == 0 {
-                    &["a"]
-                } else {
-                    &["a", "b"]
-                };
-                evs.push(Label::nondet(set.iter().copied()));
+    /// A finite delivery window, drawn from four narrow/wide bands. Never ∞, so the integer
+    /// reference stays enumerable (Б3).
+    ///
+    /// Two of the bands are deliberately *separated* — an early `[0, 0..=1]` and a late
+    /// `[3..=5, +0..=1]` — so that when both land on one receiver, reading the late one is
+    /// filtered (its early competitor has `hi < lo`, and a `lo = 0` reading escapes via the
+    /// A-clause). Without such separation a random narrow/wide mix almost never makes the
+    /// filter bite, leaving the corpus degenerate. The remaining bands (a mid-narrow window
+    /// and the wide `[0, 6]`) keep plenty of overlapping, *un*filtered timed readings too.
+    fn timed_window(rng: &mut Rng) -> Window {
+        match rng.below(4) {
+            0 => Window::new(0, rng.below(2) as u64), // early [0, 0..=1]
+            1 => {
+                let lo = 3 + rng.below(3) as u64; // late [3..=5, +0..=1]
+                Window::new(lo, lo + rng.below(2) as u64)
+            }
+            2 => Window::new(0, 6), // wide
+            _ => {
+                let lo = rng.below(4) as u64; // mid-narrow [0..=3, +0..=2]
+                Window::new(lo, lo + rng.below(3) as u64)
             }
         }
-        threads.push(evs);
     }
-    SeqProgram::new(threads)
-}
+
+    /// Generate one random timed straight-line program: 2-4 threads, 1-3 events each; ~50%
+    /// sends (each with a finite window and an Asyn/P2p model), ~40% receives (~1/3
+    /// non-blocking), ~10% nondet. Same shape as `fuzz.rs::gen_program`, restricted to the
+    /// timed-supported models with windows added.
+    fn gen_program(rng: &mut Rng) -> SeqProgram {
+        let models = [Model::Asyn, Model::P2p];
+        let vals = ["a", "b"];
+        let nt = 2 + rng.below(3);
+        let mut threads = Vec::with_capacity(nt);
+        for _ in 0..nt {
+            let ne = 1 + rng.below(3);
+            let mut evs = Vec::with_capacity(ne);
+            for _ in 0..ne {
+                let roll = rng.below(10);
+                if roll < 5 {
+                    // Bias destinations onto the last thread so several sends land on one
+                    // receiver — the structural precondition for a *competitor*, and hence for a
+                    // filtered reading. Without this the filter almost never bites (a random dst
+                    // spreads sends too thin across threads).
+                    let dst = if rng.below(2) == 0 {
+                        nt - 1
+                    } else {
+                        rng.below(nt)
+                    };
+                    let val = vals[rng.below(vals.len())];
+                    let model = models[rng.below(models.len())];
+                    evs.push(Label::send_within(model, dst, val, timed_window(rng)));
+                } else if roll < 9 {
+                    let pred = if rng.below(2) == 0 {
+                        Pred::eq(vals[rng.below(vals.len())])
+                    } else {
+                        Pred::any()
+                    };
+                    if rng.below(3) == 0 {
+                        evs.push(Label::recv_nb(pred));
+                    } else {
+                        evs.push(Label::recv(pred));
+                    }
+                } else {
+                    let set: &[&str] = if rng.below(2) == 0 {
+                        &["a"]
+                    } else {
+                        &["a", "b"]
+                    };
+                    evs.push(Label::nondet(set.iter().copied()));
+                }
+            }
+            threads.push(evs);
+        }
+        SeqProgram::new(threads)
+    }
 
     /// Public handle for the (private, verbatim-copied) generator above.
     pub fn gen(rng: &mut Rng) -> SeqProgram {
@@ -691,523 +691,531 @@ mod vd_corpus {
     use must::intern::resolve;
     use must::{Program, ThreadNext, Val};
 
-// -- The value-dependent program table ------------------------------------------------------
+    // -- The value-dependent program table ------------------------------------------------------
 
-/// A receive's selectivity: static, or keyed by the value an earlier op of the SAME thread
-/// produced (a nondet choice or a receive's read — the (а) axis).
-#[derive(Clone, Copy, Debug)]
-pub enum Sel {
-    Any,
-    Eq(&'static str),
-    /// `Pred::eq(value_of(op[k]))`; a guard with no value (⊥ read) yields a never-matching
-    /// predicate.
-    EqGuard(usize),
-}
-
-/// One straight-line op of a thread. Guards always reference a po-earlier, value-producing
-/// op (Nondet / Recv) of the same thread.
-#[derive(Clone, Debug)]
-pub enum Op {
-    /// `nd{a, b}`.
-    Nondet,
-    Send {
-        dst: usize,
-        model: Model,
-        val: &'static str,
-        lo: u64,
-        hi: u64,
-    },
-    /// Emitted only when `value_of(op[guard]) == eq` — the (б) emit/no-emit axis.
-    SendIf {
-        guard: usize,
-        eq: &'static str,
-        dst: usize,
-        model: Model,
-        val: &'static str,
-        lo: u64,
-        hi: u64,
-    },
-    /// Window `[lo1,hi1]` when `value_of(op[guard]) == eq`, else `[lo2,hi2]` — the (в) axis.
-    SendWin {
-        guard: usize,
-        eq: &'static str,
-        dst: usize,
-        model: Model,
-        val: &'static str,
-        lo1: u64,
-        hi1: u64,
-        lo2: u64,
-        hi2: u64,
-    },
-    Recv {
-        sel: Sel,
-        blocking: bool,
-    },
-}
-
-impl Op {
-    fn is_value_producing(&self) -> bool {
-        matches!(self, Op::Nondet | Op::Recv { .. })
+    /// A receive's selectivity: static, or keyed by the value an earlier op of the SAME thread
+    /// produced (a nondet choice or a receive's read — the (а) axis).
+    #[derive(Clone, Copy, Debug)]
+    pub enum Sel {
+        Any,
+        Eq(&'static str),
+        /// `Pred::eq(value_of(op[k]))`; a guard with no value (⊥ read) yields a never-matching
+        /// predicate.
+        EqGuard(usize),
     }
-}
 
-/// The interpretable program: `threads[t]` is thread `t`'s op list.
-#[derive(Clone, Debug)]
-pub struct VdProgram {
-    pub threads: Vec<Vec<Op>>,
-}
+    /// One straight-line op of a thread. Guards always reference a po-earlier, value-producing
+    /// op (Nondet / Recv) of the same thread.
+    #[derive(Clone, Debug)]
+    pub enum Op {
+        /// `nd{a, b}`.
+        Nondet,
+        Send {
+            dst: usize,
+            model: Model,
+            val: &'static str,
+            lo: u64,
+            hi: u64,
+        },
+        /// Emitted only when `value_of(op[guard]) == eq` — the (б) emit/no-emit axis.
+        SendIf {
+            guard: usize,
+            eq: &'static str,
+            dst: usize,
+            model: Model,
+            val: &'static str,
+            lo: u64,
+            hi: u64,
+        },
+        /// Window `[lo1,hi1]` when `value_of(op[guard]) == eq`, else `[lo2,hi2]` — the (в) axis.
+        SendWin {
+            guard: usize,
+            eq: &'static str,
+            dst: usize,
+            model: Model,
+            val: &'static str,
+            lo1: u64,
+            hi1: u64,
+            lo2: u64,
+            hi2: u64,
+        },
+        Recv {
+            sel: Sel,
+            blocking: bool,
+        },
+    }
 
-/// Value of guard op `k` given the resolved `vals`, when it equals `eq`.
-fn guard_hits(vals: &[Option<Val>], k: usize, eq: &str) -> bool {
-    vals[k].is_some_and(|v| resolve(v) == eq)
-}
-
-/// The label op `op` produces given the thread's resolved `vals` so far.
-fn op_label(op: &Op, vals: &[Option<Val>]) -> Label {
-    match op {
-        Op::Nondet => Label::nondet(["a", "b"]),
-        Op::Send {
-            dst,
-            model,
-            val,
-            lo,
-            hi,
-        } => Label::send_within(*model, *dst, *val, Window::new(*lo, *hi)),
-        Op::SendIf {
-            dst,
-            model,
-            val,
-            lo,
-            hi,
-            ..
-        } => Label::send_within(*model, *dst, *val, Window::new(*lo, *hi)),
-        Op::SendWin {
-            guard,
-            eq,
-            dst,
-            model,
-            val,
-            lo1,
-            hi1,
-            lo2,
-            hi2,
-        } => {
-            let (lo, hi) = if guard_hits(vals, *guard, eq) {
-                (*lo1, *hi1)
-            } else {
-                (*lo2, *hi2)
-            };
-            Label::send_within(*model, *dst, *val, Window::new(lo, hi))
-        }
-        Op::Recv { sel, blocking } => {
-            let pred = match sel {
-                Sel::Any => Pred::any(),
-                Sel::Eq(s) => Pred::eq(*s),
-                Sel::EqGuard(k) => match vals[*k] {
-                    Some(v) => Pred::eq(resolve(v)),
-                    None => Pred::eq("__none__"), // never matches the {a,b} payloads
-                },
-            };
-            if *blocking {
-                Label::recv(pred)
-            } else {
-                Label::recv_nb(pred)
-            }
+    impl Op {
+        fn is_value_producing(&self) -> bool {
+            matches!(self, Op::Nondet | Op::Recv { .. })
         }
     }
-}
 
-/// Replay one thread against its trace: resolved per-op values, plus the index of the first
-/// op not yet committed (skipped `SendIf`s never consume a trace entry).
-fn replay(ops: &[Op], trace: &[Option<Val>]) -> (Vec<Option<Val>>, usize) {
-    let mut vals: Vec<Option<Val>> = vec![None; ops.len()];
-    let mut cursor = 0;
-    for (i, op) in ops.iter().enumerate() {
-        let emits = match op {
-            Op::SendIf { guard, eq, .. } => guard_hits(&vals, *guard, eq),
-            _ => true,
-        };
-        if !emits {
-            continue; // no event, no trace entry
-        }
-        if cursor < trace.len() {
-            if op.is_value_producing() {
-                vals[i] = trace[cursor];
-            }
-            cursor += 1;
-        } else {
-            return (vals, i);
-        }
+    /// The interpretable program: `threads[t]` is thread `t`'s op list.
+    #[derive(Clone, Debug)]
+    pub struct VdProgram {
+        pub threads: Vec<Vec<Op>>,
     }
-    (vals, ops.len())
-}
 
-impl Program for VdProgram {
-    fn num_threads(&self) -> usize {
-        self.threads.len()
+    /// Value of guard op `k` given the resolved `vals`, when it equals `eq`.
+    fn guard_hits(vals: &[Option<Val>], k: usize, eq: &str) -> bool {
+        vals[k].is_some_and(|v| resolve(v) == eq)
     }
-    fn next(&self, traces: &[Vec<Option<Val>>]) -> Vec<ThreadNext> {
-        self.threads
-            .iter()
-            .enumerate()
-            .map(|(t, ops)| {
-                let (vals, frontier) = replay(ops, &traces[t]);
-                // The frontier op may itself be a skipped SendIf whose guard resolves only
-                // later — replay already skipped those; find the first op at/after `frontier`
-                // that emits under the resolved vals.
-                let mut i = frontier;
-                while i < ops.len() {
-                    let emits = match &ops[i] {
-                        Op::SendIf { guard, eq, .. } => guard_hits(&vals, *guard, eq),
-                        _ => true,
-                    };
-                    if emits {
-                        return ThreadNext::Next(op_label(&ops[i], &vals));
-                    }
-                    i += 1;
-                }
-                ThreadNext::Finished
-            })
-            .collect()
-    }
-    /// Sound over-approximation: for every op at/after the frontier, include every label it
-    /// could produce under ANY assignment of still-unresolved guards. A guard already
-    /// resolved narrows the set; an unresolved (or ⊥-valued) one contributes all variants.
-    fn possible_future(&self, tid: usize, trace: &[Option<Val>]) -> Option<Vec<Label>> {
-        let ops = &self.threads[tid];
-        let (vals, frontier) = replay(ops, trace);
-        // Contract (`src/program.rs`): `out[0]` must be *exactly* the thread's next label - the
-        // one `next` reports, i.e. `op_label` of the first **emitting** op at/after the frontier
-        // (a `SendIf` with a failing guard is skipped by both). Everything from index 1 on
-        // over-approximates the ops strictly after it.
-        //
-        // The head cannot come from the loop below: that loop deliberately emits *several*
-        // labels for one op (both windows of an unresolved `SendWin`), so it would put the wrong
-        // label at index 0. `force_source` condition (3b) does `.skip(1)` on the strength of
-        // this, so a mismatch is an over-force - a completeness loss, not a crash.
-        let Some(head) = (frontier..ops.len()).find(|&i| match &ops[i] {
-            Op::SendIf { guard, eq, .. } => guard_hits(&vals, *guard, eq),
-            _ => true,
-        }) else {
-            return Some(Vec::new()); // finished: no future events at all (the exact answer)
-        };
-        let mut out = vec![op_label(&ops[head], &vals)];
-        for op in &ops[head + 1..] {
-            match op {
-                Op::Nondet => out.push(op_label(op, &vals)),
-                Op::Send { .. } => out.push(op_label(op, &vals)),
-                Op::SendIf { guard, eq, .. } => match vals[*guard] {
-                    Some(v) if resolve(v) != *eq => {} // definitely skipped
-                    _ => out.push(op_label(op, &vals)), // may emit
-                },
-                Op::SendWin {
-                    guard,
-                    dst,
-                    model,
-                    val,
-                    lo1,
-                    hi1,
-                    lo2,
-                    hi2,
-                    ..
-                } => match vals[*guard] {
-                    Some(_) => out.push(op_label(op, &vals)),
-                    None => {
-                        // Unresolved guard: both windows are possible.
-                        out.push(Label::send_within(
-                            *model,
-                            *dst,
-                            *val,
-                            Window::new(*lo1, *hi1),
-                        ));
-                        out.push(Label::send_within(
-                            *model,
-                            *dst,
-                            *val,
-                            Window::new(*lo2, *hi2),
-                        ));
-                    }
-                },
-                Op::Recv { sel, blocking } => {
-                    let mk = |p: Pred| {
-                        if *blocking {
-                            Label::recv(p)
-                        } else {
-                            Label::recv_nb(p)
-                        }
-                    };
-                    match sel {
-                        Sel::Any => out.push(mk(Pred::any())),
-                        Sel::Eq(s) => out.push(mk(Pred::eq(*s))),
-                        Sel::EqGuard(k) => match vals[*k] {
-                            Some(v) => out.push(mk(Pred::eq(resolve(v)))),
-                            None => {
-                                // The guard may resolve to any payload the corpus uses
-                                // ("g" included — the victim's gated send), or to no value.
-                                for p in ["a", "b", "g", "__none__"] {
-                                    out.push(mk(Pred::eq(p)));
-                                }
-                            }
-                        },
-                    }
-                }
-            }
-        }
-        Some(out)
-    }
-}
 
-// -- Generator ------------------------------------------------------------------------------
-
-/// A near-tie delivery window (bands overlapping within 1–2 ticks) plus one late band.
-fn win(rng: &mut Rng) -> (u64, u64) {
-    match rng.below(5) {
-        0 => (0, 1),
-        1 => (1, 2),
-        2 => (2, 3),
-        3 => (0, 4),
-        _ => (5, 6), // late: genuinely unreadable next to an unread (0,1) competitor
-    }
-}
-
-fn model(rng: &mut Rng) -> Model {
-    if rng.chance(50) {
-        Model::Asyn
-    } else {
-        Model::P2p
-    }
-}
-
-fn payload(rng: &mut Rng) -> &'static str {
-    if rng.chance(50) {
-        "a"
-    } else {
-        "b"
-    }
-}
-
-/// One random send-ish op; guards reference `producers` (value-producing op indices so far).
-fn gen_send(rng: &mut Rng, nt: usize, victim: usize, producers: &[usize]) -> Op {
-    // Destination bias onto the victim thread: racing sends need a shared receiver. Kept
-    // moderate — relay threads (recv → send) need incoming traffic too, or their late sends
-    // (the only source of backward revisits under DES drain-first) never fire.
-    let dst = if rng.chance(40) { victim } else { rng.below(nt) };
-    let (lo, hi) = win(rng);
-    let m = model(rng);
-    let v = payload(rng);
-    if !producers.is_empty() && rng.chance(55) {
-        let guard = producers[rng.below(producers.len())];
-        let eq = payload(rng);
-        if rng.chance(50) {
+    /// The label op `op` produces given the thread's resolved `vals` so far.
+    fn op_label(op: &Op, vals: &[Option<Val>]) -> Label {
+        match op {
+            Op::Nondet => Label::nondet(["a", "b"]),
+            Op::Send {
+                dst,
+                model,
+                val,
+                lo,
+                hi,
+            } => Label::send_within(*model, *dst, *val, Window::new(*lo, *hi)),
             Op::SendIf {
+                dst,
+                model,
+                val,
+                lo,
+                hi,
+                ..
+            } => Label::send_within(*model, *dst, *val, Window::new(*lo, *hi)),
+            Op::SendWin {
                 guard,
                 eq,
+                dst,
+                model,
+                val,
+                lo1,
+                hi1,
+                lo2,
+                hi2,
+            } => {
+                let (lo, hi) = if guard_hits(vals, *guard, eq) {
+                    (*lo1, *hi1)
+                } else {
+                    (*lo2, *hi2)
+                };
+                Label::send_within(*model, *dst, *val, Window::new(lo, hi))
+            }
+            Op::Recv { sel, blocking } => {
+                let pred = match sel {
+                    Sel::Any => Pred::any(),
+                    Sel::Eq(s) => Pred::eq(*s),
+                    Sel::EqGuard(k) => match vals[*k] {
+                        Some(v) => Pred::eq(resolve(v)),
+                        None => Pred::eq("__none__"), // never matches the {a,b} payloads
+                    },
+                };
+                if *blocking {
+                    Label::recv(pred)
+                } else {
+                    Label::recv_nb(pred)
+                }
+            }
+        }
+    }
+
+    /// Replay one thread against its trace: resolved per-op values, plus the index of the first
+    /// op not yet committed (skipped `SendIf`s never consume a trace entry).
+    fn replay(ops: &[Op], trace: &[Option<Val>]) -> (Vec<Option<Val>>, usize) {
+        let mut vals: Vec<Option<Val>> = vec![None; ops.len()];
+        let mut cursor = 0;
+        for (i, op) in ops.iter().enumerate() {
+            let emits = match op {
+                Op::SendIf { guard, eq, .. } => guard_hits(&vals, *guard, eq),
+                _ => true,
+            };
+            if !emits {
+                continue; // no event, no trace entry
+            }
+            if cursor < trace.len() {
+                if op.is_value_producing() {
+                    vals[i] = trace[cursor];
+                }
+                cursor += 1;
+            } else {
+                return (vals, i);
+            }
+        }
+        (vals, ops.len())
+    }
+
+    impl Program for VdProgram {
+        fn num_threads(&self) -> usize {
+            self.threads.len()
+        }
+        fn next(&self, traces: &[Vec<Option<Val>>]) -> Vec<ThreadNext> {
+            self.threads
+                .iter()
+                .enumerate()
+                .map(|(t, ops)| {
+                    let (vals, frontier) = replay(ops, &traces[t]);
+                    // The frontier op may itself be a skipped SendIf whose guard resolves only
+                    // later — replay already skipped those; find the first op at/after `frontier`
+                    // that emits under the resolved vals.
+                    let mut i = frontier;
+                    while i < ops.len() {
+                        let emits = match &ops[i] {
+                            Op::SendIf { guard, eq, .. } => guard_hits(&vals, *guard, eq),
+                            _ => true,
+                        };
+                        if emits {
+                            return ThreadNext::Next(op_label(&ops[i], &vals));
+                        }
+                        i += 1;
+                    }
+                    ThreadNext::Finished
+                })
+                .collect()
+        }
+        /// Sound over-approximation: for every op at/after the frontier, include every label it
+        /// could produce under ANY assignment of still-unresolved guards. A guard already
+        /// resolved narrows the set; an unresolved (or ⊥-valued) one contributes all variants.
+        fn possible_future(&self, tid: usize, trace: &[Option<Val>]) -> Option<Vec<Label>> {
+            let ops = &self.threads[tid];
+            let (vals, frontier) = replay(ops, trace);
+            // Contract (`src/program.rs`): `out[0]` must be *exactly* the thread's next label - the
+            // one `next` reports, i.e. `op_label` of the first **emitting** op at/after the frontier
+            // (a `SendIf` with a failing guard is skipped by both). Everything from index 1 on
+            // over-approximates the ops strictly after it.
+            //
+            // The head cannot come from the loop below: that loop deliberately emits *several*
+            // labels for one op (both windows of an unresolved `SendWin`), so it would put the wrong
+            // label at index 0. `force_source` condition (3b) does `.skip(1)` on the strength of
+            // this, so a mismatch is an over-force - a completeness loss, not a crash.
+            let Some(head) = (frontier..ops.len()).find(|&i| match &ops[i] {
+                Op::SendIf { guard, eq, .. } => guard_hits(&vals, *guard, eq),
+                _ => true,
+            }) else {
+                return Some(Vec::new()); // finished: no future events at all (the exact answer)
+            };
+            let mut out = vec![op_label(&ops[head], &vals)];
+            for op in &ops[head + 1..] {
+                match op {
+                    Op::Nondet => out.push(op_label(op, &vals)),
+                    Op::Send { .. } => out.push(op_label(op, &vals)),
+                    Op::SendIf { guard, eq, .. } => match vals[*guard] {
+                        Some(v) if resolve(v) != *eq => {}  // definitely skipped
+                        _ => out.push(op_label(op, &vals)), // may emit
+                    },
+                    Op::SendWin {
+                        guard,
+                        dst,
+                        model,
+                        val,
+                        lo1,
+                        hi1,
+                        lo2,
+                        hi2,
+                        ..
+                    } => match vals[*guard] {
+                        Some(_) => out.push(op_label(op, &vals)),
+                        None => {
+                            // Unresolved guard: both windows are possible.
+                            out.push(Label::send_within(
+                                *model,
+                                *dst,
+                                *val,
+                                Window::new(*lo1, *hi1),
+                            ));
+                            out.push(Label::send_within(
+                                *model,
+                                *dst,
+                                *val,
+                                Window::new(*lo2, *hi2),
+                            ));
+                        }
+                    },
+                    Op::Recv { sel, blocking } => {
+                        let mk = |p: Pred| {
+                            if *blocking {
+                                Label::recv(p)
+                            } else {
+                                Label::recv_nb(p)
+                            }
+                        };
+                        match sel {
+                            Sel::Any => out.push(mk(Pred::any())),
+                            Sel::Eq(s) => out.push(mk(Pred::eq(*s))),
+                            Sel::EqGuard(k) => match vals[*k] {
+                                Some(v) => out.push(mk(Pred::eq(resolve(v)))),
+                                None => {
+                                    // The guard may resolve to any payload the corpus uses
+                                    // ("g" included — the victim's gated send), or to no value.
+                                    for p in ["a", "b", "g", "__none__"] {
+                                        out.push(mk(Pred::eq(p)));
+                                    }
+                                }
+                            },
+                        }
+                    }
+                }
+            }
+            Some(out)
+        }
+    }
+
+    // -- Generator ------------------------------------------------------------------------------
+
+    /// A near-tie delivery window (bands overlapping within 1–2 ticks) plus one late band.
+    fn win(rng: &mut Rng) -> (u64, u64) {
+        match rng.below(5) {
+            0 => (0, 1),
+            1 => (1, 2),
+            2 => (2, 3),
+            3 => (0, 4),
+            _ => (5, 6), // late: genuinely unreadable next to an unread (0,1) competitor
+        }
+    }
+
+    fn model(rng: &mut Rng) -> Model {
+        if rng.chance(50) {
+            Model::Asyn
+        } else {
+            Model::P2p
+        }
+    }
+
+    fn payload(rng: &mut Rng) -> &'static str {
+        if rng.chance(50) {
+            "a"
+        } else {
+            "b"
+        }
+    }
+
+    /// One random send-ish op; guards reference `producers` (value-producing op indices so far).
+    fn gen_send(rng: &mut Rng, nt: usize, victim: usize, producers: &[usize]) -> Op {
+        // Destination bias onto the victim thread: racing sends need a shared receiver. Kept
+        // moderate — relay threads (recv → send) need incoming traffic too, or their late sends
+        // (the only source of backward revisits under DES drain-first) never fire.
+        let dst = if rng.chance(40) {
+            victim
+        } else {
+            rng.below(nt)
+        };
+        let (lo, hi) = win(rng);
+        let m = model(rng);
+        let v = payload(rng);
+        if !producers.is_empty() && rng.chance(55) {
+            let guard = producers[rng.below(producers.len())];
+            let eq = payload(rng);
+            if rng.chance(50) {
+                Op::SendIf {
+                    guard,
+                    eq,
+                    dst,
+                    model: m,
+                    val: v,
+                    lo,
+                    hi,
+                }
+            } else {
+                let (lo2, hi2) = win(rng);
+                Op::SendWin {
+                    guard,
+                    eq,
+                    dst,
+                    model: m,
+                    val: v,
+                    lo1: lo,
+                    hi1: hi,
+                    lo2,
+                    hi2,
+                }
+            }
+        } else {
+            Op::Send {
                 dst,
                 model: m,
                 val: v,
                 lo,
                 hi,
             }
-        } else {
-            let (lo2, hi2) = win(rng);
-            Op::SendWin {
-                guard,
-                eq,
-                dst,
-                model: m,
-                val: v,
-                lo1: lo,
-                hi1: hi,
-                lo2,
-                hi2,
+        }
+    }
+
+    fn gen_recv(rng: &mut Rng, producers: &[usize]) -> Op {
+        let sel = match rng.below(10) {
+            0..=3 => Sel::Any,
+            4..=6 => Sel::Eq(payload(rng)),
+            _ if !producers.is_empty() => Sel::EqGuard(producers[rng.below(producers.len())]),
+            _ => Sel::Any,
+        };
+        Op::Recv {
+            sel,
+            blocking: rng.chance(70),
+        }
+    }
+
+    /// One random program: 3–4 threads, 2–4 ops each; the last thread is the "victim", biased
+    /// into the consumed-competitor shape: two sequential receives followed by a value-gated
+    /// send (the read value decides the emission — the raft LEADER shape).
+    fn gen_program(rng: &mut Rng) -> VdProgram {
+        let nt = 3 + rng.below(2);
+        let victim = nt - 1;
+        let mut threads = Vec::with_capacity(nt);
+        for t in 0..nt - 1 {
+            let mut ops: Vec<Op> = Vec::new();
+            let mut producers: Vec<usize> = Vec::new();
+            if rng.chance(60) {
+                producers.push(ops.len());
+                ops.push(Op::Nondet);
             }
+            let _ = t;
+            let ne = 1 + rng.below(3);
+            for _ in 0..ne {
+                match rng.below(100) {
+                    // A mid-thread nondet: po-after a receive it lands in `Deleted` of later
+                    // revisits (a nondet at op 0 is drained first by DES and is almost never
+                    // deleted) — this is what exercises the PASS oracle.
+                    0..=19 => {
+                        producers.push(ops.len());
+                        ops.push(Op::Nondet);
+                    }
+                    20..=64 => ops.push(gen_send(rng, nt, victim, &producers)),
+                    _ => {
+                        // A recv guard may only reference EARLIER producers, so the fresh index
+                        // is pushed after generating the op.
+                        let op = gen_recv(rng, &producers);
+                        producers.push(ops.len());
+                        ops.push(op);
+                    }
+                }
+            }
+            threads.push(ops);
         }
-    } else {
-        Op::Send {
-            dst,
-            model: m,
-            val: v,
-            lo,
-            hi,
-        }
-    }
-}
-
-fn gen_recv(rng: &mut Rng, producers: &[usize]) -> Op {
-    let sel = match rng.below(10) {
-        0..=3 => Sel::Any,
-        4..=6 => Sel::Eq(payload(rng)),
-        _ if !producers.is_empty() => Sel::EqGuard(producers[rng.below(producers.len())]),
-        _ => Sel::Any,
-    };
-    Op::Recv {
-        sel,
-        blocking: rng.chance(70),
-    }
-}
-
-/// One random program: 3–4 threads, 2–4 ops each; the last thread is the "victim", biased
-/// into the consumed-competitor shape: two sequential receives followed by a value-gated
-/// send (the read value decides the emission — the raft LEADER shape).
-fn gen_program(rng: &mut Rng) -> VdProgram {
-    let nt = 3 + rng.below(2);
-    let victim = nt - 1;
-    let mut threads = Vec::with_capacity(nt);
-    for t in 0..nt - 1 {
+        // The victim thread.
         let mut ops: Vec<Op> = Vec::new();
         let mut producers: Vec<usize> = Vec::new();
-        if rng.chance(60) {
+        if rng.chance(40) {
             producers.push(ops.len());
             ops.push(Op::Nondet);
         }
-        let _ = t;
-        let ne = 1 + rng.below(3);
-        for _ in 0..ne {
-            match rng.below(100) {
-                // A mid-thread nondet: po-after a receive it lands in `Deleted` of later
-                // revisits (a nondet at op 0 is drained first by DES and is almost never
-                // deleted) — this is what exercises the PASS oracle.
-                0..=19 => {
-                    producers.push(ops.len());
-                    ops.push(Op::Nondet);
-                }
-                20..=64 => ops.push(gen_send(rng, nt, victim, &producers)),
-                _ => {
-                    // A recv guard may only reference EARLIER producers, so the fresh index
-                    // is pushed after generating the op.
-                    let op = gen_recv(rng, &producers);
-                    producers.push(ops.len());
-                    ops.push(op);
-                }
-            }
-        }
-        threads.push(ops);
-    }
-    // The victim thread.
-    let mut ops: Vec<Op> = Vec::new();
-    let mut producers: Vec<usize> = Vec::new();
-    if rng.chance(40) {
         producers.push(ops.len());
-        ops.push(Op::Nondet);
-    }
-    producers.push(ops.len());
-    ops.push(Op::Recv {
-        sel: Sel::Any,
-        blocking: true,
-    });
-    if rng.chance(70) {
-        // A nondet BETWEEN the two receives: po-after a blocking receive, so it sits in the
-        // `Deleted` set of any revisit of that receive — the main PASS-oracle trigger.
-        producers.push(ops.len());
-        ops.push(Op::Nondet);
-    }
-    if rng.chance(80) {
-        let op = gen_recv(rng, &producers);
-        producers.push(ops.len());
-        ops.push(op);
-    }
-    if rng.chance(70) {
-        // The value-gated downstream send: emitted only for one read value.
-        let guard = producers[rng.below(producers.len())];
-        let (lo, hi) = win(rng);
-        ops.push(Op::SendIf {
-            guard,
-            eq: payload(rng),
-            dst: rng.below(nt - 1),
-            model: model(rng),
-            val: "g",
-            lo,
-            hi,
-        });
-    }
-    threads.push(ops);
-    VdProgram { threads }
-}
-
-/// A directed scaffold guaranteeing the PASS oracle fires (the §3.3 ingredients, randomized
-/// in windows/models/payloads): a victim with `recv; nd; [SendIf]; recv; [SendIf]`, an early
-/// sender racing a **relay** whose send is po-after its own receive — the only kind of send
-/// that is late under DES drain-first and therefore backward-revisits the victim, deleting
-/// the mid-nondet (a non-min holder in half the branches ⇒ an oracle call).
-fn gen_scaffold(rng: &mut Rng) -> VdProgram {
-    let nt = 4;
-    let victim = 0usize;
-    // T0 (victim): recv; nd; [SendIf gated by nd]; recv; [SendIf gated by a read].
-    let mut t0: Vec<Op> = vec![
-        Op::Recv {
+        ops.push(Op::Recv {
             sel: Sel::Any,
             blocking: true,
-        },
-        Op::Nondet,
-    ];
-    if rng.chance(50) {
-        // A value-gated early send between the nondet and the second receive: under one
-        // value the region carries an extra competitor — the feasibility-divergence seed.
-        let (lo, hi) = win(rng);
-        t0.push(Op::SendIf {
-            guard: 1,
-            eq: payload(rng),
-            dst: 1 + rng.below(nt - 1),
-            model: model(rng),
-            val: payload(rng),
-            lo,
-            hi,
         });
+        if rng.chance(70) {
+            // A nondet BETWEEN the two receives: po-after a blocking receive, so it sits in the
+            // `Deleted` set of any revisit of that receive — the main PASS-oracle trigger.
+            producers.push(ops.len());
+            ops.push(Op::Nondet);
+        }
+        if rng.chance(80) {
+            let op = gen_recv(rng, &producers);
+            producers.push(ops.len());
+            ops.push(op);
+        }
+        if rng.chance(70) {
+            // The value-gated downstream send: emitted only for one read value.
+            let guard = producers[rng.below(producers.len())];
+            let (lo, hi) = win(rng);
+            ops.push(Op::SendIf {
+                guard,
+                eq: payload(rng),
+                dst: rng.below(nt - 1),
+                model: model(rng),
+                val: "g",
+                lo,
+                hi,
+            });
+        }
+        threads.push(ops);
+        VdProgram { threads }
     }
-    let second = t0.len();
-    t0.push(Op::Recv {
-        sel: if rng.chance(50) { Sel::Any } else { Sel::EqGuard(1) },
-        blocking: true,
-    });
-    if rng.chance(60) {
-        let (lo, hi) = win(rng);
-        t0.push(Op::SendIf {
-            guard: if rng.chance(50) { 1 } else { second },
-            eq: payload(rng),
-            dst: 1 + rng.below(nt - 1),
-            model: model(rng),
-            val: "g",
-            lo,
-            hi,
-        });
-    }
-    // T1: the early sender racing the relay for the victim's receives.
-    let (lo, hi) = win(rng);
-    let t1 = vec![Op::Send {
-        dst: victim,
-        model: model(rng),
-        val: payload(rng),
-        lo,
-        hi,
-    }];
-    // T2 (relay): recv(=x) then send to the victim — late by construction.
-    let (lo, hi) = win(rng);
-    let t2 = vec![
-        Op::Recv {
-            sel: Sel::Eq("x"),
+
+    /// A directed scaffold guaranteeing the PASS oracle fires (the §3.3 ingredients, randomized
+    /// in windows/models/payloads): a victim with `recv; nd; [SendIf]; recv; [SendIf]`, an early
+    /// sender racing a **relay** whose send is po-after its own receive — the only kind of send
+    /// that is late under DES drain-first and therefore backward-revisits the victim, deleting
+    /// the mid-nondet (a non-min holder in half the branches ⇒ an oracle call).
+    fn gen_scaffold(rng: &mut Rng) -> VdProgram {
+        let nt = 4;
+        let victim = 0usize;
+        // T0 (victim): recv; nd; [SendIf gated by nd]; recv; [SendIf gated by a read].
+        let mut t0: Vec<Op> = vec![
+            Op::Recv {
+                sel: Sel::Any,
+                blocking: true,
+            },
+            Op::Nondet,
+        ];
+        if rng.chance(50) {
+            // A value-gated early send between the nondet and the second receive: under one
+            // value the region carries an extra competitor — the feasibility-divergence seed.
+            let (lo, hi) = win(rng);
+            t0.push(Op::SendIf {
+                guard: 1,
+                eq: payload(rng),
+                dst: 1 + rng.below(nt - 1),
+                model: model(rng),
+                val: payload(rng),
+                lo,
+                hi,
+            });
+        }
+        let second = t0.len();
+        t0.push(Op::Recv {
+            sel: if rng.chance(50) {
+                Sel::Any
+            } else {
+                Sel::EqGuard(1)
+            },
             blocking: true,
-        },
-        Op::Send {
+        });
+        if rng.chance(60) {
+            let (lo, hi) = win(rng);
+            t0.push(Op::SendIf {
+                guard: if rng.chance(50) { 1 } else { second },
+                eq: payload(rng),
+                dst: 1 + rng.below(nt - 1),
+                model: model(rng),
+                val: "g",
+                lo,
+                hi,
+            });
+        }
+        // T1: the early sender racing the relay for the victim's receives.
+        let (lo, hi) = win(rng);
+        let t1 = vec![Op::Send {
             dst: victim,
             model: model(rng),
             val: payload(rng),
             lo,
             hi,
-        },
-    ];
-    // T3: feeds the relay.
-    let (lo, hi) = win(rng);
-    let t3 = vec![Op::Send {
-        dst: 2,
-        model: model(rng),
-        val: "x",
-        lo,
-        hi,
-    }];
-    VdProgram {
-        threads: vec![t0, t1, t2, t3],
+        }];
+        // T2 (relay): recv(=x) then send to the victim — late by construction.
+        let (lo, hi) = win(rng);
+        let t2 = vec![
+            Op::Recv {
+                sel: Sel::Eq("x"),
+                blocking: true,
+            },
+            Op::Send {
+                dst: victim,
+                model: model(rng),
+                val: payload(rng),
+                lo,
+                hi,
+            },
+        ];
+        // T3: feeds the relay.
+        let (lo, hi) = win(rng);
+        let t3 = vec![Op::Send {
+            dst: 2,
+            model: model(rng),
+            val: "x",
+            lo,
+            hi,
+        }];
+        VdProgram {
+            threads: vec![t0, t1, t2, t3],
+        }
     }
-}
 
     /// Public handles for the (private, verbatim-copied) generators above.
     pub fn gen(rng: &mut Rng) -> VdProgram {
@@ -1495,138 +1503,137 @@ mod r1_witness {
     use must::event::{Label, Model, Pred, Window};
     use must::{Program, ThreadNext, Val};
 
+    type NextFn = fn(&[Option<Val>]) -> ThreadNext;
+    type FutureFn = fn(&[Option<Val>]) -> Option<Vec<Label>>;
 
-type NextFn = fn(&[Option<Val>]) -> ThreadNext;
-type FutureFn = fn(&[Option<Val>]) -> Option<Vec<Label>>;
-
-pub struct Vdp {
-    nexts: Vec<NextFn>,
-    futures: Vec<FutureFn>,
-}
-
-impl Program for Vdp {
-    fn num_threads(&self) -> usize {
-        self.nexts.len()
+    pub struct Vdp {
+        nexts: Vec<NextFn>,
+        futures: Vec<FutureFn>,
     }
-    fn next(&self, traces: &[Vec<Option<Val>>]) -> Vec<ThreadNext> {
-        (0..self.nexts.len())
-            .map(|i| (self.nexts[i])(&traces[i]))
-            .collect()
+
+    impl Program for Vdp {
+        fn num_threads(&self) -> usize {
+            self.nexts.len()
+        }
+        fn next(&self, traces: &[Vec<Option<Val>>]) -> Vec<ThreadNext> {
+            (0..self.nexts.len())
+                .map(|i| (self.nexts[i])(&traces[i]))
+                .collect()
+        }
+        fn possible_future(&self, tid: usize, trace: &[Option<Val>]) -> Option<Vec<Label>> {
+            (self.futures[tid])(trace)
+        }
     }
-    fn possible_future(&self, tid: usize, trace: &[Option<Val>]) -> Option<Vec<Label>> {
-        (self.futures[tid])(trace)
+
+    fn is(entry: &Option<Val>, s: &str) -> bool {
+        entry.as_ref() == Some(&Val::from(s))
     }
-}
 
-fn is(entry: &Option<Val>, s: &str) -> bool {
-    entry.as_ref() == Some(&Val::from(s))
-}
+    // -- labels ---------------------------------------------------------------------------------
 
-// -- labels ---------------------------------------------------------------------------------
-
-fn r_nb() -> Label {
-    Label::recv_nb(Pred::eq("L"))
-}
-fn w_send() -> Label {
-    Label::send_within(Model::Asyn, 1, "w", Window::new(100, 100))
-}
-fn recv_w() -> Label {
-    Label::recv(Pred::eq("w"))
-}
-fn ep_lbl() -> Label {
-    Label::recv(Pred::new("=s1|=s2", |x| x == "s1" || x == "s2"))
-}
-fn c_send() -> Label {
-    Label::send_within(Model::Asyn, 2, "c", Window::new(0, 0))
-}
-fn q_lbl() -> Label {
-    Label::recv(Pred::new("=m|=c", |x| x == "m" || x == "c"))
-}
-fn l_send() -> Label {
-    Label::send(Model::Asyn, 0, "L") // untimed [0, inf)
-}
-fn s1_send() -> Label {
-    Label::send_within(Model::Asyn, 1, "s1", Window::new(10, 10))
-}
-fn s2_send() -> Label {
-    Label::send_within(Model::Asyn, 1, "s2", Window::new(20, 20))
-}
-fn m_send() -> Label {
-    Label::send_within(Model::Asyn, 2, "m", Window::new(150, 150))
-}
-
-// -- threads --------------------------------------------------------------------------------
-
-fn t0(trace: &[Option<Val>]) -> ThreadNext {
-    match trace.len() {
-        0 => ThreadNext::Next(r_nb()),
-        _ => ThreadNext::Finished,
+    fn r_nb() -> Label {
+        Label::recv_nb(Pred::eq("L"))
     }
-}
-fn t0_future(trace: &[Option<Val>]) -> Option<Vec<Label>> {
-    Some(match trace.len() {
-        0 => vec![r_nb()],
-        _ => vec![],
-    })
-}
-
-fn t1(trace: &[Option<Val>]) -> ThreadNext {
-    match trace.len() {
-        0 => ThreadNext::Next(w_send()),
-        1 => ThreadNext::Next(recv_w()),
-        2 => ThreadNext::Next(ep_lbl()),
-        3 if is(&trace[2], "s1") => ThreadNext::Next(c_send()),
-        _ => ThreadNext::Finished,
+    fn w_send() -> Label {
+        Label::send_within(Model::Asyn, 1, "w", Window::new(100, 100))
     }
-}
-fn t1_future(trace: &[Option<Val>]) -> Option<Vec<Label>> {
-    Some(match trace.len() {
-        0 => vec![w_send(), recv_w(), ep_lbl(), c_send()],
-        1 => vec![recv_w(), ep_lbl(), c_send()],
-        2 => vec![ep_lbl(), c_send()],
-        3 if is(&trace[2], "s1") => vec![c_send()],
-        _ => vec![],
-    })
-}
-
-fn t2(trace: &[Option<Val>]) -> ThreadNext {
-    match trace.len() {
-        0 => ThreadNext::Next(q_lbl()),
-        1 if is(&trace[0], "m") => ThreadNext::Next(l_send()),
-        _ => ThreadNext::Finished,
+    fn recv_w() -> Label {
+        Label::recv(Pred::eq("w"))
     }
-}
-fn t2_future(trace: &[Option<Val>]) -> Option<Vec<Label>> {
-    Some(match trace.len() {
-        0 => vec![q_lbl(), l_send()],
-        1 if is(&trace[0], "m") => vec![l_send()],
-        _ => vec![],
-    })
-}
-
-fn t3(trace: &[Option<Val>]) -> ThreadNext {
-    match trace.len() {
-        0 => ThreadNext::Next(s1_send()),
-        1 => ThreadNext::Next(s2_send()),
-        2 => ThreadNext::Next(m_send()),
-        _ => ThreadNext::Finished,
+    fn ep_lbl() -> Label {
+        Label::recv(Pred::new("=s1|=s2", |x| x == "s1" || x == "s2"))
     }
-}
-fn t3_future(trace: &[Option<Val>]) -> Option<Vec<Label>> {
-    Some(match trace.len() {
-        0 => vec![s1_send(), s2_send(), m_send()],
-        1 => vec![s2_send(), m_send()],
-        2 => vec![m_send()],
-        _ => vec![],
-    })
-}
-
-fn prog() -> Vdp {
-    Vdp {
-        nexts: vec![t0, t1, t2, t3],
-        futures: vec![t0_future, t1_future, t2_future, t3_future],
+    fn c_send() -> Label {
+        Label::send_within(Model::Asyn, 2, "c", Window::new(0, 0))
     }
-}
+    fn q_lbl() -> Label {
+        Label::recv(Pred::new("=m|=c", |x| x == "m" || x == "c"))
+    }
+    fn l_send() -> Label {
+        Label::send(Model::Asyn, 0, "L") // untimed [0, inf)
+    }
+    fn s1_send() -> Label {
+        Label::send_within(Model::Asyn, 1, "s1", Window::new(10, 10))
+    }
+    fn s2_send() -> Label {
+        Label::send_within(Model::Asyn, 1, "s2", Window::new(20, 20))
+    }
+    fn m_send() -> Label {
+        Label::send_within(Model::Asyn, 2, "m", Window::new(150, 150))
+    }
+
+    // -- threads --------------------------------------------------------------------------------
+
+    fn t0(trace: &[Option<Val>]) -> ThreadNext {
+        match trace.len() {
+            0 => ThreadNext::Next(r_nb()),
+            _ => ThreadNext::Finished,
+        }
+    }
+    fn t0_future(trace: &[Option<Val>]) -> Option<Vec<Label>> {
+        Some(match trace.len() {
+            0 => vec![r_nb()],
+            _ => vec![],
+        })
+    }
+
+    fn t1(trace: &[Option<Val>]) -> ThreadNext {
+        match trace.len() {
+            0 => ThreadNext::Next(w_send()),
+            1 => ThreadNext::Next(recv_w()),
+            2 => ThreadNext::Next(ep_lbl()),
+            3 if is(&trace[2], "s1") => ThreadNext::Next(c_send()),
+            _ => ThreadNext::Finished,
+        }
+    }
+    fn t1_future(trace: &[Option<Val>]) -> Option<Vec<Label>> {
+        Some(match trace.len() {
+            0 => vec![w_send(), recv_w(), ep_lbl(), c_send()],
+            1 => vec![recv_w(), ep_lbl(), c_send()],
+            2 => vec![ep_lbl(), c_send()],
+            3 if is(&trace[2], "s1") => vec![c_send()],
+            _ => vec![],
+        })
+    }
+
+    fn t2(trace: &[Option<Val>]) -> ThreadNext {
+        match trace.len() {
+            0 => ThreadNext::Next(q_lbl()),
+            1 if is(&trace[0], "m") => ThreadNext::Next(l_send()),
+            _ => ThreadNext::Finished,
+        }
+    }
+    fn t2_future(trace: &[Option<Val>]) -> Option<Vec<Label>> {
+        Some(match trace.len() {
+            0 => vec![q_lbl(), l_send()],
+            1 if is(&trace[0], "m") => vec![l_send()],
+            _ => vec![],
+        })
+    }
+
+    fn t3(trace: &[Option<Val>]) -> ThreadNext {
+        match trace.len() {
+            0 => ThreadNext::Next(s1_send()),
+            1 => ThreadNext::Next(s2_send()),
+            2 => ThreadNext::Next(m_send()),
+            _ => ThreadNext::Finished,
+        }
+    }
+    fn t3_future(trace: &[Option<Val>]) -> Option<Vec<Label>> {
+        Some(match trace.len() {
+            0 => vec![s1_send(), s2_send(), m_send()],
+            1 => vec![s2_send(), m_send()],
+            2 => vec![m_send()],
+            _ => vec![],
+        })
+    }
+
+    fn prog() -> Vdp {
+        Vdp {
+            nexts: vec![t0, t1, t2, t3],
+            futures: vec![t0_future, t1_future, t2_future, t3_future],
+        }
+    }
 
     /// Public handle for the (private, verbatim-copied) program above.
     pub fn program() -> Vdp {

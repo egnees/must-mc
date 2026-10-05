@@ -234,7 +234,10 @@ fn permutations(n: usize) -> Vec<Vec<usize>> {
     loop {
         out.push(cur.clone());
         // next lexicographic permutation
-        let Some(i) = (0..n.saturating_sub(1)).rev().find(|&i| cur[i] < cur[i + 1]) else {
+        let Some(i) = (0..n.saturating_sub(1))
+            .rev()
+            .find(|&i| cur[i] < cur[i + 1])
+        else {
             break;
         };
         let j = (i + 1..n).rev().find(|&j| cur[j] > cur[i]).unwrap();
@@ -306,10 +309,16 @@ where
         );
         // A raw terminal count above the key count is a duplicate `canonical_key`.
         if t1_n != t1_keys.len() {
-            failures.push(format!("{perm:?}: T1 duplicate key ({t1_n} raw vs {})", t1_keys.len()));
+            failures.push(format!(
+                "{perm:?}: T1 duplicate key ({t1_n} raw vs {})",
+                t1_keys.len()
+            ));
         }
         if t2_n != t2_keys.len() {
-            failures.push(format!("{perm:?}: T2 duplicate key ({t2_n} raw vs {})", t2_keys.len()));
+            failures.push(format!(
+                "{perm:?}: T2 duplicate key ({t2_n} raw vs {})",
+                t2_keys.len()
+            ));
         }
         // The reference is priority-invariant by Theorem 4.1.
         match &reference {
@@ -345,7 +354,12 @@ where
             ));
         }
     }
-    assert!(failures.is_empty(), "{name}: {} divergence(s):\n  {}", failures.len(), failures.join("\n  "));
+    assert!(
+        failures.is_empty(),
+        "{name}: {} divergence(s):\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
     assert_eq!(
         reference.expect("at least one permutation").len(),
         expected,
@@ -508,7 +522,10 @@ struct Diagnose<MK, P: Program> {
 
 impl<MK: Fn() -> P + Sync, P: Program> Observer for Diagnose<MK, P> {
     fn on_forced_closure_pruned(&self, g2: &ExecutionGraph, r: EventId, s: EventId) {
-        eprintln!("--- revisit GATE-PRUNED (not the arm): r={r} <- s={s} {:?}", g2.all_events());
+        eprintln!(
+            "--- revisit GATE-PRUNED (not the arm): r={r} <- s={s} {:?}",
+            g2.all_events()
+        );
     }
     fn on_revisit_rejected(&self, g: &ExecutionGraph, r: EventId, s: EventId) {
         let porf_s = g.porf_prefix(s);
@@ -532,13 +549,11 @@ impl<MK: Fn() -> P + Sync, P: Program> Observer for Diagnose<MK, P> {
                 // Is ⊥ actually viable here? (the question line 18 never asks)
                 let base = viability_base(g, ep, &porf_s);
                 let rev_label = g.label(s).clone();
-                let bot =
-                    brute_viable(&base, ep, None, &p, &priorities, s, &rev_label);
+                let bot = brute_viable(&base, ep, None, &p, &priorities, s, &rev_label);
                 eprintln!("      bottom_viable={bot}  (false ⇒ line 18 is over-strict)");
                 if let Some(held) = g.reads_from(ep) {
                     if base.thread_len(held.tid) > held.idx {
-                        let v =
-                            brute_viable(&base, ep, Some(held), &p, &priorities, s, &rev_label);
+                        let v = brute_viable(&base, ep, Some(held), &p, &priorities, s, &rev_label);
                         eprintln!("      held_viable({held})={v}");
                     }
                 }

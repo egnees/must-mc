@@ -227,6 +227,8 @@ fn legacy_certified_pruning_equals_terminal_filter_reference() {
             }
         }
     }
-    println!("LEGACYDIFF seed={seed:#x} progs={progs} terminals={terminals} divergences={divergences}");
+    println!(
+        "LEGACYDIFF seed={seed:#x} progs={progs} terminals={terminals} divergences={divergences}"
+    );
     assert_eq!(divergences, 0, "legacy certified pruning diverged");
 }

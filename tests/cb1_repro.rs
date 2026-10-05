@@ -145,9 +145,7 @@ use std::sync::Mutex;
 use must::event::{EventId, Label, Model, Pred, Window};
 use must::graph::ExecutionGraph;
 use must::intern::resolve;
-use must::{
-    explore, Config, Ctx, ExecutionCollector, Observer, Program, System, ThreadNext, Val,
-};
+use must::{explore, Config, Ctx, ExecutionCollector, Observer, Program, System, ThreadNext, Val};
 
 // =====================================================================================
 // Value-dependent table program with an EXACT possible_future (copied, self-contained,
@@ -380,7 +378,11 @@ struct Cb1Probe {
 /// so `g_add` is always eager-feasible (`infeas_send_add == 0`; see the file header).
 fn is_dangerous(g_add: &ExecutionGraph, r: EventId, deleted: &BTreeSet<EventId>) -> bool {
     // A nondet in Deleted.
-    let Some(ep) = deleted.iter().copied().find(|&d| g_add.nd_value(d).is_some()) else {
+    let Some(ep) = deleted
+        .iter()
+        .copied()
+        .find(|&d| g_add.nd_value(d).is_some())
+    else {
         return false;
     };
     let ep_stamp = g_add.stamp(ep);
@@ -521,11 +523,19 @@ fn run_report<P: Program + Clone + Sync>(prog: &P) -> Report {
     let mk = || prog.clone();
 
     let t1 = ExecutionCollector::new();
-    explore(mk, &t1, Config::default().collect_errors().with_time_filter());
+    explore(
+        mk,
+        &t1,
+        Config::default().collect_errors().with_time_filter(),
+    );
     let t1_full: BTreeSet<String> = t1.full_keys().into_iter().collect();
 
     let zb = ExecutionCollector::new();
-    explore(mk, &zb, Config::default().collect_errors().with_time_zombie());
+    explore(
+        mk,
+        &zb,
+        Config::default().collect_errors().with_time_zombie(),
+    );
     let zb_full: BTreeSet<String> = zb.full_keys().into_iter().collect();
 
     let obs = (ExecutionCollector::new(), Cb1Probe::default());
@@ -563,7 +573,8 @@ fn vet<P: Program + Clone + Sync + std::fmt::Debug>(name: &str, prog: &P) -> Rep
         "{name}: zombie full-set != T1-filter full-set (arbiter broke)"
     );
     assert_eq!(
-        rep.t2_full, rep.t1_full,
+        rep.t2_full,
+        rep.t1_full,
         "{name}: COMPLETENESS FINDING — T2 realizable full-set != T1-filter full-set.\n  \
          T1\\T2 = {:?}\n  T2\\T1 = {:?}\n  prog={prog:#?}",
         rep.t1_full.difference(&rep.t2_full).collect::<Vec<_>>(),
@@ -654,7 +665,10 @@ fn send(dst: usize, val: &'static str, lo: u64, hi: u64) -> Op {
     }
 }
 fn brecv(sel: Sel) -> Op {
-    Op::Recv { sel, blocking: true }
+    Op::Recv {
+        sel,
+        blocking: true,
+    }
 }
 fn nbrecv(sel: Sel) -> Op {
     Op::Recv {
@@ -758,7 +772,13 @@ fn rwin(rng: &mut Rng) -> (u64, u64) {
 ///     `Deleted`, po-after `r`, outside `porf(L)`;
 ///   * T4 feeder for the ep-carrier; T5/T6 sends of the late `w` and an extra racer to the victim.
 fn gen_cb1(rng: &mut Rng) -> VdProgram {
-    let m = |rng: &mut Rng| if rng.chance(50) { Model::Asyn } else { Model::P2p };
+    let m = |rng: &mut Rng| {
+        if rng.chance(50) {
+            Model::Asyn
+        } else {
+            Model::P2p
+        }
+    };
     let victim = 0;
 
     let (glo, ghi) = rwin(rng);
@@ -777,8 +797,16 @@ fn gen_cb1(rng: &mut Rng) -> VdProgram {
         1 => Sel::Eq("w"),
         _ => Sel::Eq("L"),
     };
-    let relay_sel = if rng.chance(50) { Sel::Eq("g") } else { Sel::Any };
-    let carrier_sel = if rng.chance(50) { Sel::Eq("k") } else { Sel::Any };
+    let relay_sel = if rng.chance(50) {
+        Sel::Eq("g")
+    } else {
+        Sel::Any
+    };
+    let carrier_sel = if rng.chance(50) {
+        Sel::Eq("k")
+    } else {
+        Sel::Any
+    };
 
     let threads = vec![
         // T0 victim
@@ -818,7 +846,11 @@ fn gen_cb1(rng: &mut Rng) -> VdProgram {
                 Op::Nondet,
             ];
             if rng.chance(50) {
-                let (dst, val) = if rng.chance(50) { (victim, "L") } else { (1usize, "g") };
+                let (dst, val) = if rng.chance(50) {
+                    (victim, "L")
+                } else {
+                    (1usize, "g")
+                };
                 let (elo, ehi) = rwin(rng);
                 ops.push(Op::SendIf {
                     guard: 1, // the nondet op index
@@ -883,7 +915,13 @@ fn model(rng: &mut Rng) -> Model {
 fn tsnd(rng: &mut Rng, dst: usize, val: &'static str) -> Op {
     let m = model(rng);
     let (lo, hi) = rwin(rng);
-    Op::Send { dst, model: m, val, lo, hi }
+    Op::Send {
+        dst,
+        model: m,
+        val,
+        lo,
+        hi,
+    }
 }
 
 /// `Deleted(r, s)` on `g`: `{x : stamp(x) > stamp(r) ∧ x ∉ porf(s)}` (line 11) — for the
@@ -904,7 +942,11 @@ fn gen_survivor_a(rng: &mut Rng) -> VdProgram {
         1 => Sel::Eq("w"),
         _ => Sel::Eq("S"),
     };
-    let r = if rng.chance(50) { nbrecv(broad0) } else { brecv(broad0) };
+    let r = if rng.chance(50) {
+        nbrecv(broad0)
+    } else {
+        brecv(broad0)
+    };
     let (wlo, whi) = {
         let lo = 4 + rng.below(6) as u64;
         (lo, lo + rng.below(2) as u64)
@@ -913,13 +955,45 @@ fn gen_survivor_a(rng: &mut Rng) -> VdProgram {
     let extra = if rng.chance(50) { "S" } else { "w" };
     VdProgram {
         threads: vec![
-            vec![r, brecv(Sel::Any), Op::Send { dst: 3, model: model(rng), val: "u", lo: 0, hi: 0 }],
-            vec![Op::Send { dst: 0, model: model(rng), val: "w", lo: wlo, hi: whi }],
-            vec![Op::Send { dst: 0, model: model(rng), val: "S", lo: slo, hi: shi }],
-            vec![if rng.chance(60) { brecv(Sel::Eq("u")) } else { nbrecv(Sel::Eq("u")) }],
+            vec![
+                r,
+                brecv(Sel::Any),
+                Op::Send {
+                    dst: 3,
+                    model: model(rng),
+                    val: "u",
+                    lo: 0,
+                    hi: 0,
+                },
+            ],
+            vec![Op::Send {
+                dst: 0,
+                model: model(rng),
+                val: "w",
+                lo: wlo,
+                hi: whi,
+            }],
+            vec![Op::Send {
+                dst: 0,
+                model: model(rng),
+                val: "S",
+                lo: slo,
+                hi: shi,
+            }],
+            vec![if rng.chance(60) {
+                brecv(Sel::Eq("u"))
+            } else {
+                nbrecv(Sel::Eq("u"))
+            }],
             vec![brecv(Sel::Eq("k")), Op::Nondet],
             vec![tsnd(rng, 4, "k")],
-            vec![Op::Send { dst: 0, model: model(rng), val: extra, lo: 0, hi: 0 }],
+            vec![Op::Send {
+                dst: 0,
+                model: model(rng),
+                val: extra,
+                lo: 0,
+                hi: 0,
+            }],
         ],
     }
 }
@@ -933,9 +1007,34 @@ fn gen_survivor_b(rng: &mut Rng) -> VdProgram {
     };
     VdProgram {
         threads: vec![
-            vec![nbrecv(Sel::Any), brecv(Sel::Any), Op::Send { dst: 3, model: model(rng), val: "u", lo: 0, hi: 0 }],
-            vec![Op::Send { dst: 0, model: model(rng), val: "w", lo: wlo, hi: whi }],
-            vec![brecv(Sel::Eq("g")), Op::Send { dst: 0, model: model(rng), val: "S", lo: 0, hi: 0 }],
+            vec![
+                nbrecv(Sel::Any),
+                brecv(Sel::Any),
+                Op::Send {
+                    dst: 3,
+                    model: model(rng),
+                    val: "u",
+                    lo: 0,
+                    hi: 0,
+                },
+            ],
+            vec![Op::Send {
+                dst: 0,
+                model: model(rng),
+                val: "w",
+                lo: wlo,
+                hi: whi,
+            }],
+            vec![
+                brecv(Sel::Eq("g")),
+                Op::Send {
+                    dst: 0,
+                    model: model(rng),
+                    val: "S",
+                    lo: 0,
+                    hi: 0,
+                },
+            ],
             vec![brecv(Sel::Eq("u"))],
             vec![brecv(Sel::Eq("k")), Op::Nondet],
             vec![tsnd(rng, 4, "k")],
@@ -950,12 +1049,22 @@ fn gen_survivor_c(rng: &mut Rng) -> VdProgram {
     let nthreads = 6 + rng.below(3);
     let mut threads: Vec<Vec<Op>> = Vec::new();
     let mut t0 = vec![
-        if rng.chance(50) { nbrecv(Sel::Any) } else { brecv(Sel::Any) },
+        if rng.chance(50) {
+            nbrecv(Sel::Any)
+        } else {
+            brecv(Sel::Any)
+        },
         brecv(Sel::Any),
     ];
     if rng.chance(60) {
         let d = 3 + rng.below(nthreads.saturating_sub(3)).max(1);
-        t0.push(Op::Send { dst: d, model: model(rng), val: "u", lo: 0, hi: 0 });
+        t0.push(Op::Send {
+            dst: d,
+            model: model(rng),
+            val: "u",
+            lo: 0,
+            hi: 0,
+        });
     }
     threads.push(t0);
     let vals = ["w", "S", "p", "q"];
@@ -965,7 +1074,13 @@ fn gen_survivor_c(rng: &mut Rng) -> VdProgram {
                 let m = model(rng);
                 let v = vals[rng.below(vals.len())];
                 let lo = rng.below(12) as u64;
-                vec![Op::Send { dst: 0, model: m, val: v, lo, hi: lo + rng.below(2) as u64 }]
+                vec![Op::Send {
+                    dst: 0,
+                    model: m,
+                    val: v,
+                    lo,
+                    hi: lo + rng.below(2) as u64,
+                }]
             }
             1 => vec![brecv(Sel::Eq("u"))],
             2 => vec![brecv(Sel::Eq("k")), Op::Nondet],
@@ -975,7 +1090,13 @@ fn gen_survivor_c(rng: &mut Rng) -> VdProgram {
             }
             _ => {
                 let v = vals[rng.below(vals.len())];
-                vec![Op::Send { dst: 0, model: model(rng), val: v, lo: 0, hi: 0 }]
+                vec![Op::Send {
+                    dst: 0,
+                    model: model(rng),
+                    val: v,
+                    lo: 0,
+                    hi: 0,
+                }]
             }
         };
         threads.push(t);
@@ -1004,10 +1125,16 @@ fn cb1_mechanism_positive_control() {
     let mut g = ExecutionGraph::new();
     let r = g.add_event(0, Label::recv_nb(Pred::any()));
     let rpp = g.add_event(0, Label::recv(Pred::any()));
-    let w = g.add_event(1, Label::send_within(Model::Asyn, 0, "w", Window::new(50, 50)));
+    let w = g.add_event(
+        1,
+        Label::send_within(Model::Asyn, 0, "w", Window::new(50, 50)),
+    );
     let ep = g.add_event(2, Label::nondet(["a", "b"]));
     g.set_nd(ep, "a".into());
-    let s = g.add_event(3, Label::send_within(Model::Asyn, 0, "S", Window::new(0, 0)));
+    let s = g.add_event(
+        3,
+        Label::send_within(Model::Asyn, 0, "S", Window::new(0, 0)),
+    );
     g.set_rf(r, None);
     g.set_rf(rpp, Some(w));
 
@@ -1019,14 +1146,20 @@ fn cb1_mechanism_positive_control() {
     let del = deleted_of(&g, r, s);
     assert!(del.contains(&ep), "nondet ep ∈ Deleted(r, S)");
     assert!(del.contains(&rpp), "r'' ∈ Deleted(r, S)");
-    assert!(g.stamp(rpp) <= g.stamp(ep), "the stamp inversion holds here by construction");
+    assert!(
+        g.stamp(rpp) <= g.stamp(ep),
+        "the stamp inversion holds here by construction"
+    );
 
     // `base` = what `viable` searches: g_add minus S (re-added during the search), r''←w baked
     // in — exactly viability_base's content for this shape (r'' survives into Previous(ep)).
     let mut base = ExecutionGraph::new();
     let br = base.add_event(0, Label::recv_nb(Pred::any()));
     let brpp = base.add_event(0, Label::recv(Pred::any()));
-    let bw = base.add_event(1, Label::send_within(Model::Asyn, 0, "w", Window::new(50, 50)));
+    let bw = base.add_event(
+        1,
+        Label::send_within(Model::Asyn, 0, "w", Window::new(50, 50)),
+    );
     let bep = base.add_event(2, Label::nondet(["a", "b"]));
     base.set_rf(br, None);
     base.set_rf(brpp, Some(bw));
@@ -1042,7 +1175,10 @@ fn cb1_mechanism_positive_control() {
     let mut memo = must::time::ViableMemo::new();
     let va = must::time::viable(&base, bep, "a".into(), &prog, &prio, s, &s_label, &mut memo);
     let vb = must::time::viable(&base, bep, "b".into(), &prog, &prio, s, &s_label, &mut memo);
-    assert!(!va, "viable(ep=a) must be FALSE (every completion re-adds S ⇒ infeasible)");
+    assert!(
+        !va,
+        "viable(ep=a) must be FALSE (every completion re-adds S ⇒ infeasible)"
+    );
     assert!(!vb, "viable(ep=b) must be FALSE (value-independent)");
     // Both nondet values non-viable ⇒ min-holder "a" PASSes (0 calls) AND non-min "b" PASSes
     // (no smaller value viable) ⇒ the revisit fires from both ⇒ the same g2 is visited twice.
@@ -1061,14 +1197,29 @@ fn cb1_mechanism_positive_control() {
     let mut base_ok = ExecutionGraph::new();
     let or = base_ok.add_event(0, Label::recv_nb(Pred::any()));
     let orpp = base_ok.add_event(0, Label::recv(Pred::any()));
-    let ow = base_ok.add_event(1, Label::send_within(Model::Asyn, 0, "w", Window::new(0, 0)));
+    let ow = base_ok.add_event(
+        1,
+        Label::send_within(Model::Asyn, 0, "w", Window::new(0, 0)),
+    );
     let oep = base_ok.add_event(2, Label::nondet(["a", "b"]));
     base_ok.set_rf(or, None);
     base_ok.set_rf(orpp, Some(ow));
     base_ok.set_nd(oep, "a".into());
     let mut memo2 = must::time::ViableMemo::new();
-    let va_ok = must::time::viable(&base_ok, oep, "a".into(), &prog_ok, &prio, s, &s_label, &mut memo2);
-    assert!(va_ok, "on a feasible g_add, viable(min) is TRUE ⇒ the non-min holder is rejected");
+    let va_ok = must::time::viable(
+        &base_ok,
+        oep,
+        "a".into(),
+        &prog_ok,
+        &prio,
+        s,
+        &s_label,
+        &mut memo2,
+    );
+    assert!(
+        va_ok,
+        "on a feasible g_add, viable(min) is TRUE ⇒ the non-min holder is rejected"
+    );
 }
 
 // =====================================================================================
@@ -1120,13 +1271,25 @@ fn cb1_machine_verification() {
     ] {
         // Systems are !Send / not Clone-able as a value; run through fn-pointer builders.
         let t1 = ExecutionCollector::new();
-        explore(sys, &t1, Config::default().collect_errors().with_time_filter());
+        explore(
+            sys,
+            &t1,
+            Config::default().collect_errors().with_time_filter(),
+        );
         let t1_full: BTreeSet<String> = t1.full_keys().into_iter().collect();
         let zb = ExecutionCollector::new();
-        explore(sys, &zb, Config::default().collect_errors().with_time_zombie());
+        explore(
+            sys,
+            &zb,
+            Config::default().collect_errors().with_time_zombie(),
+        );
         let zb_full: BTreeSet<String> = zb.full_keys().into_iter().collect();
         let obs = (ExecutionCollector::new(), Cb1Probe::default());
-        explore(sys, &obs, Config::default().collect_errors().with_time_predicate());
+        explore(
+            sys,
+            &obs,
+            Config::default().collect_errors().with_time_predicate(),
+        );
         let (col, probe) = obs;
         let rep = Report {
             t1_full: t1_full.clone(),
@@ -1145,7 +1308,10 @@ fn cb1_machine_verification() {
             log: probe.log.into_inner().unwrap(),
         };
         assert_eq!(rep.zb_full, rep.t1_full, "{name}: zombie != T1");
-        assert_eq!(rep.t2_full, rep.t1_full, "{name}: COMPLETENESS FINDING (System build)");
+        assert_eq!(
+            rep.t2_full, rep.t1_full,
+            "{name}: COMPLETENESS FINDING (System build)"
+        );
         record(name, &rep);
     }
 

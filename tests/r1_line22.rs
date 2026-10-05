@@ -304,7 +304,9 @@ fn all_states<P: Program>(h0: &ExecutionGraph, program: &P) -> Vec<ExecutionGrap
         let traces = traces_of(&h, n);
         let nexts = program.next(&traces);
         for (tid, next) in nexts.iter().enumerate() {
-            let ThreadNext::Next(label) = next else { continue };
+            let ThreadNext::Next(label) = next else {
+                continue;
+            };
             let mut children: Vec<ExecutionGraph> = Vec::new();
             match label {
                 Label::Send { .. } | Label::Error { .. } => {
@@ -383,7 +385,9 @@ impl Observer for Diagnose {
         for ep in deleted.iter().copied().chain(std::iter::once(r)) {
             let lbl = g.label(ep).clone();
             let ok = match &lbl {
-                Label::Recv { blocking: false, .. } => g.reads_bottom(ep),
+                Label::Recv {
+                    blocking: false, ..
+                } => g.reads_bottom(ep),
                 Label::Recv { blocking: true, .. } => {
                     let prev = previous_set(g, ep, &porf_s);
                     let h = g.restrict(&prev);
@@ -415,7 +419,13 @@ impl Observer for Diagnose {
                             let feas = cons && check(&trial).is_feasible();
                             let viab = base.contains(cand)
                                 && brute_viable_recv(
-                                    &base, ep, cand, &p, &priorities, s, &rev_label,
+                                    &base,
+                                    ep,
+                                    cand,
+                                    &p,
+                                    &priorities,
+                                    s,
+                                    &rev_label,
                                 );
                             eprintln!(
                                 "      cand={cand} local_cons={cons} local_feas={feas} \
@@ -426,9 +436,9 @@ impl Observer for Diagnose {
                     tb == held
                 }
                 Label::Nondet { set } => {
-                    let min = set.iter().min_by(|a, b| {
-                        must::intern::resolve(**a).cmp(must::intern::resolve(**b))
-                    });
+                    let min = set
+                        .iter()
+                        .min_by(|a, b| must::intern::resolve(**a).cmp(must::intern::resolve(**b)));
                     g.nd_value(ep) == min
                 }
                 Label::Send { .. } | Label::Error { .. } => {

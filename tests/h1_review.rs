@@ -137,6 +137,9 @@ fn vd_program_head_of_possible_future_is_the_next_label() {
 
     // A finished thread's exact future is empty.
     let trace_done = vec![None, Some(must::Val::from("a"))];
-    assert!(prog3.next(std::slice::from_ref(&trace_done)).remove(0).is_finished());
+    assert!(prog3
+        .next(std::slice::from_ref(&trace_done))
+        .remove(0)
+        .is_finished());
     assert_eq!(prog3.possible_future(0, &trace_done), Some(Vec::new()));
 }

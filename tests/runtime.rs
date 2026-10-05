@@ -521,7 +521,10 @@ fn declared_future_lets_the_closure_force_a_blocking_receive() {
         declared.contains(recv_id),
         "with a declared future the unavoidable receive is forced onto the closure"
     );
-    assert_eq!(declared.reads_from(recv_id), Some(must::event::EventId::new(0, 0)));
+    assert_eq!(
+        declared.reads_from(recv_id),
+        Some(must::event::EventId::new(0, 0))
+    );
 
     let undeclared = forced_closure(&g0, &declared_pair_undeclared(), &[0, 1]);
     assert!(
@@ -550,7 +553,10 @@ fn coarser_declaration_forces_less() {
     sys.declare_alphabet(1, [Label::recv(must::event::Pred::any())]);
 
     let mut g0 = ExecutionGraph::new();
-    g0.add_event(0, Label::send_within(Model::Asyn, 1, "a", Window::new(10, 20)));
+    g0.add_event(
+        0,
+        Label::send_within(Model::Asyn, 1, "a", Window::new(10, 20)),
+    );
     let closure = forced_closure(&g0, &sys, &[0, 1]);
     assert!(
         !closure.contains(must::event::EventId::new(1, 0)),

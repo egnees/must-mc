@@ -161,7 +161,15 @@ fn diff_case(
         rev_label,
         &mut memo,
     );
-    let brute = brute_viable(base, ep, val(v), program, &priorities, revisiting, rev_label);
+    let brute = brute_viable(
+        base,
+        ep,
+        val(v),
+        program,
+        &priorities,
+        revisiting,
+        rev_label,
+    );
     assert_eq!(got, brute, "{name}[{v}]: viable disagrees with brute force");
     assert_eq!(got, expected, "{name}[{v}]: unexpected verdict");
 }
@@ -287,22 +295,35 @@ fn deferral_through_foreign_branch() {
 
 fn m4_t0(trace: &[Option<Val>]) -> ThreadNext {
     match trace.len() {
-        0 => ThreadNext::Next(Label::send_within(Model::Asyn, 2, "late", Window::new(40, 60))),
+        0 => ThreadNext::Next(Label::send_within(
+            Model::Asyn,
+            2,
+            "late",
+            Window::new(40, 60),
+        )),
         _ => ThreadNext::Finished,
     }
 }
 fn m4_t0_future(trace: &[Option<Val>]) -> Option<Vec<Label>> {
     Some(match trace.len() {
-        0 => vec![Label::send_within(Model::Asyn, 2, "late", Window::new(40, 60))],
+        0 => vec![Label::send_within(
+            Model::Asyn,
+            2,
+            "late",
+            Window::new(40, 60),
+        )],
         _ => vec![],
     })
 }
 fn m4_t1(trace: &[Option<Val>]) -> ThreadNext {
     match trace.len() {
         0 => ThreadNext::Next(Label::nondet(["a", "b"])),
-        1 if is(&trace[0], "b") => {
-            ThreadNext::Next(Label::send_within(Model::Asyn, 2, "early", Window::new(1, 2)))
-        }
+        1 if is(&trace[0], "b") => ThreadNext::Next(Label::send_within(
+            Model::Asyn,
+            2,
+            "early",
+            Window::new(1, 2),
+        )),
         _ => ThreadNext::Finished,
     }
 }
@@ -313,7 +334,12 @@ fn m4_t1_future(trace: &[Option<Val>]) -> Option<Vec<Label>> {
             Label::send_within(Model::Asyn, 2, "early", Window::new(1, 2)),
         ],
         1 if is(&trace[0], "b") => {
-            vec![Label::send_within(Model::Asyn, 2, "early", Window::new(1, 2))]
+            vec![Label::send_within(
+                Model::Asyn,
+                2,
+                "early",
+                Window::new(1, 2),
+            )]
         }
         _ => vec![],
     })
@@ -403,7 +429,14 @@ fn verdict_priority_invariant_and_memo_hits() {
     for perm in [[0, 1, 2], [2, 1, 0], [1, 2, 0]] {
         let mut memo = ViableMemo::new();
         verdicts.push(viable(
-            &base, ep, val("b"), &prog, &perm, revisiting, &rev_label, &mut memo,
+            &base,
+            ep,
+            val("b"),
+            &prog,
+            &perm,
+            revisiting,
+            &rev_label,
+            &mut memo,
         ));
     }
     assert!(
@@ -415,11 +448,25 @@ fn verdict_priority_invariant_and_memo_hits() {
     let priorities = [0, 1, 2];
     let mut memo = ViableMemo::new();
     let first = viable(
-        &base, ep, val("b"), &prog, &priorities, revisiting, &rev_label, &mut memo,
+        &base,
+        ep,
+        val("b"),
+        &prog,
+        &priorities,
+        revisiting,
+        &rev_label,
+        &mut memo,
     );
     let (h0, m0) = (memo.hits(), memo.misses());
     let second = viable(
-        &base, ep, val("b"), &prog, &priorities, revisiting, &rev_label, &mut memo,
+        &base,
+        ep,
+        val("b"),
+        &prog,
+        &priorities,
+        revisiting,
+        &rev_label,
+        &mut memo,
     );
     assert_eq!(first, second);
     assert!(memo.hits() > h0, "repeat call must hit the memo");

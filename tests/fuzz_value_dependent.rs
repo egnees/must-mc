@@ -29,8 +29,8 @@ use must::event::{EventId, Label, Model, Pred, Window};
 use must::graph::ExecutionGraph;
 use must::intern::resolve;
 use must::{
-    explore, Config, CountingObserver, DeadBranchDetector, ExecutionCollector, Observer,
-    Program, ThreadNext, Val,
+    explore, Config, CountingObserver, DeadBranchDetector, ExecutionCollector, Observer, Program,
+    ThreadNext, Val,
 };
 
 /// SplitMix64 (copy of `fuzz.rs`) — reproducible with no external crate.
@@ -262,7 +262,7 @@ impl Program for VdProgram {
                 Op::Nondet => out.push(Label::nondet(["a", "b"])),
                 Op::Send { .. } => out.push(op_label(op, &vals)),
                 Op::SendIf { guard, eq, .. } => match vals[*guard] {
-                    Some(v) if resolve(v) != *eq => {} // definitely skipped
+                    Some(v) if resolve(v) != *eq => {}  // definitely skipped
                     _ => out.push(op_label(op, &vals)), // may emit
                 },
                 Op::SendWin {
@@ -356,7 +356,11 @@ fn gen_send(rng: &mut Rng, nt: usize, victim: usize, producers: &[usize]) -> Op 
     // Destination bias onto the victim thread: racing sends need a shared receiver. Kept
     // moderate — relay threads (recv → send) need incoming traffic too, or their late sends
     // (the only source of backward revisits under DES drain-first) never fire.
-    let dst = if rng.chance(40) { victim } else { rng.below(nt) };
+    let dst = if rng.chance(40) {
+        victim
+    } else {
+        rng.below(nt)
+    };
     let (lo, hi) = win(rng);
     let m = model(rng);
     let v = payload(rng);
@@ -521,7 +525,11 @@ fn gen_scaffold(rng: &mut Rng) -> VdProgram {
     }
     let second = t0.len();
     t0.push(Op::Recv {
-        sel: if rng.chance(50) { Sel::Any } else { Sel::EqGuard(1) },
+        sel: if rng.chance(50) {
+            Sel::Any
+        } else {
+            Sel::EqGuard(1)
+        },
         blocking: true,
     });
     if rng.chance(60) {
@@ -648,9 +656,18 @@ fn check_program(case: usize, prog: &VdProgram) -> ProgStats {
         match &reference {
             None => reference = Some((full, term, filt)),
             Some((rf, rt, ri)) => {
-                assert_eq!(&full, rf, "case {case} perm {perm:?}: T1 full varies\n{prog:#?}");
-                assert_eq!(&term, rt, "case {case} perm {perm:?}: T1 term varies\n{prog:#?}");
-                assert_eq!(&filt, ri, "case {case} perm {perm:?}: T1 filt varies\n{prog:#?}");
+                assert_eq!(
+                    &full, rf,
+                    "case {case} perm {perm:?}: T1 full varies\n{prog:#?}"
+                );
+                assert_eq!(
+                    &term, rt,
+                    "case {case} perm {perm:?}: T1 term varies\n{prog:#?}"
+                );
+                assert_eq!(
+                    &filt, ri,
+                    "case {case} perm {perm:?}: T1 filt varies\n{prog:#?}"
+                );
             }
         }
     }
@@ -733,7 +750,8 @@ fn check_program(case: usize, prog: &VdProgram) -> ProgStats {
             seen.insert(dedup_key, *verdict);
             let brute = brute_viable(base, *ep, *v, prog, &perm, *revisiting, rev_label);
             assert_eq!(
-                *verdict, brute,
+                *verdict,
+                brute,
                 "case {case} perm {perm:?}: viable({}) = {verdict} but brute force says \
                  {brute} (ep {ep}, s {revisiting})\n{prog:#?}",
                 resolve(*v)
@@ -819,5 +837,9 @@ fn fuzz_value_dependent_large_corpus() {
         s.oracle_called, s.progs, s.oracle_rejected, s.with_filtered, s.dead_total
     );
     assert!(s.with_filtered >= 30, "filtered {}/400", s.with_filtered);
-    assert!(s.oracle_called >= 50, "oracle_called {}/400", s.oracle_called);
+    assert!(
+        s.oracle_called >= 50,
+        "oracle_called {}/400",
+        s.oracle_called
+    );
 }

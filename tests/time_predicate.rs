@@ -36,7 +36,12 @@ fn tsend(model: Model, dst: usize, v: &str, lo: u64, hi: u64) -> Label {
 fn des_pick(prog: &SeqProgram, g: &ExecutionGraph) -> NextStep {
     let traces = traces_of(g, prog.num_threads());
     let nexts = prog.next(&traces);
-    pick(g, &nexts, &(0..prog.num_threads()).collect::<Vec<_>>(), true)
+    pick(
+        g,
+        &nexts,
+        &(0..prog.num_threads()).collect::<Vec<_>>(),
+        true,
+    )
 }
 
 /// Sends bubble up by lower-bound arrival time (`Occ + window.lo`), regardless of tid order.
@@ -174,7 +179,10 @@ fn t1_realizable_keys(prog: &SeqProgram) -> BTreeSet<String> {
 fn assert_t2_matches_t1(name: &str, prog: &SeqProgram) {
     let t2 = t2_realizable_keys(prog);
     let t1 = t1_realizable_keys(prog);
-    assert_eq!(t2, t1, "{name}: T2 realizable keys != T1-filter realizable keys");
+    assert_eq!(
+        t2, t1,
+        "{name}: T2 realizable keys != T1-filter realizable keys"
+    );
 }
 
 #[test]
@@ -250,12 +258,15 @@ fn t2_matches_t1_nonblocking_recv() {
 /// The 6-thread L3 counterexample program (TIME_PLAN "Контрпример").
 fn l3_program() -> SeqProgram {
     SeqProgram::new(vec![
-        vec![Label::recv(Pred::any())],                 // T0: r
-        vec![tsend(Model::Asyn, 0, "a", 1, 100)],       // T1: a
-        vec![Label::recv(Pred::eq("g")), tsend(Model::Asyn, 0, "b0", 0, 0)], // T2: rg; m
-        vec![tsend(Model::Asyn, 2, "g", 5, 5)],         // T3: g
+        vec![Label::recv(Pred::any())],           // T0: r
+        vec![tsend(Model::Asyn, 0, "a", 1, 100)], // T1: a
+        vec![
+            Label::recv(Pred::eq("g")),
+            tsend(Model::Asyn, 0, "b0", 0, 0),
+        ], // T2: rg; m
+        vec![tsend(Model::Asyn, 2, "g", 5, 5)],   // T3: g
         vec![Label::recv(Pred::eq("x")), tsend(Model::Asyn, 0, "b", 0, 0)], // T4: rs; s
-        vec![tsend(Model::Asyn, 4, "x", 30, 30)],       // T5: x
+        vec![tsend(Model::Asyn, 4, "x", 30, 30)], // T5: x
     ])
 }
 
@@ -277,8 +288,16 @@ fn l3_explorer_regression() {
         );
         obs
     };
-    assert_eq!(t1_counts.full(), 2, "T1: two realizable full terminals (r←a, r←m)");
-    assert_eq!(t1_counts.filtered_full(), 1, "T1: one filtered full terminal (r←s)");
+    assert_eq!(
+        t1_counts.full(),
+        2,
+        "T1: two realizable full terminals (r←a, r←m)"
+    );
+    assert_eq!(
+        t1_counts.filtered_full(),
+        1,
+        "T1: one filtered full terminal (r←s)"
+    );
     assert_eq!(t1_counts.blocked(), 0);
 
     // T2 predicate: same 2 realizable full, 0 blocked, 0 filtered (predicate = no filter), and
@@ -306,7 +325,10 @@ fn l3_explorer_regression() {
     // The realizable sets coincide (r←a and r←m), and exclude r←s.
     let t1_keys: BTreeSet<String> = t1_col.terminal_keys().into_iter().collect();
     let t2_keys: BTreeSet<String> = t2_col.terminal_keys().into_iter().collect();
-    assert_eq!(t2_keys, t1_keys, "L3: T2 realizable set must equal T1-filter realizable set");
+    assert_eq!(
+        t2_keys, t1_keys,
+        "L3: T2 realizable set must equal T1-filter realizable set"
+    );
 }
 
 /// The L3 counterexample built on the **coroutine runtime** (`System`) instead of a table
@@ -365,11 +387,19 @@ fn l3_runtime(declare: bool) -> must::System {
         }
         let m = Label::send_within(Model::Asyn, 0, "b0", win(0, 0));
         sys.declare_future(2, move |trace: &[Option<must::Val>]| {
-            if trace.is_empty() { vec![m.clone()] } else { Vec::new() }
+            if trace.is_empty() {
+                vec![m.clone()]
+            } else {
+                Vec::new()
+            }
         });
         let s = Label::send_within(Model::Asyn, 0, "b", win(0, 0));
         sys.declare_future(4, move |trace: &[Option<must::Val>]| {
-            if trace.is_empty() { vec![s.clone()] } else { Vec::new() }
+            if trace.is_empty() {
+                vec![s.clone()]
+            } else {
+                Vec::new()
+            }
         });
     }
     sys
@@ -409,8 +439,14 @@ fn l3_on_the_coroutine_runtime_matches_t1_either_way() {
 
     let (undeclared, _, _) = l3_runtime_run(false);
     let (declared, _, _) = l3_runtime_run(true);
-    assert_eq!(undeclared, t1_keys, "undeclared: T2 realizable set == T1-filter's");
-    assert_eq!(declared, t1_keys, "declared: T2 realizable set == T1-filter's");
+    assert_eq!(
+        undeclared, t1_keys,
+        "undeclared: T2 realizable set == T1-filter's"
+    );
+    assert_eq!(
+        declared, t1_keys,
+        "declared: T2 realizable set == T1-filter's"
+    );
 }
 
 /// Without a declared future the lookahead cannot force `rg←g`, so the s→r revisit is not
@@ -534,7 +570,11 @@ fn fixb_value_dependent_reproducer_t2_equals_t1() {
     let (t2, (_dead, viable)) = obs;
     let t2_vec = t2.terminal_keys();
     let t2_keys: BTreeSet<String> = t2_vec.iter().cloned().collect();
-    assert_eq!(t2_vec.len(), t2_keys.len(), "reproducer: T2 duplicate terminals");
+    assert_eq!(
+        t2_vec.len(),
+        t2_keys.len(),
+        "reproducer: T2 duplicate terminals"
+    );
     let t2_full: BTreeSet<String> = t2.full_keys().into_iter().collect();
     assert_eq!(
         t2_full, t1_keys,
@@ -643,7 +683,11 @@ fn bug_class_min_holder_revisit_survives() {
     let (t2, viable) = obs;
     let t2_vec = t2.terminal_keys();
     let t2_keys: BTreeSet<String> = t2_vec.iter().cloned().collect();
-    assert_eq!(t2_vec.len(), t2_keys.len(), "bug-class: T2 duplicate terminals");
+    assert_eq!(
+        t2_vec.len(),
+        t2_keys.len(),
+        "bug-class: T2 duplicate terminals"
+    );
     let t2_full: BTreeSet<String> = t2.full_keys().into_iter().collect();
     assert_eq!(
         t2_full, t1_keys,
