@@ -1,0 +1,9 @@
+[package]
+name = "must-python"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Deterministic, cached AnySystem-compatible Python process callbacks"
+license = "MIT"
+
+[dependencies]
