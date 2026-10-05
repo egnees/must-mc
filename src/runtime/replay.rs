@@ -13,7 +13,7 @@ use std::task::{Context, Poll, Waker};
 use crate::event::{Label, Model, ReceiveTiming, Tid, Val, Window};
 use crate::program::{ThreadNext, TraceLabel};
 
-use super::{BoxedPred, LocalFut};
+use super::{LocalFut, RecvPredicate};
 
 thread_local! {
     /// `"recv#k"` tags, built once per `k` and shared by every `Pred` for that position.
@@ -47,6 +47,15 @@ enum Halt {
     Finished,
 }
 
+enum Resume {
+    Receive {
+        value: Option<Val>,
+        blocking: bool,
+        timing: ReceiveTiming,
+    },
+    Nondet(Val),
+}
+
 /// Shared state a process body reads and writes through its [`Ctx`](super::Ctx) during
 /// one replay poll. Single-threaded (`Rc`/`RefCell`).
 pub(crate) struct ThreadCell {
@@ -72,6 +81,12 @@ pub(crate) struct ThreadCell {
     /// Collected only when reconstructing execution annotations, not on ordinary next().
     labels: Option<Vec<TraceLabel>>,
     halt: Halt,
+    /// A parked await was already charged and emitted its predicate/option set.
+    /// Its next poll consumes this committed reply instead of emitting it again.
+    resume: Option<Resume>,
+    /// Opt-in run-ahead: freshly computed synchronous sends advance a virtual
+    /// trace and are returned as separate next-event answers for its prefixes.
+    batch: Option<Vec<Label>>,
 }
 
 impl ThreadCell {
@@ -90,7 +105,73 @@ impl ThreadCell {
             max_recvs,
             labels: collect_labels.then(Vec::new),
             halt: Halt::Running,
+            resume: None,
+            batch: None,
         }
+    }
+
+    pub(crate) fn matches_trace(&self, trace: &[Option<Val>]) -> bool {
+        self.trace == trace
+    }
+
+    pub(crate) fn extends_trace_once(&self, trace: &[Option<Val>]) -> bool {
+        trace.len() == self.trace.len() + 1 && trace[..self.trace.len()] == self.trace
+    }
+
+    pub(crate) fn has_labels(&self) -> bool {
+        self.labels.is_some()
+    }
+
+    pub(crate) fn labels_snapshot(&self) -> Vec<TraceLabel> {
+        self.labels
+            .as_ref()
+            .expect("checkpoint collects annotations")
+            .clone()
+    }
+
+    pub(crate) fn begin_batch(&mut self) {
+        self.batch = Some(Vec::new());
+    }
+
+    pub(crate) fn begin_plain(&mut self) {
+        self.batch = None;
+    }
+
+    pub(crate) fn finish_batch(&mut self, next: ThreadNext) -> (Vec<ThreadNext>, Vec<TraceLabel>) {
+        let mut steps: Vec<_> = self
+            .batch
+            .take()
+            .expect("batch mode was started")
+            .into_iter()
+            .map(ThreadNext::Next)
+            .collect();
+        steps.push(next);
+        (
+            steps,
+            self.labels
+                .as_ref()
+                .expect("batch collects annotations")
+                .clone(),
+        )
+    }
+
+    pub(crate) fn resume_with(&mut self, value: Option<Val>) {
+        debug_assert_eq!(self.cursor, self.trace.len());
+        self.resume = Some(match &self.halt {
+            Halt::Emit(Label::Recv {
+                blocking, timing, ..
+            }) => Resume::Receive {
+                value,
+                blocking: *blocking,
+                timing: *timing,
+            },
+            Halt::Emit(Label::Nondet { .. }) => {
+                Resume::Nondet(value.expect("a nondet event never reads nothing"))
+            }
+            _ => unreachable!("only a parked receive or nondet future can resume"),
+        });
+        self.trace.push(value);
+        self.halt = Halt::Running;
     }
 
     fn halted(&self) -> bool {
@@ -152,7 +233,14 @@ impl ThreadCell {
             );
             self.cursor += 1;
         } else {
-            self.halt = Halt::Emit(Label::send_within(model, to, msg, window));
+            let label = Label::send_within(model, to, msg, window);
+            if let Some(batch) = &mut self.batch {
+                batch.push(label);
+                self.trace.push(None);
+                self.cursor += 1;
+            } else {
+                self.halt = Halt::Emit(label);
+            }
         }
     }
 
@@ -177,13 +265,38 @@ impl ThreadCell {
     /// cursor position, never from the shape of the trace entry.
     pub(crate) fn poll_recv(
         &mut self,
-        pred_fn: &mut Option<BoxedPred>,
+        pred_fn: &mut Option<RecvPredicate>,
         blocking: bool,
         timing: ReceiveTiming,
     ) -> Poll<Option<Val>> {
         // Once we have recorded the next event (or finished), further awaits just park
         // so the top-level poll unwinds; the recorded outcome takes priority.
-        if self.halted() || self.over_budget() {
+        if self.halted() {
+            return Poll::Pending;
+        }
+        if pred_fn.is_none() {
+            match self.resume.take() {
+                Some(Resume::Receive {
+                    value,
+                    blocking: parked_blocking,
+                    timing: parked_timing,
+                }) => {
+                    assert_eq!(blocking, parked_blocking);
+                    assert_eq!(timing, parked_timing);
+                    self.cursor += 1;
+                    return match value {
+                        None if blocking => {
+                            self.halt = Halt::Finished;
+                            Poll::Pending
+                        }
+                        value => Poll::Ready(value),
+                    };
+                }
+                _ => panic!("recv future polled twice after parking"),
+            }
+        }
+        // A different future cannot consume the saved reply of the parked await.
+        if self.resume.is_some() || self.over_budget() {
             return Poll::Pending;
         }
         // Receive budget: the thread's `max_recvs` receives are its last events, so the
@@ -217,7 +330,10 @@ impl ThreadCell {
             let f = pred_fn
                 .take()
                 .expect("recv future polled twice after parking");
-            let pred = crate::event::Pred::from_boxed(recv_tag(k), f);
+            let pred = match f {
+                RecvPredicate::Any => crate::event::Pred::any_with_repr(recv_tag(k)),
+                RecvPredicate::Custom(f) => crate::event::Pred::from_boxed(recv_tag(k), f),
+            };
             let label = match timing {
                 ReceiveTiming::Abstract if blocking => Label::recv(pred),
                 ReceiveTiming::Abstract => Label::recv_nb(pred),
@@ -235,7 +351,19 @@ impl ThreadCell {
     /// Advances `cursor` on a committed replay so po position stays in step.
     pub(crate) fn poll_nondet(&mut self, set: &mut Option<Vec<Val>>) -> Poll<Val> {
         // Once the next event is recorded (or the thread finished) further awaits park.
-        if self.halted() || self.over_budget() {
+        if self.halted() {
+            return Poll::Pending;
+        }
+        if set.is_none() {
+            match self.resume.take() {
+                Some(Resume::Nondet(value)) => {
+                    self.cursor += 1;
+                    return Poll::Ready(value);
+                }
+                _ => panic!("nondet future polled twice after parking"),
+            }
+        }
+        if self.resume.is_some() || self.over_budget() {
             return Poll::Pending;
         }
         if self.cursor < self.trace.len() {
@@ -281,6 +409,13 @@ impl ThreadCell {
 /// futures never register a waker: they drive synchronously, returning `Ready` to
 /// finish and `Pending` to park (with the outcome already stored in the cell).
 pub(crate) fn run_once(mut fut: LocalFut, cell: &RefCell<ThreadCell>) -> ThreadNext {
+    poll_once(&mut fut, cell).0
+}
+
+/// Return whether this poll stopped exactly at a resumable provided await.
+/// Synchronous sends may execute their Rust tail before parking elsewhere, so
+/// their futures must never be retained as checkpoints of the emitted send.
+pub(crate) fn poll_once(fut: &mut LocalFut, cell: &RefCell<ThreadCell>) -> (ThreadNext, bool) {
     let mut cx = Context::from_waker(Waker::noop());
     let future_done = fut.as_mut().poll(&mut cx).is_ready();
     let cell = cell.borrow();
@@ -311,5 +446,15 @@ pub(crate) fn run_once(mut fut: LocalFut, cell: &RefCell<ThreadCell>) -> ThreadN
         cell.cursor,
         cell.trace.len(),
     );
-    outcome
+    // A custom predicate can capture body-local shared mutable state. Keeping
+    // its future alive would let continuation code mutate a predicate already
+    // stored in an older execution graph. Only constructor-proven Any receives
+    // and immutable nondet option sets have no such mutable capture.
+    let resumable = !future_done
+        && match &cell.halt {
+            Halt::Emit(Label::Recv { pred, .. }) => pred.is_any(),
+            Halt::Emit(Label::Nondet { .. }) => true,
+            _ => false,
+        };
+    (outcome, resumable)
 }

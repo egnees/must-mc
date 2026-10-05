@@ -563,3 +563,640 @@ fn coarser_declaration_forces_less() {
         "a second possible consumer in the declared future blocks the force (condition 3b)"
     );
 }
+
+#[test]
+fn recv_any_replay_preserves_predicate_tags_annotations_and_receive_budgets() {
+    fn make(any: bool, budget: usize) -> System {
+        let mut system = System::new();
+        system.add(move |c| async move {
+            c.insert_label("start");
+            let first = if any {
+                c.recv_timeout_any().await
+            } else {
+                c.recv_timeout(|_| true).await
+            };
+            c.insert_label(first.as_deref().unwrap_or("empty"));
+            let second = if any {
+                c.recv_any().await
+            } else {
+                c.recv(|_| true).await
+            };
+            c.insert_label(second.as_str());
+            c.send(0, second, Model::Asyn);
+        });
+        system.set_max_recvs(0, budget);
+        system
+    }
+    let cases = [
+        vec![],
+        vec![S],
+        vec![v("first")],
+        vec![S, v("second")],
+        vec![v("first"), v("second")],
+        vec![v("first"), S],
+        vec![S, S],
+        vec![S, v("second"), S],
+        vec![v("first"), v("second"), S],
+    ];
+    for budget in 0..=2 {
+        let ordinary = make(false, budget);
+        let optimized = make(true, budget);
+        for trace in &cases {
+            if (budget < 2 && trace.len() > budget) || trace.len() > budget + 1 {
+                continue;
+            }
+            let traces = vec![trace.clone()];
+            let expected = ordinary.next(&traces);
+            let actual = optimized.next(&traces);
+            assert_eq!(actual, expected);
+            assert_eq!(optimized.labels(&traces), ordinary.labels(&traces));
+            if let ThreadNext::Next(Label::Recv { pred, .. }) = &actual[0] {
+                assert!(pred.repr().starts_with("recv#"));
+                for value in [
+                    "",
+                    "message",
+                    "\u{043f}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}",
+                ] {
+                    assert!(pred.test(value));
+                    assert!(pred.test_sym(value.into()));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn recv_any_exploration_preserves_exact_terminal_sets() {
+    fn make(any: bool) -> System {
+        let mut system = System::new();
+        system.add(|c| async move {
+            c.send(1, "a", Model::Asyn);
+            c.send(1, "b", Model::Asyn);
+        });
+        system.add(move |c| async move {
+            let first = if any {
+                c.recv_timeout_any().await
+            } else {
+                c.recv_timeout(|_| true).await
+            };
+            c.insert_label(first.as_deref().unwrap_or("empty"));
+            let second = if any {
+                c.recv_any().await
+            } else {
+                c.recv(|_| true).await
+            };
+            c.send(0, second, Model::Asyn);
+        });
+        system.add(|c| async move { c.send(1, "c", Model::Asyn) });
+        system
+    }
+    for priorities in [vec![0, 1, 2], vec![1, 2, 0], vec![2, 1, 0]] {
+        let ordinary = must::ExecutionCollector::new();
+        let optimized = must::ExecutionCollector::new();
+        let config = must::Config::default().with_priorities(priorities);
+        must::explore(|| make(false), &ordinary, config.clone());
+        must::explore(|| make(true), &optimized, config);
+        assert_eq!(optimized.terminal_keys(), ordinary.terminal_keys());
+    }
+}
+
+#[test]
+fn live_await_checkpoints_resume_without_replaying_and_invalidate_on_siblings_and_cuts() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let factories = Arc::new(AtomicUsize::new(0));
+    let mut system = System::new().with_incremental_replay(true);
+    let counter = factories.clone();
+    system.add(move |c| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        async move {
+            let first = c.recv_any().await;
+            let choice = c.nondet(["left", "right"]).await;
+            let last = c.recv_timeout_any().await;
+            c.send(
+                0,
+                format!("{first}/{choice}/{}", last.as_deref().unwrap_or("empty")),
+                Model::Asyn,
+            );
+        }
+    });
+    assert_recv(&system.next_thread(0, &[]));
+    assert_recv(&system.next_thread(0, &[]));
+    assert_eq!(factories.load(Ordering::Relaxed), 1);
+    assert!(matches!(
+        system.next_thread(0, &[v("a")]),
+        ThreadNext::Next(Label::Nondet { .. })
+    ));
+    assert_recv_nb(&system.next_thread(0, &[v("a"), v("left")]));
+    assert_eq!(factories.load(Ordering::Relaxed), 1);
+    assert_send(
+        &system.next_thread(0, &[v("a"), v("left"), S]),
+        0,
+        "a/left/empty",
+    );
+    assert_eq!(factories.load(Ordering::Relaxed), 1);
+    // A send's Rust tail has already run; it is deliberately not a checkpoint.
+    assert_send(
+        &system.next_thread(0, &[v("a"), v("left"), v("b")]),
+        0,
+        "a/left/b",
+    );
+    assert_eq!(factories.load(Ordering::Relaxed), 2);
+    assert_recv_nb(&system.next_thread(0, &[v("a"), v("right")]));
+    assert_eq!(factories.load(Ordering::Relaxed), 3);
+    assert_recv(&system.next_thread(0, &[]));
+    assert_eq!(factories.load(Ordering::Relaxed), 4);
+    assert_send(
+        &system.next_thread(0, &[v("alternate"), v("right"), v("last")]),
+        0,
+        "alternate/right/last",
+    );
+    assert_eq!(factories.load(Ordering::Relaxed), 5);
+}
+
+#[test]
+fn live_checkpoints_preserve_budgets_predicates_and_fresh_annotation_replay() {
+    fn make(live: bool, events: usize, receives: usize) -> System {
+        let mut system = System::new()
+            .with_incremental_replay(live)
+            .with_max_events(events);
+        system.add(|c| async move {
+            c.insert_label("before-first");
+            let first = c.recv_timeout(|v| v != "invalid").await;
+            c.insert_label(first.as_deref().unwrap_or("empty"));
+            c.insert_label("same-position");
+            let choice = c.nondet(["left", "right"]).await;
+            c.insert_label(choice);
+            let second = c.recv(|v| v.starts_with('s')).await;
+            c.send(0, second, Model::Asyn);
+            c.insert_label("after-send");
+            let _ = c.recv_timeout_any().await;
+            c.insert_label("finished");
+        });
+        system.set_max_recvs(0, receives);
+        system
+    }
+    let paths = [
+        vec![S, v("left"), v("second"), S, S],
+        vec![v("first"), v("right"), v("second"), S, v("last")],
+        vec![v("first"), v("left"), S],
+    ];
+    for receives in 0..=3 {
+        for events in 0..=6 {
+            let live = make(true, events, receives);
+            let replay = make(false, events, receives);
+            for path in &paths {
+                let receive_cut = match receives {
+                    0 => 0,
+                    1 => 2,
+                    2 => 4,
+                    _ => path.len(),
+                };
+                let limit = path.len().min(events).min(receive_cut);
+                for length in 0..=limit {
+                    let trace = &path[..length];
+                    let expected = replay.next_thread(0, trace);
+                    let actual = live.next_thread(0, trace);
+                    assert_eq!(actual, expected);
+                    if let (
+                        ThreadNext::Next(Label::Recv { pred: a, .. }),
+                        ThreadNext::Next(Label::Recv { pred: b, .. }),
+                    ) = (&actual, &expected)
+                    {
+                        for value in ["invalid", "first", "second", "no"] {
+                            assert_eq!(a.test(value), b.test(value));
+                        }
+                    }
+                    let traces = [trace.to_vec()];
+                    assert_eq!(live.labels(&traces), replay.labels(&traces));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn live_checkpoints_do_not_resume_send_tails_completed_bodies_or_foreign_awaits() {
+    fn make(live: bool) -> System {
+        let mut system = System::new().with_incremental_replay(live);
+        system.add(|c| async move {
+            let first = c.recv_any().await;
+            let mut state = vec![first];
+            c.send(0, state.len().to_string(), Model::Asyn);
+            state.push("second".into());
+            c.send(0, state.len().to_string(), Model::Asyn);
+            c.insert_label("after-burst");
+            let next = c.recv_any().await;
+            c.assert_that(next != "bad", "bad value");
+        });
+        system.add(|c| async move {
+            c.send(0, "only-send", Model::Asyn);
+        });
+        system.add(|c| async move {
+            let _ = c.recv_any().await;
+            std::future::pending::<()>().await;
+        });
+        system
+    }
+    let live = make(true);
+    let replay = make(false);
+    for trace in [
+        vec![],
+        vec![v("first")],
+        vec![v("first"), S],
+        vec![v("first"), S, S],
+        vec![v("first"), S, S, v("bad")],
+        vec![v("first"), S, S, v("bad"), S],
+        vec![v("first"), S, S, v("good")],
+    ] {
+        assert_eq!(live.next_thread(0, &trace), replay.next_thread(0, &trace));
+        assert_eq!(live.next_thread(0, &trace), replay.next_thread(0, &trace));
+    }
+    for tid in [1, 2] {
+        let first = if tid == 1 { S } else { v("value") };
+        for trace in [vec![], vec![first]] {
+            assert_eq!(
+                live.next_thread(tid, &trace),
+                replay.next_thread(tid, &trace)
+            );
+            assert_eq!(
+                live.next_thread(tid, &trace),
+                replay.next_thread(tid, &trace)
+            );
+        }
+    }
+}
+
+#[test]
+fn live_checkpoints_drop_on_invalidation_and_keep_threads_independent() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    struct Guard(Arc<AtomicUsize>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut system = System::new().with_incremental_replay(true);
+    for _ in 0..2 {
+        let drops = drops.clone();
+        system.add(move |c| {
+            let guard = Guard(drops.clone());
+            async move {
+                let _guard = guard;
+                let _ = c.recv_any().await;
+                let _ = c.recv_any().await;
+            }
+        });
+    }
+    assert_recv(&system.next_thread(0, &[]));
+    assert_recv(&system.next_thread(1, &[]));
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+    assert_recv(&system.next_thread(0, &[v("a")]));
+    assert_recv(&system.next_thread(1, &[]));
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+    assert_recv(&system.next_thread(0, &[]));
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+    system.set_max_recvs(1, 0);
+    assert_eq!(drops.load(Ordering::Relaxed), 2);
+    assert!(system.next_thread(1, &[]).is_finished());
+    assert_eq!(drops.load(Ordering::Relaxed), 3);
+    drop(system);
+    assert_eq!(drops.load(Ordering::Relaxed), 4);
+}
+
+#[test]
+fn live_checkpoint_exploration_preserves_all_terminal_graphs_and_annotations() {
+    fn make(live: bool) -> System {
+        let mut system = System::new().with_incremental_replay(live);
+        system.add(|c| async move {
+            c.send(1, "a", Model::Asyn);
+            c.send(1, "b", Model::Asyn);
+        });
+        system.add(|c| async move {
+            let first = c.recv_timeout_any().await;
+            c.insert_label(first.as_deref().unwrap_or("empty"));
+            let choice = c.nondet(["good", "bad"]).await;
+            let second = c.recv_any().await;
+            c.insert_label(second.as_str());
+            c.send(0, second, Model::Asyn);
+            c.assert_that(choice != "bad", "chosen failure");
+        });
+        system.add(|c| async move {
+            c.send(1, "c", Model::Asyn);
+        });
+        system
+    }
+    fn annotated(collector: &must::ExecutionCollector) -> Vec<String> {
+        let annotations = collector
+            .full()
+            .into_iter()
+            .chain(collector.blocked())
+            .chain(collector.errors())
+            .map(|execution| {
+                format!(
+                    "{}{:?}",
+                    execution.graph().canonical_key(),
+                    execution.labels()
+                )
+            })
+            .collect();
+        sorted_runtime_keys(annotations)
+    }
+    for priorities in [vec![0, 1, 2], vec![1, 2, 0]] {
+        for threads in [1, 4] {
+            for limit in [None, Some(2)] {
+                let replay = must::ExecutionCollector::new();
+                let live = must::ExecutionCollector::new();
+                let mut config = must::Config::default()
+                    .collect_errors()
+                    .with_priorities(priorities.clone())
+                    .with_threads(threads);
+                config.max_sends = limit;
+                must::explore(|| make(false), &replay, config.clone());
+                must::explore(|| make(true), &live, config);
+                assert_eq!(sorted_runtime_keys(live.terminal_keys()), sorted_runtime_keys(replay.terminal_keys()), "terminal multiset: priorities={priorities:?}, threads={threads}, limit={limit:?}");
+                assert_eq!(
+                    sorted_runtime_keys(live.error_keys()),
+                    sorted_runtime_keys(replay.error_keys()),
+                    "error multiset: priorities={priorities:?}, threads={threads}, limit={limit:?}"
+                );
+                assert_eq!(
+                    annotated(&live),
+                    annotated(&replay),
+                    "annotations: priorities={priorities:?}, threads={threads}, limit={limit:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn live_checkpoints_never_mutate_an_emitted_custom_predicates_local_state() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    fn make(live: bool) -> System {
+        let mut system = System::new().with_incremental_replay(live);
+        system.add(|c| async move {
+            c.send(2, "before", Model::Asyn);
+        });
+        system.add(|c| async move {
+            c.send(2, "after", Model::Asyn);
+        });
+        system.add(|c| async move {
+            let state = Arc::new(AtomicUsize::new(0));
+            let captured = state.clone();
+            let value = c
+                .recv(move |v| captured.load(Ordering::Relaxed) == 0 && v == "before")
+                .await;
+            state.store(1, Ordering::Relaxed);
+            let choice = c.nondet(["one", "two"]).await;
+            state.store(2, Ordering::Relaxed);
+            c.send(0, format!("{value}/{choice}"), Model::Asyn);
+        });
+        system
+    }
+    let live = make(true);
+    let ThreadNext::Next(Label::Recv { pred, .. }) = live.next_thread(2, &[]) else {
+        panic!("expected receive")
+    };
+    assert!(pred.test("before"));
+    assert!(matches!(
+        live.next_thread(2, &[v("before")]),
+        ThreadNext::Next(Label::Nondet { .. })
+    ));
+    assert_send(
+        &live.next_thread(2, &[v("before"), v("one")]),
+        0,
+        "before/one",
+    );
+    assert!(
+        pred.test("before"),
+        "the already emitted predicate must retain its original local state"
+    );
+    assert!(!pred.test("after"));
+    for threads in [1, 4] {
+        let live = must::ExecutionCollector::new();
+        let replay = must::ExecutionCollector::new();
+        let config = must::Config::default()
+            .with_threads(threads)
+            .with_priorities(vec![2, 0, 1]);
+        must::explore(|| make(true), &live, config.clone());
+        must::explore(|| make(false), &replay, config);
+        assert_eq!(
+            sorted_runtime_keys(live.terminal_keys()),
+            sorted_runtime_keys(replay.terminal_keys()),
+            "frozen custom predicates: threads={threads}"
+        );
+        assert_eq!(live.full_count(), 2);
+        for execution in live.full() {
+            assert!(must::consistent(execution.graph()));
+        }
+    }
+}
+
+fn sorted_runtime_keys(mut keys: Vec<String>) -> Vec<String> {
+    keys.sort();
+    keys
+}
+
+fn check_batch_against_replay(
+    batched: &System,
+    replay: &System,
+    trace: &[Option<Val>],
+) -> must::runtime::ReplayBatch {
+    let batch = batched.next_thread_batch(0, trace);
+    assert!(!batch.steps.is_empty());
+    let mut prefix = trace.to_vec();
+    for (offset, next) in batch.steps.iter().enumerate() {
+        let expected = replay.next_thread(0, &prefix);
+        assert_eq!(*next, expected);
+        if let (
+            ThreadNext::Next(Label::Recv { pred: a, .. }),
+            ThreadNext::Next(Label::Recv { pred: b, .. }),
+        ) = (next, &expected)
+        {
+            for value in ["a", "b", "before", "after", "invalid"] {
+                assert_eq!(a.test(value), b.test(value));
+            }
+        }
+        let labels: Vec<_> = batch
+            .labels
+            .iter()
+            .filter(|label| label.position <= prefix.len())
+            .cloned()
+            .collect();
+        assert_eq!(labels, replay.labels(&[prefix.clone()]));
+        if offset + 1 < batch.steps.len() {
+            assert!(matches!(next, ThreadNext::Next(Label::Send { .. })));
+            prefix.push(S);
+        }
+    }
+    batch
+}
+
+#[test]
+fn deterministic_send_batches_and_live_awaits_need_one_factory_for_a_linear_path() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    fn make(counter: Arc<AtomicUsize>, live: bool) -> System {
+        let mut system = System::new().with_incremental_replay(live);
+        system.add(move |c| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            async move {
+                let mut local = vec!["first".to_owned()];
+                c.insert_label("before-first");
+                c.insert_label("same-position");
+                c.send(0, local.len().to_string(), Model::Asyn);
+                c.insert_label("after-first");
+                c.insert_label("before-second");
+                local.push("second".into());
+                c.send(0, local.len().to_string(), Model::Asyn);
+                c.insert_label("before-receive");
+                let reply = c.recv_any().await;
+                c.insert_label(reply.as_str());
+                c.send(0, reply, Model::Asyn);
+                let choice = c.nondet(["left", "right"]).await;
+                c.send(0, choice, Model::Asyn);
+                let last = c.recv_timeout_any().await;
+                c.insert_label(last.as_deref().unwrap_or("empty"));
+            }
+        });
+        system
+    }
+    let count = Arc::new(AtomicUsize::new(0));
+    let batched = make(count.clone(), true);
+    let replay_count = Arc::new(AtomicUsize::new(0));
+    let replay = make(replay_count.clone(), false);
+    let first = check_batch_against_replay(&batched, &replay, &[]);
+    assert_eq!(first.steps.len(), 3);
+    assert_send(&first.steps[0], 0, "1");
+    assert_send(&first.steps[1], 0, "2");
+    let repeated = check_batch_against_replay(&batched, &replay, &[S, S]);
+    assert_eq!(repeated.steps.len(), 1);
+    let second = check_batch_against_replay(&batched, &replay, &[S, S, v("reply")]);
+    assert_eq!(second.steps.len(), 2);
+    let third = check_batch_against_replay(&batched, &replay, &[S, S, v("reply"), S, v("left")]);
+    assert_eq!(third.steps.len(), 2);
+    let last =
+        check_batch_against_replay(&batched, &replay, &[S, S, v("reply"), S, v("left"), S, S]);
+    assert!(last.steps[0].is_finished());
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+    assert!(replay_count.load(Ordering::Relaxed) >= 8);
+    check_batch_against_replay(&batched, &replay, &[S, S, v("other")]);
+    assert_eq!(count.load(Ordering::Relaxed), 2);
+    check_batch_against_replay(&batched, &replay, &[]);
+    assert_eq!(count.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn deterministic_batches_preserve_ready_error_foreign_await_and_budget_boundaries() {
+    fn make(live: bool, mode: usize, events: usize, receives: usize) -> System {
+        let mut system = System::new()
+            .with_incremental_replay(live)
+            .with_max_events(events);
+        system.add(move |c| async move {
+            c.insert_label("before-send");
+            c.send(0, "one", Model::Asyn);
+            c.insert_label("after-send");
+            if mode == 0 {
+                c.send(0, "two", Model::Asyn);
+                c.insert_label("done");
+            }
+            if mode == 1 {
+                c.assert_that(false, "failure");
+                c.insert_label("must-not-leak");
+                c.send(0, "must-not-send", Model::Asyn);
+            }
+            if mode == 2 {
+                std::future::pending::<()>().await;
+            }
+            if mode == 3 {
+                let reply = c.recv_timeout_any().await;
+                c.insert_label(reply.as_deref().unwrap_or("empty"));
+                c.send(0, "after-receive", Model::Asyn);
+                let choice = c.nondet(["a", "b"]).await;
+                c.insert_label(choice);
+                let _ = c.recv_any().await;
+                c.insert_label("finished");
+            }
+        });
+        system.set_max_recvs(0, receives);
+        system
+    }
+    for mode in 0..4 {
+        for events in 0..=6 {
+            for receives in 0..=2 {
+                let batched = make(true, mode, events, receives);
+                let replay = make(false, mode, events, receives);
+                let mut trace = Vec::new();
+                for _ in 0..4 {
+                    let batch = check_batch_against_replay(&batched, &replay, &trace);
+                    trace.extend(std::iter::repeat_n(S, batch.steps.len() - 1));
+                    match batch.steps.last().unwrap() {
+                        ThreadNext::Next(Label::Recv { blocking, .. }) => {
+                            trace.push(if *blocking { v("reply") } else { S })
+                        }
+                        ThreadNext::Next(Label::Nondet { .. }) => trace.push(v("a")),
+                        ThreadNext::Next(Label::Error { .. }) | ThreadNext::Finished => break,
+                        _ => panic!("batch must end at an await, error or completion"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn deterministic_batches_freeze_custom_predicates_and_mix_with_plain_queries() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    fn make(live: bool) -> System {
+        let mut system = System::new().with_incremental_replay(live);
+        system.add(|c| async move {
+            let state = Arc::new(AtomicUsize::new(0));
+            c.send(0, "prefix", Model::Asyn);
+            let captured = state.clone();
+            let first = c
+                .recv(move |v| captured.load(Ordering::Relaxed) == 0 && v == "before")
+                .await;
+            state.store(1, Ordering::Relaxed);
+            c.insert_label("first-reply");
+            c.send(0, first, Model::Asyn);
+            let _ = c.recv_any().await;
+            c.send(0, "first-tail", Model::Asyn);
+            c.send(0, "second-tail", Model::Asyn);
+        });
+        system
+    }
+    let batched = make(true);
+    let replay = make(false);
+    let batch = check_batch_against_replay(&batched, &replay, &[]);
+    let ThreadNext::Next(Label::Recv { pred, .. }) = batch.steps.last().unwrap() else {
+        panic!("expected custom boundary")
+    };
+    assert!(pred.test("before"));
+    check_batch_against_replay(&batched, &replay, &[S, v("before")]);
+    assert!(pred.test("before"));
+    // Resuming a batched Any checkpoint through the plain API must stop at the
+    // first synchronous send, even though run-ahead previously reached past it.
+    let trace = [S, v("before"), S, v("reply")];
+    assert_eq!(
+        batched.next_thread(0, &trace),
+        replay.next_thread(0, &trace)
+    );
+    assert_send(&batched.next_thread(0, &trace), 0, "first-tail");
+    check_batch_against_replay(&batched, &replay, &[S]);
+    assert!(pred.test("before"));
+}

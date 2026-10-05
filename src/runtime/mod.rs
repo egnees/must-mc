@@ -35,7 +35,7 @@ use std::rc::Rc;
 use crate::event::{Label, Model, ReceiveTiming, Tid, Val, Window};
 use crate::program::{Program, ThreadNext, TraceLabel};
 
-use replay::{run_once, ThreadCell};
+use replay::{poll_once, run_once, ThreadCell};
 
 /// The boxed, pinned future produced by a process body - polled with a no-op waker.
 pub type LocalFut = Pin<Box<dyn Future<Output = ()>>>;
@@ -44,6 +44,11 @@ pub type LocalFut = Pin<Box<dyn Future<Output = ()>>>;
 /// `Label::Recv`. `Send + Sync` so the resulting `Pred`/`Label`/`ExecutionGraph` can
 /// cross threads (see [`crate::event::Pred`]).
 pub(crate) type BoxedPred = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
+pub(crate) enum RecvPredicate {
+    Any,
+    Custom(BoxedPred),
+}
 
 /// A process's declared **future-label** over-approximation: given the thread's trace, the
 /// labels its events *strictly after* its next one may carry. See
@@ -55,8 +60,8 @@ type FutureDecl = Box<dyn Fn(&[Option<Val>]) -> Vec<Label>>;
 pub const DEFAULT_MAX_EVENTS: usize = 10_000;
 
 /// A system of processes. Each process is stored as a factory `Fn(Ctx) -> LocalFut` so
-/// it can be re-executed from scratch on every replay; the checker never keeps a
-/// suspended coroutine around.
+/// it can be re-executed from scratch on replay. Optional incremental replay
+/// retains safe await checkpoints; divergent histories rebuild from the factory.
 pub struct System {
     factories: Vec<Box<dyn Fn(Ctx) -> LocalFut>>,
     /// Per-thread future-label declaration ([`System::declare_future`]), parallel to
@@ -67,6 +72,25 @@ pub struct System {
     /// `usize::MAX` = unbounded.
     recv_budgets: Vec<usize>,
     max_events: usize,
+    incremental_replay: bool,
+    checkpoints: Vec<RefCell<Option<LiveCheckpoint>>>,
+}
+
+struct LiveCheckpoint {
+    future: LocalFut,
+    cell: Rc<RefCell<ThreadCell>>,
+    next: ThreadNext,
+}
+
+/// One replay's deterministic synchronous sends followed by the next await,
+/// error, or completion. `steps[i]` is the next event for the input trace extended
+/// by `i` send slots (`None`); every step except the last is a send.
+///
+/// Annotations retain their original event positions and local order. For the
+/// prefix corresponding to step `i`, use labels with `position <= trace.len()+i`.
+pub struct ReplayBatch {
+    pub steps: Vec<ThreadNext>,
+    pub labels: Vec<TraceLabel>,
 }
 
 impl Default for System {
@@ -82,13 +106,33 @@ impl System {
             futures: Vec::new(),
             recv_budgets: Vec::new(),
             max_events: DEFAULT_MAX_EVENTS,
+            incremental_replay: false,
+            checkpoints: Vec::new(),
         }
     }
 
     /// Set the per-thread event budget (see [`DEFAULT_MAX_EVENTS`]).
     pub fn with_max_events(mut self, max_events: usize) -> Self {
         self.max_events = max_events;
+        self.clear_checkpoints();
         self
+    }
+
+    /// Reuse a live coroutine parked at an Any receive or nondet await when its exact
+    /// trace grows by one event. Siblings and cuts fall back to fresh replay;
+    /// synchronous-send, custom-predicate and error outcomes never retain a live
+    /// checkpoint. Custom predicates may capture mutable state of the body.
+    /// Annotation reconstruction always uses the independent replay path.
+    pub fn with_incremental_replay(mut self, enabled: bool) -> Self {
+        self.incremental_replay = enabled;
+        self.clear_checkpoints();
+        self
+    }
+
+    fn clear_checkpoints(&mut self) {
+        for checkpoint in &mut self.checkpoints {
+            checkpoint.get_mut().take();
+        }
     }
 
     /// Register a process body; returns its thread id (`0`-based, in registration
@@ -103,6 +147,7 @@ impl System {
             .push(Box::new(move |ctx| Box::pin(body(ctx)) as LocalFut));
         self.futures.push(None); // undeclared future = the safe `None` (see `possible_future`)
         self.recv_budgets.push(usize::MAX); // unbounded until `set_max_recvs` says otherwise
+        self.checkpoints.push(RefCell::new(None));
         tid
     }
 
@@ -131,6 +176,7 @@ impl System {
             "set_max_recvs: no such thread {tid} (the system has {n}; `add` returns the tid)"
         );
         self.recv_budgets[tid] = max_recvs;
+        self.checkpoints[tid].get_mut().take();
     }
 
     /// Declare a **sound over-approximation** of the labels thread `tid`'s events may carry
@@ -178,8 +224,130 @@ impl System {
     }
 
     /// Replay thread `tid` against `trace` and read off its next event.
-    fn run_thread(&self, tid: Tid, trace: Vec<Option<Val>>) -> ThreadNext {
-        self.replay_thread(tid, trace, false).0
+    fn run_thread(&self, tid: Tid, trace: &[Option<Val>]) -> ThreadNext {
+        if self.incremental_replay {
+            return self.run_incremental(tid, trace);
+        }
+        self.replay_thread(tid, trace.to_vec(), false).0
+    }
+
+    fn run_incremental(&self, tid: Tid, trace: &[Option<Val>]) -> ThreadNext {
+        // No borrow of the slot spans polling, user code, or destruction.
+        let mut checkpoint = self.checkpoints[tid].borrow_mut().take();
+        if let Some(saved) = &checkpoint {
+            if saved.cell.borrow().matches_trace(trace) {
+                let next = saved.next.clone();
+                self.save_checkpoint(tid, checkpoint.unwrap());
+                return next;
+            }
+        }
+        let can_resume = checkpoint
+            .as_ref()
+            .is_some_and(|saved| saved.cell.borrow().extends_trace_once(trace));
+        if can_resume {
+            checkpoint
+                .as_ref()
+                .unwrap()
+                .cell
+                .borrow_mut()
+                .resume_with(*trace.last().unwrap());
+        } else {
+            // The caller returned to a sibling, a shorter prefix, or a cut. The
+            // old future is not cloneable and its mutated local state is discarded.
+            drop(checkpoint.take());
+            let cell = Rc::new(RefCell::new(ThreadCell::new(
+                trace.to_vec(),
+                self.max_events,
+                self.recv_budgets[tid],
+                false,
+            )));
+            let future = (self.factories[tid])(Ctx {
+                tid,
+                cell: cell.clone(),
+            });
+            checkpoint = Some(LiveCheckpoint {
+                future,
+                cell,
+                next: ThreadNext::Finished,
+            });
+        }
+        let mut checkpoint = checkpoint.unwrap();
+        checkpoint.cell.borrow_mut().begin_plain();
+        let (next, resumable) = poll_once(&mut checkpoint.future, &checkpoint.cell);
+        if resumable {
+            checkpoint.next = next.clone();
+            self.save_checkpoint(tid, checkpoint);
+        }
+        next
+    }
+
+    fn save_checkpoint(&self, tid: Tid, checkpoint: LiveCheckpoint) {
+        let displaced = self.checkpoints[tid].borrow_mut().replace(checkpoint);
+        // User destructor code can re-enter the runtime. No slot borrow survives.
+        drop(displaced);
+    }
+
+    /// Compute several deterministic send-only successors in one poll. No
+    /// graph event or observer notification is produced speculatively. A caller
+    /// may reuse each answer only for its exact input-plus-send prefix.
+    /// Custom-predicate boundaries discard the live body so older predicates
+    /// cannot be changed by later mutations of body-local captured state.
+    pub fn next_thread_batch(&self, tid: Tid, trace: &[Option<Val>]) -> ReplayBatch {
+        let mut checkpoint = self.checkpoints[tid].borrow_mut().take();
+        if !self.incremental_replay
+            || checkpoint
+                .as_ref()
+                .is_some_and(|saved| !saved.cell.borrow().has_labels())
+        {
+            drop(checkpoint.take());
+        }
+        if let Some(saved) = &checkpoint {
+            if saved.cell.borrow().matches_trace(trace) {
+                let result = ReplayBatch {
+                    steps: vec![saved.next.clone()],
+                    labels: saved.cell.borrow().labels_snapshot(),
+                };
+                self.save_checkpoint(tid, checkpoint.unwrap());
+                return result;
+            }
+        }
+        let can_resume = checkpoint
+            .as_ref()
+            .is_some_and(|saved| saved.cell.borrow().extends_trace_once(trace));
+        if can_resume {
+            checkpoint
+                .as_ref()
+                .unwrap()
+                .cell
+                .borrow_mut()
+                .resume_with(*trace.last().unwrap());
+        } else {
+            drop(checkpoint.take());
+            let cell = Rc::new(RefCell::new(ThreadCell::new(
+                trace.to_vec(),
+                self.max_events,
+                self.recv_budgets[tid],
+                true,
+            )));
+            let future = (self.factories[tid])(Ctx {
+                tid,
+                cell: cell.clone(),
+            });
+            checkpoint = Some(LiveCheckpoint {
+                future,
+                cell,
+                next: ThreadNext::Finished,
+            });
+        }
+        let mut checkpoint = checkpoint.unwrap();
+        checkpoint.cell.borrow_mut().begin_batch();
+        let (next, resumable) = poll_once(&mut checkpoint.future, &checkpoint.cell);
+        let (steps, labels) = checkpoint.cell.borrow_mut().finish_batch(next.clone());
+        if self.incremental_replay && resumable {
+            checkpoint.next = next;
+            self.save_checkpoint(tid, checkpoint);
+        }
+        ReplayBatch { steps, labels }
     }
 
     fn replay_thread(
@@ -218,7 +386,7 @@ impl Program for System {
         );
         (0..self.factories.len())
             .map(|tid| {
-                let trace = traces.get(tid).cloned().unwrap_or_default();
+                let trace = traces.get(tid).map_or(&[][..], Vec::as_slice);
                 self.run_thread(tid, trace)
             })
             .collect()
@@ -226,7 +394,7 @@ impl Program for System {
 
     /// Per-thread replay: re-run only thread `tid`'s body, not all of them.
     fn next_thread(&self, tid: Tid, trace: &[Option<Val>]) -> ThreadNext {
-        self.run_thread(tid, trace.to_vec())
+        self.run_thread(tid, trace)
     }
 
     /// Reconstruct all annotations in one replay per thread, independent of the
@@ -268,7 +436,7 @@ impl Program for System {
     /// declare only where the extra forcing precision is worth it.
     fn possible_future(&self, tid: Tid, trace: &[Option<Val>]) -> Option<Vec<Label>> {
         let tail = self.futures.get(tid)?.as_ref()?;
-        let mut out = match self.run_thread(tid, trace.to_vec()) {
+        let mut out = match self.run_thread(tid, trace) {
             ThreadNext::Next(label) => vec![label],
             ThreadNext::Finished => return Some(Vec::new()),
         };
@@ -327,7 +495,16 @@ impl Ctx {
     pub fn recv(&self, pred: impl Fn(&str) -> bool + Send + Sync + 'static) -> RecvFuture {
         RecvFuture {
             cell: self.cell.clone(),
-            pred_fn: Some(Box::new(pred)),
+            pred_fn: Some(RecvPredicate::Custom(Box::new(pred))),
+        }
+    }
+
+    /// Blocking receive accepting any message. Equivalent to `recv(|_| true)`,
+    /// preserving its replay position and predicate tag, with a known-any fast path.
+    pub fn recv_any(&self) -> RecvFuture {
+        RecvFuture {
+            cell: self.cell.clone(),
+            pred_fn: Some(RecvPredicate::Any),
         }
     }
 
@@ -347,7 +524,17 @@ impl Ctx {
     ) -> RecvTimeoutFuture {
         RecvTimeoutFuture {
             cell: self.cell.clone(),
-            pred_fn: Some(Box::new(pred)),
+            pred_fn: Some(RecvPredicate::Custom(Box::new(pred))),
+            timing: ReceiveTiming::Abstract,
+        }
+    }
+
+    /// Time-transparent nonblocking receive accepting any message. Equivalent
+    /// to `recv_timeout(|_| true)`, including its no-message outcome and tags.
+    pub fn recv_timeout_any(&self) -> RecvTimeoutFuture {
+        RecvTimeoutFuture {
+            cell: self.cell.clone(),
+            pred_fn: Some(RecvPredicate::Any),
             timing: ReceiveTiming::Abstract,
         }
     }
@@ -363,7 +550,7 @@ impl Ctx {
     ) -> RecvTimeoutFuture {
         RecvTimeoutFuture {
             cell: self.cell.clone(),
-            pred_fn: Some(Box::new(pred)),
+            pred_fn: Some(RecvPredicate::Custom(Box::new(pred))),
             timing: ReceiveTiming::Timeout(window),
         }
     }
@@ -378,7 +565,7 @@ impl Ctx {
     ) -> RecvTimeoutFuture {
         RecvTimeoutFuture {
             cell: self.cell.clone(),
-            pred_fn: Some(Box::new(pred)),
+            pred_fn: Some(RecvPredicate::Custom(Box::new(pred))),
             timing: ReceiveTiming::Poll(window),
         }
     }
@@ -405,7 +592,7 @@ impl Ctx {
 pub struct RecvFuture {
     cell: Rc<RefCell<ThreadCell>>,
     /// Predicate closure, moved into the emitted `Label::Recv` when the receive parks.
-    pred_fn: Option<BoxedPred>,
+    pred_fn: Option<RecvPredicate>,
 }
 
 impl Future for RecvFuture {
@@ -435,7 +622,7 @@ impl Future for RecvFuture {
 pub struct RecvTimeoutFuture {
     cell: Rc<RefCell<ThreadCell>>,
     /// Predicate closure, moved into the emitted `Label::recv_nb` when the receive parks.
-    pred_fn: Option<BoxedPred>,
+    pred_fn: Option<RecvPredicate>,
     timing: ReceiveTiming,
 }
 
