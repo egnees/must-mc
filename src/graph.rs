@@ -691,7 +691,7 @@ impl ExecutionGraph {
                     && self.threads[tid]
                         .last()
                         .is_none_or(|ev| ev.stamp < cut_from)
-                    && self.threads[tid].iter().all(|ev| ev.rf.is_none_or(&kept));
+                    && self.threads[tid].iter().all(|ev| ev.rf.is_none_or(kept));
                 if unchanged {
                     threads.push(Arc::clone(&self.threads[tid]));
                     continue;

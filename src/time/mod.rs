@@ -1071,23 +1071,20 @@ fn force_source<P: Program>(
         if t == tid || next.is_finished() {
             continue;
         }
-        match program.possible_future(t, &traces[t]) {
-            None => return None, // unknown future ⇒ a competitor may appear ⇒ don't force
-            Some(future) => {
-                debug_assert_eq!(
-                    future.first(),
-                    next.label(),
-                    "possible_future contract (src/program.rs): labels[0] must be thread {t}'s \
-                     next label"
-                );
-                let competes = future.iter().any(|l| match l {
-                    Label::Send { dst, val, .. } => *dst == tid && pred.test_sym(*val),
-                    _ => false,
-                });
-                if competes {
-                    return None;
-                }
-            }
+        // Unknown future ⇒ a competitor may appear ⇒ don't force.
+        let future = program.possible_future(t, &traces[t])?;
+        debug_assert_eq!(
+            future.first(),
+            next.label(),
+            "possible_future contract (src/program.rs): labels[0] must be thread {t}'s \
+             next label"
+        );
+        let competes = future.iter().any(|l| match l {
+            Label::Send { dst, val, .. } => *dst == tid && pred.test_sym(*val),
+            _ => false,
+        });
+        if competes {
+            return None;
         }
     }
 
@@ -1099,29 +1096,25 @@ fn force_source<P: Program>(
         }
     }
     // (3b) a possible future receive of thread `tid` (after `r`) could also accept `S`.
-    match program.possible_future(tid, &traces[tid]) {
-        None => return None,
-        Some(future) => {
-            // `future[0]` is `r` itself (the thread's next event); a *later* matching receive
-            // means `S` has two possible consumers. The `.skip(1)` below is exactly where the
-            // positional half of the contract is load-bearing: a head that is *not* `r` makes
-            // this skip drop a real consumer, and forcing `r ← S` then over-prunes. So assert it
-            // — three lines that turn "every implementation happens to comply" into a checked
-            // invariant (it did **not** hold: `tests/h1_review.rs`).
-            debug_assert_eq!(
-                future.first(),
-                Some(label),
-                "possible_future contract (src/program.rs): labels[0] must be thread {tid}'s \
-                 next label"
-            );
-            let contested = future
-                .iter()
-                .skip(1)
-                .any(|l| l.is_recv() && l.pred().is_some_and(|p| p.test_sym(s_val)));
-            if contested {
-                return None;
-            }
-        }
+    let future = program.possible_future(tid, &traces[tid])?;
+    // `future[0]` is `r` itself (the thread's next event); a *later* matching receive
+    // means `S` has two possible consumers. The `.skip(1)` below is exactly where the
+    // positional half of the contract is load-bearing: a head that is *not* `r` makes
+    // this skip drop a real consumer, and forcing `r ← S` then over-prunes. So assert it
+    // — three lines that turn "every implementation happens to comply" into a checked
+    // invariant (it did **not** hold: `tests/h1_review.rs`).
+    debug_assert_eq!(
+        future.first(),
+        Some(label),
+        "possible_future contract (src/program.rs): labels[0] must be thread {tid}'s \
+         next label"
+    );
+    let contested = future
+        .iter()
+        .skip(1)
+        .any(|l| l.is_recv() && l.pred().is_some_and(|p| p.test_sym(s_val)));
+    if contested {
+        return None;
     }
     Some(s)
 }
