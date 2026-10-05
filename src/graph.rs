@@ -5,11 +5,170 @@
 //! materialised with a per-event stamp: insertion-order queries use `stamp`, while the
 //! tid-then-idx order used by the tiebreaker uses `EventId`'s `Ord` directly.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
 use crate::event::{EventId, Label, Model, Tid, Val, Window};
+
+/// A set of the events of one graph, as a per-thread grid of generation tags: a cell is in
+/// the set when its tag equals the current generation. Clearing is a generation bump, so a
+/// query that needs a fresh set does no allocation once the grid has grown to size - which
+/// is what lets the hot predicates ([`ExecutionGraph::unread_sends`],
+/// [`ExecutionGraph::porf_reaches`], `consistent_mbox`) run without touching the allocator.
+///
+/// Marks are keyed by `(tid, idx)`, so one instance is only ever valid for the graph it was
+/// [`begin`](Marks::begin)'d on.
+#[derive(Default)]
+pub(crate) struct Marks {
+    cells: Vec<Vec<u64>>,
+    gen: u64,
+}
+
+impl Marks {
+    /// Clear the set and size it for `g` (O(threads), no allocation once grown).
+    pub(crate) fn begin(&mut self, g: &ExecutionGraph) {
+        self.gen += 1;
+        if self.cells.len() < g.threads.len() {
+            self.cells.resize_with(g.threads.len(), Vec::new);
+        }
+        for (row, thread) in self.cells.iter_mut().zip(g.threads.iter()) {
+            if row.len() < thread.len() {
+                row.resize(thread.len(), 0);
+            }
+        }
+    }
+
+    /// Add `e`; returns whether it was newly added (like `BTreeSet::insert`).
+    ///
+    /// An id outside the graph is accepted and simply not stored: callers mark rf sources,
+    /// and a dangling source (one a cut removed) has to behave as it did when these sets
+    /// were `BTreeSet`s — held, but matching no event of the graph.
+    pub(crate) fn insert(&mut self, e: EventId) -> bool {
+        match self.cells.get_mut(e.tid).and_then(|row| row.get_mut(e.idx)) {
+            Some(cell) => {
+                let fresh = *cell != self.gen;
+                *cell = self.gen;
+                fresh
+            }
+            None => true,
+        }
+    }
+
+    pub(crate) fn contains(&self, e: EventId) -> bool {
+        self.cells
+            .get(e.tid)
+            .and_then(|row| row.get(e.idx))
+            .is_some_and(|&c| c == self.gen)
+    }
+}
+
+/// Which events an [`EventIter`] yields.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    All,
+    Send,
+    Recv,
+}
+
+/// Walks a graph's events in `(tid, idx)` order, optionally keeping only sends or only
+/// receives. Hand-rolled rather than `flat_map(..).filter(..)`: these three iterators drive
+/// every consistency check, and the adapter stack was showing up as a top-of-stack cost of
+/// its own.
+pub struct EventIter<'a> {
+    g: &'a ExecutionGraph,
+    kind: Kind,
+    tid: usize,
+    idx: usize,
+}
+
+impl Iterator for EventIter<'_> {
+    type Item = EventId;
+
+    fn next(&mut self) -> Option<EventId> {
+        loop {
+            let thread = self.g.threads.get(self.tid)?;
+            if self.idx >= thread.len() {
+                self.tid += 1;
+                self.idx = 0;
+                continue;
+            }
+            let ev = &thread[self.idx];
+            let e = EventId::new(self.tid, self.idx);
+            self.idx += 1;
+            let wanted = match self.kind {
+                Kind::All => true,
+                Kind::Send => ev.label.is_send(),
+                Kind::Recv => ev.label.is_recv(),
+            };
+            if wanted {
+                return Some(e);
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// Free list of [`Marks`] grids, so a caller that needs one across a recursive call
+    /// (where a `thread_local` slot would be clobbered) still allocates nothing.
+    static MARK_POOL: RefCell<Vec<Marks>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A [`Marks`] borrowed from the per-thread pool and returned on drop.
+pub(crate) struct PooledMarks(Option<Marks>);
+
+impl PooledMarks {
+    pub(crate) fn take() -> Self {
+        PooledMarks(Some(
+            MARK_POOL.with(|p| p.borrow_mut().pop()).unwrap_or_default(),
+        ))
+    }
+}
+
+impl std::ops::Deref for PooledMarks {
+    type Target = Marks;
+    fn deref(&self) -> &Marks {
+        self.0.as_ref().expect("marks live until drop")
+    }
+}
+
+impl std::ops::DerefMut for PooledMarks {
+    fn deref_mut(&mut self) -> &mut Marks {
+        self.0.as_mut().expect("marks live until drop")
+    }
+}
+
+impl Drop for PooledMarks {
+    fn drop(&mut self) {
+        if let Some(m) = self.0.take() {
+            MARK_POOL.with(|p| p.borrow_mut().push(m));
+        }
+    }
+}
+
+/// Per-thread scratch for the graph queries. Workers never share it (one instance per
+/// thread), and no query here is re-entrant, so each borrows for the length of one call.
+#[derive(Default)]
+struct GraphScratch {
+    /// Marked sends: read sources ([`ExecutionGraph::unread_sends`]).
+    read: Marks,
+    /// Visited set of a porf traversal ([`ExecutionGraph::porf_reaches`]).
+    seen: Marks,
+    /// Traversal stack, reused across porf walks.
+    stack: Vec<EventId>,
+    /// DFS colours for [`ExecutionGraph::is_porf_acyclic`] (0 unseen / 1 on stack / 2 done).
+    color: Vec<Vec<u8>>,
+    /// DFS stack for [`ExecutionGraph::is_porf_acyclic`]: (event, next predecessor slot).
+    acyclic_stack: Vec<(EventId, u8)>,
+    /// New stamp per old stamp for a [`restrict`](ExecutionGraph::restrict) (`u64::MAX`
+    /// while a stamp is still marked as removed).
+    rank: Vec<u64>,
+}
+
+thread_local! {
+    static GSCRATCH: RefCell<GraphScratch> = RefCell::new(GraphScratch::default());
+}
 
 /// One event as stored in the graph: its label, its insertion stamp, and — inlined rather
 /// than held in side maps — the receive's reads-from source and the nondet event's chosen
@@ -182,11 +341,13 @@ impl ExecutionGraph {
 
     /// All events in `(tid, idx)` order, without allocating a `Vec`: the iterator
     /// counterpart of [`all_events`](Self::all_events).
-    pub fn iter_events(&self) -> impl Iterator<Item = EventId> + '_ {
-        self.threads
-            .iter()
-            .enumerate()
-            .flat_map(|(tid, thread)| (0..thread.len()).map(move |idx| EventId::new(tid, idx)))
+    pub fn iter_events(&self) -> EventIter<'_> {
+        EventIter {
+            g: self,
+            kind: Kind::All,
+            tid: 0,
+            idx: 0,
+        }
     }
 
     /// All events in `(tid, idx)` order.
@@ -196,14 +357,24 @@ impl ExecutionGraph {
 
     /// Sends in `(tid, idx)` order, without allocating — the iterator counterpart of
     /// [`sends`](Self::sends) for the consistency predicates.
-    pub fn iter_sends(&self) -> impl Iterator<Item = EventId> + '_ {
-        self.iter_events().filter(move |&e| self.label(e).is_send())
+    pub fn iter_sends(&self) -> EventIter<'_> {
+        EventIter {
+            g: self,
+            kind: Kind::Send,
+            tid: 0,
+            idx: 0,
+        }
     }
 
     /// Receives in `(tid, idx)` order, without allocating — the iterator counterpart of
     /// [`recvs`](Self::recvs).
-    pub fn iter_recvs(&self) -> impl Iterator<Item = EventId> + '_ {
-        self.iter_events().filter(move |&e| self.label(e).is_recv())
+    pub fn iter_recvs(&self) -> EventIter<'_> {
+        EventIter {
+            g: self,
+            kind: Kind::Recv,
+            tid: 0,
+            idx: 0,
+        }
     }
 
     /// All events in insertion order.
@@ -227,16 +398,23 @@ impl ExecutionGraph {
             .collect()
     }
 
-    /// Unread sends `G.US`: sends no receive reads.
+    /// Unread sends `G.US`: sends no receive reads, in `(tid, idx)` order.
+    ///
+    /// The read sources are marked in a reusable per-thread grid rather than collected into
+    /// a `BTreeSet`, so only the result vector is allocated.
     pub fn unread_sends(&self) -> Vec<EventId> {
-        let read: BTreeSet<EventId> = self
-            .iter_events()
-            .filter_map(|e| self.stored(e).rf)
-            .collect();
-        self.sends()
-            .into_iter()
-            .filter(|e| !read.contains(e))
-            .collect()
+        GSCRATCH.with(|s| {
+            let read = &mut s.borrow_mut().read;
+            read.begin(self);
+            for e in self.iter_events() {
+                if let Some(src) = self.stored(e).rf {
+                    read.insert(src);
+                }
+            }
+            self.iter_events()
+                .filter(|&e| self.label(e).is_send() && !read.contains(e))
+                .collect()
+        })
     }
 
     /// `matches(s, r)`: `mval` with destination, i.e. `dst(s) = tid(r)` and `val(s)` is
@@ -284,9 +462,67 @@ impl ExecutionGraph {
         seen
     }
 
+    /// `porf_prefix(e)` marked into caller-owned buffers instead of returned as a set: the
+    /// form the consistency predicates use when they need one prefix tested against many
+    /// events. `seen` is cleared (and sized for this graph) first; `stack` is scratch.
+    pub(crate) fn porf_prefix_into(&self, e: EventId, seen: &mut Marks, stack: &mut Vec<EventId>) {
+        seen.begin(self);
+        stack.clear();
+        // Seeded with `e`'s predecessors, not `e`: the prefix is strict, so `e` is in it
+        // only when it lies on a causal cycle (and is then reached as a predecessor).
+        if e.idx > 0 {
+            stack.push(EventId::new(e.tid, e.idx - 1));
+        }
+        if let Some(p) = self.reads_from(e) {
+            stack.push(p);
+        }
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            if x.idx > 0 {
+                stack.push(EventId::new(x.tid, x.idx - 1));
+            }
+            if let Some(p) = self.reads_from(x) {
+                stack.push(p);
+            }
+        }
+    }
+
     /// Whether `(a, b)` is in `G.porf` (strict).
+    ///
+    /// Same relation as `porf_prefix(b).contains(&a)`, but walks `b`'s predecessors with a
+    /// reusable mark grid and stops at the first sighting of `a` instead of materialising
+    /// the whole prefix - this is the form the consistency predicates call per pair.
     pub fn porf_reaches(&self, a: EventId, b: EventId) -> bool {
-        self.porf_prefix(b).contains(&a)
+        GSCRATCH.with(|sc| {
+            let GraphScratch { seen, stack, .. } = &mut *sc.borrow_mut();
+            seen.begin(self);
+            stack.clear();
+            stack.push(b);
+            while let Some(x) = stack.pop() {
+                // The (at most two) porf predecessors of `x`, inlined to avoid the `Vec`
+                // that `porf_preds` returns.
+                if x.idx > 0 {
+                    let p = EventId::new(x.tid, x.idx - 1);
+                    if p == a {
+                        return true;
+                    }
+                    if seen.insert(p) {
+                        stack.push(p);
+                    }
+                }
+                if let Some(p) = self.reads_from(x) {
+                    if p == a {
+                        return true;
+                    }
+                    if seen.insert(p) {
+                        stack.push(p);
+                    }
+                }
+            }
+            false
+        })
     }
 
     /// Whether `po` and `rf` together are acyclic, i.e. no event reaches itself. This is
@@ -297,14 +533,26 @@ impl ExecutionGraph {
     /// still on the stack. Iterative rather than recursive so deep graphs cannot overflow
     /// the call stack.
     pub fn is_porf_acyclic(&self) -> bool {
+        GSCRATCH.with(|sc| {
+            let GraphScratch {
+                color,
+                acyclic_stack: stack,
+                ..
+            } = &mut *sc.borrow_mut();
+            self.porf_acyclic_with(color, stack)
+        })
+    }
+
+    /// [`is_porf_acyclic`](Self::is_porf_acyclic) over caller-owned buffers, so the colour
+    /// grid and the DFS stack are reused across calls instead of reallocated per check.
+    fn porf_acyclic_with(&self, color: &mut Vec<Vec<u8>>, stack: &mut Vec<(EventId, u8)>) -> bool {
         // Colour per event: 0 = unseen, 1 = on the DFS stack, 2 = fully explored.
-        let mut color: Vec<Vec<u8>> = self
-            .threads
-            .iter()
-            .map(|thread| vec![0u8; thread.len()])
-            .collect();
-        // Explicit DFS stack of (event, next predecessor slot to try).
-        let mut stack: Vec<(EventId, u8)> = Vec::new();
+        color.resize_with(self.threads.len(), Vec::new);
+        for (row, thread) in color.iter_mut().zip(self.threads.iter()) {
+            row.clear();
+            row.resize(thread.len(), 0);
+        }
+        stack.clear();
 
         for (tid, thread) in self.threads.iter().enumerate() {
             for idx in 0..thread.len() {
@@ -370,52 +618,105 @@ impl ExecutionGraph {
                 .all(|e| e.idx < new_len.get(e.tid).copied().unwrap_or(0)),
             "restrict expects a po-prefix-closed keep set"
         );
+        self.restrict_to_lens(&new_len)
+    }
 
-        let kept = |e: EventId| e.tid < new_len.len() && e.idx < new_len[e.tid];
+    /// [`restrict`](Self::restrict) to a keep set given directly as per-thread prefix
+    /// lengths: `keep_len[t]` events survive in thread `t`. Every keep set the explorer
+    /// cuts with is po-prefix-closed, so it *is* a length vector; passing it in this form
+    /// skips materialising the set (and, in the callers, building it at all).
+    pub(crate) fn restrict_to_lens(&self, keep_len: &[usize]) -> ExecutionGraph {
+        debug_assert!(
+            keep_len.len() >= self.threads.len()
+                || self.threads[keep_len.len()..].iter().all(|t| t.is_empty()),
+            "keep_len must cover every non-empty thread"
+        );
+        let len_of = |tid: usize| keep_len.get(tid).copied().unwrap_or(0).min(self.thread_len(tid));
+        let kept = |e: EventId| e.idx < len_of(e.tid);
 
-        // Re-stamp: order survivors by old stamp, then assign 0..n.
-        let mut survivors: Vec<EventId> = Vec::new();
-        for (tid, &len) in new_len.iter().enumerate() {
-            for idx in 0..len {
-                survivors.push(EventId::new(tid, idx));
+        // Nothing removed: the cut is the identity. Stamps are dense (`add_event` counts up
+        // and every cut re-stamps densely), so the re-stamping would hand every event back
+        // its own stamp — a clone (a refcount bump per thread) is the same graph for far
+        // less work. Whole classes of `Previous` cuts delete nothing at all.
+        if (0..self.threads.len()).all(|tid| len_of(tid) == self.threads[tid].len()) {
+            debug_assert_eq!(
+                self.next_stamp as usize,
+                self.threads.iter().map(|t| t.len()).sum::<usize>(),
+                "identity restrict assumes dense stamps (as add_event and restrict produce)"
+            );
+            return self.clone();
+        }
+
+        GSCRATCH.with(|sc| {
+            let GraphScratch { rank, .. } = &mut *sc.borrow_mut();
+
+            // Re-stamp: survivors keep their relative insertion order, so the new stamp of an
+            // event is the number of survivors ahead of it. Stamps are dense, so that is a
+            // counting pass over the stamp axis - no sort (which used to be O(n log n) on
+            // every cut, and every rf-choice reaches one).
+            rank.clear();
+            rank.resize(self.next_stamp as usize, u64::MAX);
+            for tid in 0..self.threads.len() {
+                for idx in 0..len_of(tid) {
+                    rank[self.threads[tid][idx].stamp as usize] = 0; // marked as surviving
+                }
             }
-        }
-        survivors.sort_by_key(|&e| self.stamp(e));
-        let new_stamp: BTreeMap<EventId, u64> = survivors
-            .iter()
-            .enumerate()
-            .map(|(rank, &e)| (e, rank as u64))
-            .collect();
-
-        let mut threads: Vec<Arc<Vec<StoredEvent>>> = Vec::with_capacity(new_len.len());
-        for (tid, &len) in new_len.iter().enumerate() {
-            let mut thread = Vec::with_capacity(len);
-            for idx in 0..len {
-                let e = EventId::new(tid, idx);
-                let old = &self.threads[tid][idx];
-                // Carry `rf` forward, normalizing a source that did not survive to ⊥
-                // (well-formedness later rejects that for a blocking receive). idx is
-                // preserved by the cut, so a kept source keeps the same EventId. "Reading
-                // nothing" and "unassigned" are both `None`, exactly as `reads_from` treats
-                // them. `nd` is carried verbatim (idx-keyed choices stay valid).
-                let rf = match old.rf {
-                    Some(s) if kept(s) => Some(s),
-                    _ => None,
-                };
-                thread.push(StoredEvent {
-                    label: old.label.clone(),
-                    stamp: new_stamp[&e],
-                    rf,
-                    nd: old.nd,
-                });
+            // `cut_from` = the oldest stamp that disappears: every survivor below it keeps
+            // its own stamp, which is what lets an untouched thread be shared below.
+            let mut cut_from = u64::MAX;
+            let mut next = 0u64;
+            for (old, slot) in rank.iter_mut().enumerate() {
+                if *slot == u64::MAX {
+                    cut_from = cut_from.min(old as u64);
+                } else {
+                    *slot = next;
+                    next += 1;
+                }
             }
-            threads.push(Arc::new(thread));
-        }
 
-        ExecutionGraph {
-            threads,
-            next_stamp: survivors.len() as u64,
-        }
+            let mut threads: Vec<Arc<Vec<StoredEvent>>> = Vec::with_capacity(self.threads.len());
+            for tid in 0..self.threads.len() {
+                let len = len_of(tid);
+                // A thread that loses no event, whose events all predate the cut (so their
+                // stamps are unchanged) and whose receives all still find their source, is
+                // bit-for-bit the old thread: share it instead of rebuilding (a refcount
+                // bump against a full copy of every event).
+                let unchanged = len == self.threads[tid].len()
+                    && self.threads[tid].last().is_none_or(|ev| ev.stamp < cut_from)
+                    && self.threads[tid]
+                        .iter()
+                        .all(|ev| ev.rf.is_none_or(&kept));
+                if unchanged {
+                    threads.push(Arc::clone(&self.threads[tid]));
+                    continue;
+                }
+                let mut thread = Vec::with_capacity(len);
+                for idx in 0..len {
+                    let old = &self.threads[tid][idx];
+                    // Carry `rf` forward, normalizing a source that did not survive to ⊥
+                    // (well-formedness later rejects that for a blocking receive). idx is
+                    // preserved by the cut, so a kept source keeps the same EventId. "Reading
+                    // nothing" and "unassigned" are both `None`, exactly as `reads_from` treats
+                    // them. `nd` is carried verbatim (idx-keyed choices stay valid).
+                    let rf = match old.rf {
+                        Some(s) if kept(s) => Some(s),
+                        _ => None,
+                    };
+                    thread.push(StoredEvent {
+                        label: old.label.clone(),
+                        stamp: rank[old.stamp as usize],
+                        rf,
+                        nd: old.nd,
+                    });
+                }
+                threads.push(Arc::new(thread));
+            }
+
+            ExecutionGraph {
+                threads,
+                next_stamp: next,
+            }
+        })
     }
 
     /// Deterministic textual key of the graph's `(E, po, rf)` content, ignoring stamps.
@@ -478,7 +779,10 @@ const _: fn() = || {
 // Free-form strings (val, pred repr, error msg) are length-prefixed so the key parses
 // unambiguously left-to-right: a val containing "...) Sp2p(..." cannot collide with a
 // pair of separate labels.
-fn label_key(l: &Label) -> String {
+//
+// `pub(crate)`: the viable-oracle memo (T2_ORACLE_SPEC §1.3) keys the revisiting label by this
+// same canonical string (stable across `Sym` interning order, unlike `Debug`).
+pub(crate) fn label_key(l: &Label) -> String {
     match l {
         Label::Send {
             model,
