@@ -106,7 +106,7 @@ pub fn next_step<P: Program>(program: &P, priorities: &[Tid], g: &ExecutionGraph
 /// send appears.
 ///
 /// `des` selects the discrete-event scheduling order of the time-intervals extension
-/// ([`pick_des`], T2_PLAN §2b) — set by both the T2 predicate and the zombie regime
+/// (`pick_des`, T2_PLAN §2b) — set by both the T2 predicate and the zombie regime
 /// (`des = time_predicate || time_zombie`, T2_ORACLE_SPEC §2.1); with it `false` this is the
 /// ordinary priority policy and every count is byte-identical to the untimed explorer.
 pub fn pick(g: &ExecutionGraph, nexts: &[ThreadNext], priorities: &[Tid], des: bool) -> NextStep {

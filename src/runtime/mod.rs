@@ -147,7 +147,7 @@ impl System {
     /// replays the body and knows it exactly — so `tail` must not try to predict it, and
     /// including it anyway is harmless (it only makes the answer coarser).
     ///
-    /// A declaration that is too narrow is a **soundness bug**: [`crate::time::force_source`]
+    /// A declaration that is too narrow is a **soundness bug**: `crate::time::force_source`
     /// uses it to prove a blocking receive's source unavoidable, and an unavoidable-looking
     /// but avoidable read over-prunes, losing realizable terminals. When in doubt, declare
     /// more (a superset is always sound) or do not declare at all.
@@ -245,7 +245,7 @@ impl Program for System {
     /// nondet), so its remaining events cannot be enumerated by replay alone. The answer is
     /// therefore **declaration-driven** ([`System::declare_future`]):
     ///
-    /// * undeclared (the default) → `None`, "unknown". [`crate::time::force_source`] then
+    /// * undeclared (the default) → `None`, "unknown". `crate::time::force_source` then
     ///   never forces a blocking receive for this `System` — C1-safe by construction, at the
     ///   cost of a shorter forced closure. Any resulting dead branches are a performance
     ///   matter, never a soundness one.
@@ -260,8 +260,8 @@ impl Program for System {
     ///
     /// # Cost
     ///
-    /// Every `Some` answer re-runs the whole body once ([`System::run_thread`]) to obtain the
-    /// exact head. [`crate::time::force_source`] can ask up to once per unfinished thread per
+    /// Every `Some` answer re-runs the whole body once (`System::run_thread`) to obtain the
+    /// exact head. `crate::time::force_source` can ask up to once per unfinished thread per
     /// force attempt, and a force attempt happens per blocking receive per closure round, so a
     /// declared system pays roughly one extra body replay per thread per round on top of the
     /// `next` it already does. That is the same order as the closure itself, but it is not free:

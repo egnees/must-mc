@@ -122,7 +122,7 @@ pub trait Program {
     /// The contract: if this returns `Some(labels)`, then in *every* continuation of `trace`,
     /// each of thread `tid`'s future events (its next one and all after it) is **represented**
     /// in `labels`. "Represented" is not label equality — it is what the two consumers actually
-    /// test ([`crate::time::force_source`] conditions (2) and (3b)):
+    /// test (`crate::time::force_source` conditions (2) and (3b)):
     ///
     /// * a future **send** must be represented by some `Label::Send` with the same `dst` and the
     ///   same payload. Its `model` and delivery `window` are never inspected, so they may be

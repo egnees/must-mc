@@ -80,7 +80,7 @@ pub struct Config {
     /// threads (including already consumed sends). `None` = unbounded.
     ///
     /// Before adding a send beyond this budget, abandon that subtree and notify
-    /// [`Observer::on_send_limit`](crate::Observer::on_send_limit). This is an
+    /// [`Observer::on_send_limit`]. This is an
     /// inconclusive cutoff, NOT a terminal execution or a protocol error. Receives
     /// and other events may still run at exactly the limit.
     ///
@@ -100,7 +100,7 @@ pub struct Config {
     /// engine_plan §3). When `true`, a terminal graph consistent in the untimed sense but
     /// with no schedule satisfying the eager receive semantics
     /// ([`crate::time::eager_feasible`]) is routed to
-    /// [`Observer::on_execution_filtered`](crate::Observer::on_execution_filtered) instead of
+    /// [`Observer::on_execution_filtered`] instead of
     /// `on_execution`, and counts towards neither the terminal count nor `max_executions`.
     /// Default `false` (every untimed oracle count is unchanged).
     ///
@@ -126,11 +126,11 @@ pub struct Config {
     ///
     /// * **T-DES** ([`crate::scheduler::pick`]): a discrete-event scheduling order by lower-bound
     ///   time, replacing the priority order and determining insertion order `≤_G`;
-    /// * **T-PRED** ([`Explorer::visit_recv`]): an rf-fork is taken only when the resulting
+    /// * **T-PRED** (`Explorer::visit_recv`): an rf-fork is taken only when the resulting
     ///   prefix is eager-time-feasible (`time::check(..).is_feasible()`), not merely consistent;
     /// * **T-CANON** ([`crate::explorer::revisit::get_cons_tiebreaker`]): the canonical source of
     ///   a blocking receive is the earliest-arriving one (`avail`-LB), not the `(tid,idx)`-min;
-    /// * **T-GATE** ([`Explorer::visit_send`] line 9, [`crate::explorer::revisit`] line 13): a
+    /// * **T-GATE** (`Explorer::visit_send` line 9, [`crate::explorer::revisit`] line 13): a
     ///   forward send / backward revisit is gated on `time::forced_closure_feasible`, which
     ///   rejects a child whose *obligatory* continuation is eager-infeasible (the refuted-L3
     ///   replacement).
@@ -152,7 +152,7 @@ pub struct Config {
     /// | 4 | ✓ | ✓ | ✓ | ✓ | none needed (feasible by construction) |
     ///
     /// Levels 2 and 3 still record only *eager-realizable* terminals — they route the rest to
-    /// [`Observer::on_execution_filtered`](crate::Observer::on_execution_filtered) exactly as
+    /// [`Observer::on_execution_filtered`] exactly as
     /// [`time_filter`](Self::time_filter)/[`time_zombie`](Self::time_zombie) do — because without
     /// T-PRED/T-GATE the walk reaches graphs no schedule realizes. At level 4 that filter should
     /// be vacuous, and a debug build asserts that it is; it is applied all the same, so that a

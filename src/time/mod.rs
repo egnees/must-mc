@@ -282,7 +282,7 @@ impl Earliest {
 ///
 /// The lower bounds themselves are the pointwise-minimum values over the hard-only relaxation
 /// (drop the A/B receive clauses and the `avail` max clauses; keep the hard window / gate /
-/// `avail ≥ arr` / origin edges), computed by [`Builder::earliest_lb`]. Dropping the
+/// `avail ≥ arr` / origin edges), computed by `Builder::earliest_lb`. Dropping the
 /// disjunctions only *relaxes* the system, so each variable's minimum there is a **sound lower
 /// bound** of its true earliest time in the full system (LB ≤ true earliest — possibly not
 /// tight). Note: the solver's own model is a valid schedule but *not* pointwise-minimal (slack
@@ -343,7 +343,7 @@ pub fn earliest_times(g: &ExecutionGraph) -> Option<Earliest> {
 /// * non-blocking `Recv` → add reading ⊥ (the nb canon, T2_PLAN §2d — nb-recv is
 ///   time-transparent in v1).
 /// * blocking `Recv` → add reading `S` **only when `S` is statically the unavoidable
-///   source** (see [`force_source`] — conditions (1)(2)(3)); otherwise stop by that thread.
+///   source** (see `force_source` — conditions (1)(2)(3)); otherwise stop by that thread.
 /// * `Finished` / blocked → skip.
 ///
 /// A thread that blocks earlier contributes no "ghost" events, which is exactly why the
@@ -482,7 +482,7 @@ pub fn forced_closure_feasible<P: Program>(
 ///
 /// Л-C1 (`C1_HARDENING_SPEC` §C.2) originally carried a side condition "exact futures". It was
 /// **restated on 26.07.2026** as **per-site precision**: what the proof needs is that *at the
-/// moment of each force* every unfinished thread had a `Some` future — which [`force_source`]
+/// moment of each force* every unfinished thread had a `Some` future — which `force_source`
 /// establishes constructively, since its conditions (2) and (3b) return `None` the instant they
 /// meet an unfinished thread with an unknown future. An unknown future therefore never produces a
 /// half-trusted closure: it makes `force_source` decline outright, the closure degenerates to a
@@ -584,7 +584,7 @@ fn closure_forced_nb(g0: &ExecutionGraph, closure: &ExecutionGraph) -> bool {
 /// stamp- and order-independent (commuting resolution orders collapse onto one entry, which is
 /// what makes the search effectively "by graphs, not by insertion orders").
 ///
-/// The map is size-capped ([`VIABLE_MEMO_CAP`]): past the cap a state is simply recomputed —
+/// The map is size-capped (`VIABLE_MEMO_CAP`): past the cap a state is simply recomputed —
 /// a memo miss is never a wrong verdict. No depth cap exists anywhere in the search.
 ///
 /// It doubles as the per-worker memo of the **gate** ([`gate_feasible_cached`], H2): the gate
@@ -723,13 +723,13 @@ pub fn viable<P: Program>(
 ///
 /// Changing an rf edge plays exactly the role changing a nondet value plays in [`viable`]: both
 /// re-pin one choice point of the base and ask whether the region can still deliver `revisiting`.
-/// Everything downstream is literally the same search — the same [`viable_search`], the same
+/// Everything downstream is literally the same search — the same `viable_search`, the same
 /// cuts, the same memo (whose key already distinguishes the two, since `canonical_key` encodes
 /// rf), so the O2 precision argument (`T2_PROOFS_A` A1) transfers verbatim: exact under exact
 /// futures, a strict under-approximation otherwise, and under-approximation is the
 /// completeness-safe direction for a PASS rule (`T2_PROOFS_B` B1.d).
 ///
-/// `src` must be present in `base`; the caller ([`crate::explorer::revisit::cons_candidates`]
+/// `src` must be present in `base`; the caller (`crate::explorer::revisit::cons_candidates`
 /// consumers) answers "not viable" for absent candidates without calling here.
 #[allow(clippy::too_many_arguments)]
 pub fn viable_recv<P: Program>(
@@ -753,7 +753,7 @@ pub fn viable_recv<P: Program>(
 ///
 /// ⊥ is the `≺`-minimum option of a non-blocking receive (it *is* the untimed line-18 canon), so
 /// this is the one call the non-blocking PASS rule always has to make. It is literally
-/// [`viable_recv`] with `set_rf(ep, None)`: same [`viable_search`], same cuts, same memo, same O2
+/// [`viable_recv`] with `set_rf(ep, None)`: same `viable_search`, same cuts, same memo, same O2
 /// precision argument. (For a *blocking* `ep` the ⊥ state is inconsistent and the search prunes
 /// it at its step 2, so calling this on one is safe but pointless.)
 #[allow(clippy::too_many_arguments)]

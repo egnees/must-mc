@@ -133,9 +133,9 @@ pub fn check_mailbox(g: &ExecutionGraph) -> TimedVerdict {
 /// witness. This is the hot path of the terminal filter (one call per terminal candidate).
 ///
 /// The constraint system is built with the explanation tables switched off
-/// ([`Builder::explain`]); they never contribute an edge, so the `System` — and therefore
+/// (`Builder::explain`); they never contribute an edge, so the `System` — and therefore
 /// the solver verdict — is identical. A satisfiable system is re-verified through the full
-/// [`check_mailbox`], so the witness-extraction assertions in [`Builder::schedule`] still
+/// [`check_mailbox`], so the witness-extraction assertions in `Builder::schedule` still
 /// run on every accepted terminal; only the (overwhelmingly common) infeasible answer takes
 /// the cheap path.
 pub fn eager_mailbox_feasible(g: &ExecutionGraph) -> bool {
@@ -370,7 +370,7 @@ struct Builder {
     spare_alt_lists: Vec<Vec<Vec<Edge>>>,
     spare_alts: Vec<Vec<Alternative>>,
     /// Whether to record the witness/explanation side tables (`provenance`, `hard_order`,
-    /// `clause_order`). They feed [`Builder::explanation`], [`Builder::schedule`] and
+    /// `clause_order`). They feed [`Builder::explanation`], `Builder::schedule` and
     /// [`verify_mailbox_schedule`] only — never [`Builder::system`] — so building them is
     /// pure overhead when the caller wants nothing but a feasibility bit. Skipping them
     /// leaves the emitted `System` bit-for-bit identical (the same edges pushed in the same
