@@ -1,7 +1,7 @@
 //! Multi-threaded driver for the explorer.
 //!
-//! DPOR subtrees are independent: the explorer is stateless (every branch works on a clone
-//! of the graph), so exploring `Visit_P(G)` for a consistent `G` is a pure function of
+//! DPOR subtrees are independent: each worker owns its graph and restores forward
+//! appends on return, so exploring `Visit_P(G)` for a consistent `G` is a pure function of
 //! `(G, program, priorities)`. The search tree is therefore embarrassingly parallel - the
 //! driver hands out subtrees to a pool of workers.
 //!
@@ -182,6 +182,8 @@ where
                 let mut ex = Explorer {
                     program: &program,
                     observer,
+                    buffer_added_events: observer.allows_buffered_events(),
+                    buffered_events_added: 0,
                     priorities,
                     stop_on_error,
                     stop_on_terminal_error,
@@ -202,8 +204,8 @@ where
                     stop: false,
                     fork: Some(Arc::clone(&sp)),
                 };
-                while let Some(g) = sp.pop() {
-                    ex.visit(&g);
+                while let Some(mut g) = sp.pop() {
+                    ex.visit(&mut g);
                     sp.complete();
                 }
             });

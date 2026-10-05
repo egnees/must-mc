@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use super::source_order::SourceOrder;
 use crate::consistency::consistent;
 use crate::event::{EventId, Label, Val};
-use crate::graph::ExecutionGraph;
+use crate::graph::{EventMembership, ExecutionGraph};
 use crate::observer::Observer;
 use crate::program::Program;
 
@@ -21,6 +21,45 @@ use super::Explorer;
 thread_local! {
     /// Per-thread keep-lengths for [`restrict_prefix`], reused across cuts.
     static LENS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Untimed canonical arms are pure functions of `(g, ep, porf_send, order)`.
+/// Those arguments stay fixed while one send scans its candidate target receives.
+/// Cache both verdicts, owning the pooled marks across recursive child visits.
+/// Initialize lazily: sends without viable revisit candidates need no scratch.
+#[derive(Default)]
+struct CanonicalMemo {
+    verdicts: Option<(crate::graph::PooledMarks, crate::graph::PooledMarks)>,
+}
+
+impl CanonicalMemo {
+    fn get_or_insert(
+        &mut self,
+        g: &ExecutionGraph,
+        ep: EventId,
+        compute: impl FnOnce() -> bool,
+    ) -> bool {
+        let (accepted, rejected) = self.verdicts.get_or_insert_with(|| {
+            let mut accepted = crate::graph::PooledMarks::take();
+            let mut rejected = crate::graph::PooledMarks::take();
+            accepted.begin(g);
+            rejected.begin(g);
+            (accepted, rejected)
+        });
+        if accepted.contains(ep) {
+            return true;
+        }
+        if rejected.contains(ep) {
+            return false;
+        }
+        let verdict = compute();
+        if verdict {
+            accepted.insert(ep);
+        } else {
+            rejected.insert(ep);
+        }
+        verdict
+    }
 }
 
 /// `G|_keep` for a keep set described by a per-event predicate: each thread keeps the
@@ -56,10 +95,32 @@ fn restrict_prefix(g: &ExecutionGraph, pred: impl Fn(EventId) -> bool) -> Execut
 pub(super) fn restrict_previous(
     g: &ExecutionGraph,
     e: EventId,
-    porf_s: &BTreeSet<EventId>,
+    porf_s: &impl EventMembership,
 ) -> ExecutionGraph {
     let se = g.stamp(e);
     restrict_prefix(g, |x| g.stamp(x) <= se || porf_s.contains(&x))
+}
+
+/// Matching requires `tid(r) = dst(e)`, so unrelated thread rows cannot
+/// contribute a backward target. This preserves the original EventId order.
+fn destination_receives(g: &ExecutionGraph, tid: usize) -> impl Iterator<Item = EventId> + '_ {
+    (0..g.thread_len(tid))
+        .map(move |idx| EventId::new(tid, idx))
+        .filter(|&event| g.label(event).is_recv())
+}
+
+fn restrict_revisit_target(
+    g: &ExecutionGraph,
+    receive: EventId,
+    send: EventId,
+    porf_send: &impl EventMembership,
+) -> ExecutionGraph {
+    let stamp = g.stamp(receive);
+    let mut target = restrict_prefix(g, |x| {
+        g.stamp(x) <= stamp || porf_send.contains(&x) || x == send
+    });
+    target.set_rf(receive, Some(send));
+    target
 }
 
 impl<P: Program, O: Observer> Explorer<'_, P, O> {
@@ -67,12 +128,32 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     /// (bar `e`'s causal prefix), and - if every deleted event and `r` itself satisfy
     /// `RevisitCondition` - explore the graph where `r` reads `e`.
     pub(crate) fn backward_revisits(&mut self, first: &mut bool, g: &ExecutionGraph, e: EventId) {
+        let destination = g.label(e).dst().expect("backward revisit requires a send");
+        let mut receives = destination_receives(g, destination).peekable();
+        if receives.peek().is_none() {
+            // No matching target exists; the old scan emitted no callbacks here.
+            return;
+        }
         // e's porf-prefix is reused by the candidate filter, `Deleted`, and every
         // `Previous`, so compute it once.
-        let porf_e = g.porf_prefix(e);
+        let porf_e = g.causal_prefix(e);
+        let mut canonical = CanonicalMemo::default();
+        // Only the exact original untimed Asyn/EventId construction uses a
+        // virtual target. Conservative observers, ordering/timing modes and
+        // stronger channel models keep the materialized reference path.
+        let virtual_target = !self.time_predicate
+            && !self.time_filter
+            && !self.time_zombie
+            && !self.mailbox_time
+            && self.source_order == SourceOrder::EventId
+            && !g.uses_model(crate::Model::P2p)
+            && !g.uses_model(crate::Model::Cd)
+            && !g.uses_model(crate::Model::Mbox)
+            && !self.observer.inspects_rf_trial_graphs()
+            && !self.observer.inspects_revisit_targets();
 
         // line 10: candidates r with matches(e, r) and no porf path r -> e.
-        for r in g.iter_recvs() {
+        for r in receives {
             if self.stopping() {
                 return;
             }
@@ -102,15 +183,36 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             // `deleted_set` itself is deferred below to the survivors of the two rejection
             // tests — it is a pure function of `(g, r, porf_e)`, so nothing else moves.
             let sr = g.stamp(r);
-            let mut g2 = restrict_prefix(g, |x| g.stamp(x) <= sr || porf_e.contains(&x) || x == e);
-            g2.set_rf(r, Some(e));
+            let g2 = (!virtual_target).then(|| restrict_revisit_target(g, r, e, &porf_e));
 
             // line 13's `VisitIfConsistent`, evaluated here rather than at the recursion (so the
             // gate below never runs on an inconsistent graph — a blocking receive reading ⊥ has
             // no well-formed time system). `branch` below is the raw form, so consistency is
             // still tested exactly once per revisit.
-            if !consistent(&g2) {
-                self.observer.on_inconsistent(&g2);
+            let target_consistent = match &g2 {
+                Some(target) => crate::consistency::consistent_after_asyn_revisit(g, target, r, e),
+                None => {
+                    crate::consistency::consistent_asyn_revisit_before_restrict(g, r, e, &porf_e)
+                }
+            };
+            #[cfg(debug_assertions)]
+            {
+                let reference;
+                let target = match &g2 {
+                    Some(target) => target,
+                    None => {
+                        reference = restrict_revisit_target(g, r, e, &porf_e);
+                        &reference
+                    }
+                };
+                assert_eq!(
+                    target_consistent,
+                    consistent(target),
+                    "incremental revisit-consistency must agree with the full check"
+                );
+            }
+            if !target_consistent {
+                self.observer.on_inconsistent(g2.as_ref().unwrap_or(g));
                 continue;
             }
 
@@ -130,13 +232,19 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             if self.time_predicate
                 && self.time_level >= 4
                 && !crate::time::gate_feasible_cached(
-                    &g2,
+                    g2.as_ref()
+                        .expect("timed revisits materialize their target"),
                     self.program,
                     &self.priorities,
                     &mut self.viable_memo,
                 )
             {
-                self.observer.on_forced_closure_pruned(&g2, r, e);
+                self.observer.on_forced_closure_pruned(
+                    g2.as_ref()
+                        .expect("timed revisits materialize their target"),
+                    r,
+                    e,
+                );
                 continue;
             }
 
@@ -149,15 +257,24 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             // `Deleted` is walked, not built: the set object is only needed by the observer
             // on the accepted path below, and the predicate is the same one the keep-lengths
             // above use.
-            self.observer.on_revisit_candidate(g, r, e, &g2);
+            self.observer
+                .on_revisit_candidate(g, r, e, g2.as_ref().unwrap_or(g));
             let mut all_ok = true;
             for ep in g
                 .iter_events()
                 .filter(|&x| g.stamp(x) > sr && !porf_e.contains(&x))
                 .chain(std::iter::once(r))
             {
-                if !self.revisit_condition(g, ep, &porf_e, e) {
-                    self.observer.on_revisit_arm_rejected(g, r, e, &g2, ep);
+                let accepted = if !self.time_predicate && !self.canon_free {
+                    canonical.get_or_insert(g, ep, || self.revisit_condition(g, ep, &porf_e, e))
+                } else {
+                    // Timing arms issue diagnostic callbacks and viability queries;
+                    // their original calls and side effects remain unchanged.
+                    self.revisit_condition(g, ep, &porf_e, e)
+                };
+                if !accepted {
+                    self.observer
+                        .on_revisit_arm_rejected(g, r, e, g2.as_ref().unwrap_or(g), ep);
                     all_ok = false;
                     break;
                 }
@@ -169,6 +286,11 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                 // would justify an early exit is unproven for the tiebreaker.
                 continue;
             }
+
+            // A virtual trial reaching this point has the exact same accepted
+            // canonical arms as the reference path. Its successor must own the
+            // actual restricted graph before any recursion or work donation.
+            let mut g2 = g2.unwrap_or_else(|| restrict_revisit_target(g, r, e, &porf_e));
 
             // A repairing send can make every old holder fail the viability oracle even
             // though its rewritten target is feasible. PASS then admits several holders.
@@ -205,7 +327,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             if self.stopping() {
                 return;
             }
-            self.branch(first, &g2);
+            self.branch(first, &mut g2);
         }
     }
 
@@ -229,7 +351,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         &mut self,
         g: &ExecutionGraph,
         ep: EventId,
-        porf_s: &BTreeSet<EventId>,
+        porf_s: &impl EventMembership,
         revisiting: EventId,
     ) -> bool {
         if !self.time_predicate && !self.canon_free {
@@ -452,7 +574,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         &mut self,
         g: &ExecutionGraph,
         ep: EventId,
-        porf_s: &BTreeSet<EventId>,
+        porf_s: &impl EventMembership,
         revisiting: EventId,
         h: &ExecutionGraph,
     ) -> bool {
@@ -547,7 +669,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         &mut self,
         g: &ExecutionGraph,
         ep: EventId,
-        porf_s: &BTreeSet<EventId>,
+        porf_s: &impl EventMembership,
         revisiting: EventId,
         h: &ExecutionGraph,
     ) -> bool {
@@ -624,7 +746,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
 pub(crate) fn viability_base(
     g: &ExecutionGraph,
     ep: EventId,
-    porf_s: &BTreeSet<EventId>,
+    porf_s: &impl EventMembership,
 ) -> ExecutionGraph {
     let previous = previous_set(g, ep, porf_s);
     let n = g.num_threads();
@@ -661,7 +783,7 @@ pub(crate) fn viability_base(
 /// the precomputed porf-prefix of `s`. Strict `<G`; `s`'s porf-prefix is preserved. `s`
 /// itself is included (it is <=G-maximal and not in its own porf-prefix), but the caller
 /// keeps it in the graph.
-fn deleted_set(g: &ExecutionGraph, r: EventId, porf_s: &BTreeSet<EventId>) -> BTreeSet<EventId> {
+fn deleted_set(g: &ExecutionGraph, r: EventId, porf_s: &impl EventMembership) -> BTreeSet<EventId> {
     let sr = g.stamp(r);
     g.all_events()
         .into_iter()
@@ -675,7 +797,11 @@ fn deleted_set(g: &ExecutionGraph, r: EventId, porf_s: &BTreeSet<EventId>) -> BT
 /// added": from the future, e sees only s's porf-prefix, which is guaranteed to remain.
 /// The set is po-prefix-closed (stamp-downward within each thread plus a porf-prefix), so
 /// `restrict` accepts it as a keep set.
-fn previous_set(g: &ExecutionGraph, e: EventId, porf_s: &BTreeSet<EventId>) -> BTreeSet<EventId> {
+fn previous_set(
+    g: &ExecutionGraph,
+    e: EventId,
+    porf_s: &impl EventMembership,
+) -> BTreeSet<EventId> {
     let se = g.stamp(e);
     g.all_events()
         .into_iter()
@@ -847,6 +973,82 @@ pub(crate) fn cons_candidates(
 mod source_order_tests {
     use super::*;
     use crate::event::{Model, Pred, Window};
+
+    #[test]
+    fn destination_scan_preserves_matching_target_order_and_empty_destinations() {
+        let mut g = ExecutionGraph::new();
+        for tid in 0..4 {
+            g.add_event(tid, Label::send(Model::Asyn, 3, "existing"));
+            let receive = g.add_event(tid, Label::recv_nb(Pred::eq("a")));
+            g.set_rf(receive, None);
+            g.add_event(tid, Label::error("separator"));
+            let receive = g.add_event(tid, Label::recv_nb(Pred::any()));
+            g.set_rf(receive, None);
+        }
+        for destination in 0..6 {
+            for payload in ["a", "b"] {
+                let checkpoint = g.checkpoint();
+                let send = g.add_event(4, Label::send(Model::Asyn, destination, payload));
+                let expected: Vec<_> = g.iter_recvs().filter(|&r| g.matches(send, r)).collect();
+                let actual: Vec<_> = destination_receives(&g, destination)
+                    .filter(|&r| g.matches(send, r))
+                    .collect();
+                assert_eq!(actual, expected);
+                if destination >= 4 {
+                    assert_eq!(destination_receives(&g, destination).next(), None);
+                }
+                g.restore_append(checkpoint, send);
+            }
+        }
+    }
+
+    #[test]
+    fn untimed_canonical_memo_preserves_revisit_targets_and_rejection_order() {
+        let mut g = ExecutionGraph::new();
+        let a = g.add_event(0, Label::send(Model::Asyn, 2, "a"));
+        let b = g.add_event(0, Label::send(Model::Asyn, 2, "b"));
+        let c = g.add_event(0, Label::send(Model::Asyn, 2, "c"));
+        for source in [c, a, b] {
+            let r = g.add_event(2, Label::recv(Pred::any()));
+            g.set_rf(r, Some(source));
+        }
+        let e = g.add_event(1, Label::send(Model::Asyn, 2, "new"));
+        assert!(consistent(&g));
+        let prefix = g.porf_prefix(e);
+        let mut memo = CanonicalMemo::default();
+        let mut memo_calls = 0;
+        let mut direct_calls = 0;
+        let mut accepted_targets = 0;
+        for r in g.iter_recvs() {
+            let stamp = g.stamp(r);
+            let mut target =
+                restrict_prefix(&g, |x| g.stamp(x) <= stamp || prefix.contains(&x) || x == e);
+            target.set_rf(r, Some(e));
+            assert!(consistent(&target));
+            let arms: Vec<_> = g
+                .iter_events()
+                .filter(|&x| g.stamp(x) > stamp && !prefix.contains(&x))
+                .chain(std::iter::once(r))
+                .collect();
+            let direct_rejection = arms.iter().copied().find(|&ep| {
+                direct_calls += 1;
+                !super::super::ownership::untimed_revisit_condition(&g, ep, &prefix)
+            });
+            let cached_rejection = arms.iter().copied().find(|&ep| {
+                !memo.get_or_insert(&g, ep, || {
+                    memo_calls += 1;
+                    super::super::ownership::untimed_revisit_condition(&g, ep, &prefix)
+                })
+            });
+            // Identical first failed arm means identical rejection callback data,
+            // or the identical child graph is explored by both engines. Inducting
+            // over these unchanged successors preserves terminal sets and counts.
+            assert_eq!(cached_rejection, direct_rejection);
+            accepted_targets += usize::from(direct_rejection.is_none());
+        }
+        assert_eq!(accepted_targets, 2);
+        assert!(memo_calls < direct_calls);
+    }
 
     #[test]
     fn self_send_order_is_rf_blind_and_does_not_filter_late_sources() {

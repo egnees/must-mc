@@ -507,3 +507,842 @@ fn collect_errors_preserves_error_free_counts() {
     assert_eq!(col.full_count(), 3);
     assert_eq!(col.error_count(), 0);
 }
+
+#[test]
+fn forward_dfs_restores_every_parent_including_stopping_paths() {
+    #[derive(Default)]
+    struct ParentSnapshots {
+        stack: std::sync::Mutex<Vec<ExecutionGraph>>,
+        visits: AtomicUsize,
+    }
+    impl Observer for ParentSnapshots {
+        fn on_visit_enter(&self, g: &ExecutionGraph) {
+            self.stack.lock().unwrap().push(g.clone());
+            self.visits.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_visit_exit(&self, g: &ExecutionGraph, _productive: bool) {
+            let parent = self.stack.lock().unwrap().pop().unwrap();
+            assert_eq!(g.canonical_key(), parent.canonical_key());
+            assert_eq!(g.num_threads(), parent.num_threads());
+            assert_eq!(g.num_sends(), parent.num_sends());
+            for e in parent.iter_events() {
+                assert_eq!(g.stamp(e), parent.stamp(e));
+            }
+        }
+    }
+    let program = SeqProgram {
+        threads: vec![
+            vec![send(2, "a"), send(2, "b")],
+            vec![send(2, "c"), Label::nondet(["x", "y"])],
+            vec![
+                Label::recv_nb(Pred::any()),
+                recv(),
+                Label::nondet(["one", "two"]),
+                Label::error("end"),
+            ],
+        ],
+    };
+    for config in [
+        Config::default(),
+        Config::default().collect_errors(),
+        Config::default().with_max_sends(2),
+        Config {
+            max_executions: Some(2),
+            ..Config::default().collect_errors()
+        },
+    ] {
+        let snapshots = ParentSnapshots::default();
+        let mut program = program.clone();
+        if config.max_executions.is_some() {
+            // Full terminals exercise the execution-cap stop; error terminals
+            // deliberately do not count against max_executions.
+            program.threads[2].pop();
+        }
+        explore(|| program.clone(), &snapshots, config);
+        assert!(snapshots.visits.load(Ordering::Relaxed) > 1);
+        assert!(snapshots.stack.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn graph_agnostic_rf_trials_preserve_metadata_counts_and_terminal_graphs() {
+    use must::{Execution, ExecutionKind};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct TrialLog {
+        counts: CountingObserver,
+        metadata: Mutex<Vec<String>>,
+        terminals: Mutex<BTreeSet<String>>,
+    }
+    impl Observer for TrialLog {
+        fn inspects_rf_trial_graphs(&self) -> bool {
+            false
+        }
+        fn inspects_revisit_targets(&self) -> bool {
+            false
+        }
+        fn on_event_added(&self, g: &ExecutionGraph, e: EventId) {
+            self.counts.on_event_added(g, e);
+            self.metadata.lock().unwrap().push(format!("event {e:?}"));
+        }
+        fn on_rf_choice(&self, g: &ExecutionGraph, r: EventId, src: Option<EventId>) {
+            self.counts.on_rf_choice(g, r, src);
+            self.metadata
+                .lock()
+                .unwrap()
+                .push(format!("rf {r:?} {src:?}"));
+        }
+        fn on_inconsistent(&self, g: &ExecutionGraph) {
+            self.counts.on_inconsistent(g);
+            self.metadata.lock().unwrap().push("inconsistent".into());
+        }
+        fn on_revisit_candidate(
+            &self,
+            _g: &ExecutionGraph,
+            r: EventId,
+            s: EventId,
+            _target: &ExecutionGraph,
+        ) {
+            self.metadata
+                .lock()
+                .unwrap()
+                .push(format!("candidate {r:?} {s:?}"));
+        }
+        fn on_revisit_arm_rejected(
+            &self,
+            _g: &ExecutionGraph,
+            r: EventId,
+            s: EventId,
+            _target: &ExecutionGraph,
+            ep: EventId,
+        ) {
+            self.metadata
+                .lock()
+                .unwrap()
+                .push(format!("arm {r:?} {s:?} {ep:?}"));
+        }
+        fn on_revisit_rejected(&self, g: &ExecutionGraph, r: EventId, s: EventId) {
+            self.counts.on_revisit_rejected(g, r, s);
+            self.metadata
+                .lock()
+                .unwrap()
+                .push(format!("rejected {r:?} {s:?}"));
+        }
+        fn on_backward_revisit(
+            &self,
+            g: &ExecutionGraph,
+            r: EventId,
+            s: EventId,
+            deleted: &BTreeSet<EventId>,
+        ) {
+            self.counts.on_backward_revisit(g, r, s, deleted);
+            self.metadata
+                .lock()
+                .unwrap()
+                .push(format!("backward {r:?} {s:?} {deleted:?}"));
+        }
+        fn on_execution(&self, exec: &Execution, kind: ExecutionKind) {
+            self.counts.on_execution(exec, kind);
+            let key = format!("{kind:?}:{}", exec.graph().canonical_key());
+            self.metadata.lock().unwrap().push(key.clone());
+            self.terminals.lock().unwrap().insert(key);
+        }
+    }
+    // This wrapper uses the default capability and forces the pre-optimization
+    // materialized path while forwarding identical metadata to the reference log.
+    struct Materialized<'a>(&'a TrialLog);
+    impl Observer for Materialized<'_> {
+        fn on_event_added(&self, g: &ExecutionGraph, e: EventId) {
+            self.0.on_event_added(g, e);
+        }
+        fn on_rf_choice(&self, g: &ExecutionGraph, r: EventId, src: Option<EventId>) {
+            assert_eq!(g.reads_from(r), src);
+            self.0.on_rf_choice(g, r, src);
+        }
+        fn on_inconsistent(&self, g: &ExecutionGraph) {
+            self.0.on_inconsistent(g);
+        }
+        fn on_revisit_candidate(
+            &self,
+            g: &ExecutionGraph,
+            r: EventId,
+            s: EventId,
+            target: &ExecutionGraph,
+        ) {
+            let prefix = g.porf_prefix(s);
+            let keep = g
+                .iter_events()
+                .filter(|&x| g.stamp(x) <= g.stamp(r) || prefix.contains(&x) || x == s)
+                .collect();
+            let mut expected = g.restrict(&keep);
+            expected.set_rf(r, Some(s));
+            assert_eq!(target.canonical_key(), expected.canonical_key());
+            self.0.on_revisit_candidate(g, r, s, target);
+        }
+        fn on_revisit_arm_rejected(
+            &self,
+            g: &ExecutionGraph,
+            r: EventId,
+            s: EventId,
+            target: &ExecutionGraph,
+            ep: EventId,
+        ) {
+            assert_eq!(target.reads_from(r), Some(s));
+            self.0.on_revisit_arm_rejected(g, r, s, target, ep);
+        }
+        fn on_revisit_rejected(&self, g: &ExecutionGraph, r: EventId, s: EventId) {
+            self.0.on_revisit_rejected(g, r, s);
+        }
+        fn on_backward_revisit(
+            &self,
+            g: &ExecutionGraph,
+            r: EventId,
+            s: EventId,
+            deleted: &BTreeSet<EventId>,
+        ) {
+            self.0.on_backward_revisit(g, r, s, deleted);
+        }
+        fn on_execution(&self, exec: &Execution, kind: ExecutionKind) {
+            self.0.on_execution(exec, kind);
+        }
+    }
+
+    let mut backwards = 0;
+    let mut rejected = 0;
+    for model in [Model::Asyn, Model::P2p, Model::Cd, Model::Mbox] {
+        let program = SeqProgram {
+            threads: vec![
+                vec![
+                    Label::send(model, 2, "a"),
+                    Label::send(model, 1, "other"),
+                    Label::send(model, 99, "outside"),
+                ],
+                vec![Label::send(model, 2, "b"), recv()],
+                vec![
+                    Label::recv_nb(Pred::any()),
+                    Label::recv(Pred::new("selective", |v| v == "a")),
+                    Label::error("end"),
+                ],
+            ],
+        };
+        let base = Config::default()
+            .collect_errors()
+            .with_priorities(vec![2, 1, 0]);
+        let mut configs = vec![
+            base.clone(),
+            base.clone()
+                .with_source_order(must::SourceOrder::SelfSendFirst),
+        ];
+        if matches!(model, Model::Asyn | Model::P2p) {
+            configs.extend([
+                base.clone().with_time_filter(),
+                base.clone().with_time_zombie(),
+                base.with_time_predicate(),
+            ]);
+        }
+        for (config_index, config) in configs.into_iter().enumerate() {
+            let fast = TrialLog::default();
+            let reference = TrialLog::default();
+            let materialized = Materialized(&reference);
+            assert!(!fast.inspects_rf_trial_graphs());
+            assert!(fast.observes_rejected_rf_trials());
+            assert!(materialized.observes_rejected_rf_trials());
+            assert!(materialized.inspects_rf_trial_graphs());
+            explore(|| program.clone(), &fast, config.clone());
+            explore(|| program.clone(), &materialized, config);
+            assert_eq!(
+                *fast.metadata.lock().unwrap(),
+                *reference.metadata.lock().unwrap()
+            );
+            assert_eq!(
+                *fast.terminals.lock().unwrap(),
+                *reference.terminals.lock().unwrap()
+            );
+            assert_eq!(fast.counts.events_added(), reference.counts.events_added());
+            assert_eq!(fast.counts.rf_choices(), reference.counts.rf_choices());
+            assert_eq!(fast.counts.inconsistent(), reference.counts.inconsistent());
+            assert_eq!(
+                fast.counts.backward_revisits(),
+                reference.counts.backward_revisits()
+            );
+            assert_eq!(
+                fast.counts.revisits_rejected(),
+                reference.counts.revisits_rejected()
+            );
+            if model == Model::Asyn && config_index == 0 {
+                assert!(fast.counts.backward_revisits() > 0);
+                assert!(fast.counts.revisits_rejected() > 0);
+            }
+            backwards += fast.counts.backward_revisits();
+            rejected += fast.counts.revisits_rejected();
+            assert!(fast.counts.inconsistent() > 0);
+            assert!(!fast.terminals.lock().unwrap().is_empty());
+        }
+    }
+    assert!(backwards > 0);
+    assert!(rejected > 0);
+}
+
+#[test]
+fn default_revisit_target_capability_is_conservative_even_with_ignored_rf_graphs() {
+    #[derive(Default)]
+    struct TargetInspector(AtomicUsize);
+    impl Observer for TargetInspector {
+        fn inspects_rf_trial_graphs(&self) -> bool {
+            false
+        }
+        fn on_revisit_candidate(
+            &self,
+            host: &ExecutionGraph,
+            r: EventId,
+            s: EventId,
+            target: &ExecutionGraph,
+        ) {
+            assert_eq!(target.reads_from(r), Some(s));
+            assert_ne!(host.reads_from(r), target.reads_from(r));
+            assert!(must::consistent(target));
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let program = SeqProgram {
+        threads: vec![
+            vec![Label::send(Model::Asyn, 2, "a")],
+            vec![Label::send(Model::Asyn, 2, "b")],
+            vec![recv()],
+        ],
+    };
+    let observer = (
+        must::EventCountingObserver::default(),
+        TargetInspector::default(),
+    );
+    assert!(!observer.inspects_rf_trial_graphs());
+    assert!(observer.inspects_revisit_targets());
+    explore(
+        || program.clone(),
+        &observer,
+        Config::default().with_priorities(vec![2, 0, 1]),
+    );
+    assert!(observer.1 .0.load(Ordering::Relaxed) > 0);
+    assert_eq!(observer.0.full(), 2);
+}
+
+#[test]
+fn graph_inspecting_observer_in_a_tuple_keeps_exact_rejected_rf_snapshots() {
+    use must::observer::{NullObserver, RecordingObserver, StepKind};
+
+    let program = SeqProgram {
+        threads: vec![
+            vec![send(2, "a"), send(99, "outside")],
+            vec![send(2, "b")],
+            vec![recv()],
+        ],
+    };
+    let observers = (CountingObserver::default(), RecordingObserver::new());
+    assert!(!NullObserver.inspects_rf_trial_graphs());
+    assert!(!observers.0.inspects_rf_trial_graphs());
+    assert!(observers.inspects_rf_trial_graphs());
+    explore(|| program.clone(), &observers, Config::default());
+    let mut rejected_wrong_destination = false;
+    let mut rejected_blocking_bottom = false;
+    for step in observers.1.steps() {
+        match step.kind {
+            StepKind::RfChoice { r, src } => {
+                assert_eq!(step.graph.reads_from(r), src);
+                rejected_wrong_destination |=
+                    src.is_some_and(|s| step.graph.label(s).dst() == Some(99));
+                rejected_blocking_bottom |= src.is_none();
+            }
+            StepKind::Inconsistent => assert!(!must::consistency::consistent(&step.graph)),
+            _ => {}
+        }
+    }
+    assert!(rejected_wrong_destination);
+    assert!(rejected_blocking_bottom);
+}
+
+#[test]
+fn rejected_rf_trial_capability_is_independent_and_composes_conservatively() {
+    use must::observer::{EventCountingObserver, NullObserver, RecordingObserver};
+    #[derive(Default)]
+    struct MetadataCounter(AtomicUsize);
+    impl Observer for MetadataCounter {
+        fn inspects_rf_trial_graphs(&self) -> bool {
+            false
+        }
+        fn on_rf_choice(&self, _: &ExecutionGraph, _: EventId, _: Option<EventId>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    assert!(!NullObserver.observes_rejected_rf_trials());
+    assert!(!EventCountingObserver::default().observes_rejected_rf_trials());
+    assert!(CountingObserver::default().observes_rejected_rf_trials());
+    assert!(RecordingObserver::new().observes_rejected_rf_trials());
+    assert!(!(NullObserver, EventCountingObserver::default()).observes_rejected_rf_trials());
+    let observers = (EventCountingObserver::default(), MetadataCounter::default());
+    assert!(!observers.inspects_rf_trial_graphs());
+    assert!(observers.observes_rejected_rf_trials());
+    let program = SeqProgram {
+        threads: vec![
+            vec![send(1, "a"), send(1, "b"), send(99, "outside")],
+            vec![recv(), recv()],
+        ],
+    };
+    let reference = CountingObserver::default();
+    explore(|| program.clone(), &observers, Config::default());
+    explore(|| program.clone(), &reference, Config::default());
+    assert_eq!(
+        observers.1 .0.load(Ordering::Relaxed),
+        reference.rf_choices()
+    );
+    assert!(reference.inconsistent() > 0);
+}
+
+#[test]
+fn indexed_unread_sources_preserve_terminal_multisets_events_and_cutoffs() {
+    use must::{Execution, ExecutionKind, SourceOrder, Window};
+    use std::sync::Mutex;
+
+    struct Outcomes {
+        indexed: bool,
+        events: AtomicUsize,
+        bottoms: AtomicUsize,
+        terminals: Mutex<BTreeMap<String, usize>>,
+        cuts: Mutex<BTreeMap<String, usize>>,
+    }
+    impl Outcomes {
+        fn new(indexed: bool) -> Self {
+            Self {
+                indexed,
+                events: AtomicUsize::new(0),
+                bottoms: AtomicUsize::new(0),
+                terminals: Mutex::new(BTreeMap::new()),
+                cuts: Mutex::new(BTreeMap::new()),
+            }
+        }
+    }
+    impl Observer for Outcomes {
+        fn observes_rejected_rf_trials(&self) -> bool {
+            !self.indexed
+        }
+        fn inspects_rf_trial_graphs(&self) -> bool {
+            false
+        }
+        fn inspects_revisit_targets(&self) -> bool {
+            false
+        }
+        fn on_event_added(&self, _: &ExecutionGraph, _: EventId) {
+            self.events.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_execution(&self, execution: &Execution, kind: ExecutionKind) {
+            let key = format!(
+                "{kind:?}:{}:{:?}",
+                execution.canonical_key(),
+                execution.labels()
+            );
+            *self.terminals.lock().unwrap().entry(key).or_default() += 1;
+            if execution
+                .graph()
+                .iter_recvs()
+                .any(|r| execution.graph().reads_from(r).is_none())
+            {
+                self.bottoms.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn on_send_limit(&self, graph: &ExecutionGraph, limit: usize) {
+            let key = format!("{limit}:{}", graph.canonical_key());
+            *self.cuts.lock().unwrap().entry(key).or_default() += 1;
+        }
+    }
+    fn compare(program: &SeqProgram, config: Config) -> usize {
+        let indexed = Outcomes::new(true);
+        let reference = Outcomes::new(false);
+        explore(|| program.clone(), &indexed, config.clone());
+        explore(|| program.clone(), &reference, config);
+        assert_eq!(
+            *indexed.terminals.lock().unwrap(),
+            *reference.terminals.lock().unwrap()
+        );
+        assert_eq!(
+            *indexed.cuts.lock().unwrap(),
+            *reference.cuts.lock().unwrap()
+        );
+        assert_eq!(
+            indexed.events.load(Ordering::Relaxed),
+            reference.events.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            indexed.bottoms.load(Ordering::Relaxed),
+            reference.bottoms.load(Ordering::Relaxed)
+        );
+        indexed.bottoms.load(Ordering::Relaxed)
+    }
+    for model in [Model::Asyn, Model::P2p, Model::Cd, Model::Mbox] {
+        let program = SeqProgram {
+            threads: vec![
+                vec![
+                    Label::send(model, 2, "a"),
+                    Label::send(model, 1, "other"),
+                    Label::send(model, 99, "outside"),
+                ],
+                vec![Label::send(model, 2, "b"), recv()],
+                vec![
+                    Label::recv_nb(Pred::any()),
+                    Label::recv(Pred::eq("a")),
+                    Label::error("end"),
+                ],
+            ],
+        };
+        let base = Config::default()
+            .collect_errors()
+            .with_priorities(vec![2, 1, 0]);
+        assert!(
+            compare(&program, base.clone()) > 0,
+            "nonblocking bottom must remain for {model:?}"
+        );
+        for order in [SourceOrder::EventId, SourceOrder::SelfSendFirst] {
+            for threads in [1, 4] {
+                compare(
+                    &program,
+                    base.clone().with_source_order(order).with_threads(threads),
+                );
+            }
+        }
+        compare(&program, base.clone().with_max_sends(2));
+        if matches!(model, Model::Asyn | Model::P2p) {
+            compare(&program, base.clone().with_time_filter());
+            compare(&program, base.clone().with_time_zombie());
+            compare(&program, base.with_time_predicate());
+        }
+    }
+    // The destination index and the source snapshot both exceed the inline capacity.
+    let mut many = vec![Label::send(Model::Asyn, 1, "message"); 35];
+    many.push(Label::send(Model::Asyn, 99, "outside"));
+    let program = SeqProgram {
+        threads: vec![many, vec![Label::recv_nb(Pred::any())]],
+    };
+    assert!(compare(&program, Config::default().with_priorities(vec![1, 0])) > 0);
+
+    let timed = SeqProgram {
+        threads: vec![
+            vec![
+                Label::send_within(Model::P2p, 1, "a", Window::new(0, 2)),
+                Label::send_within(Model::P2p, 99, "outside", Window::new(0, 2)),
+            ],
+            vec![Label::recv_timeout_timed(Pred::eq("a"), Window::new(2, 3))],
+        ],
+    };
+    compare(
+        &timed,
+        Config::default()
+            .collect_errors()
+            .with_mailbox_time()
+            .with_time_filter()
+            .with_priorities(vec![1, 0]),
+    );
+}
+
+#[test]
+fn continuation_sidecars_match_plain_replay_across_branches_cuts_and_eviction() {
+    use must::{Execution, ExecutionKind, ProgramCursor, SourceOrder, Tid, TraceLabel, Window};
+    use std::cell::{Cell, RefCell};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct Decisions {
+        model: Model,
+    }
+    impl Program for Decisions {
+        fn num_threads(&self) -> usize {
+            3
+        }
+        fn next(&self, traces: &[Vec<Option<Val>>]) -> Vec<ThreadNext> {
+            traces
+                .iter()
+                .enumerate()
+                .map(|(tid, trace)| self.next_thread(tid, trace))
+                .collect()
+        }
+        fn next_thread(&self, tid: Tid, trace: &[Option<Val>]) -> ThreadNext {
+            let next = match (tid, trace.len()) {
+                (0, 0) => Label::send(self.model, 2, "a"),
+                (0, 1) => Label::recv_nb(Pred::new("echo", |v| v.starts_with("echo:"))),
+                (1, 0) => Label::send(self.model, 2, "b"),
+                (1, 1) => Label::send(self.model, 99, "outside"),
+                (2, 0) => Label::recv_nb(Pred::any()),
+                (2, 1) => Label::recv(Pred::any()),
+                (2, 2) => {
+                    let value = trace[0].map_or("bottom", must::intern::resolve);
+                    Label::send(self.model, 0, format!("echo:{value}"))
+                }
+                (2, 3) => Label::nondet(["x", "y"]),
+                (2, 4) => Label::error(format!("end:{}", must::intern::resolve(trace[3].unwrap()))),
+                _ => return ThreadNext::Finished,
+            };
+            ThreadNext::Next(next)
+        }
+        fn labels(&self, traces: &[Vec<Option<Val>>]) -> Vec<TraceLabel> {
+            traces
+                .iter()
+                .enumerate()
+                .flat_map(|(tid, trace)| {
+                    trace
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(position, value)| {
+                            value.map(|value| TraceLabel {
+                                tid,
+                                position: position + 1,
+                                value,
+                            })
+                        })
+                })
+                .collect()
+        }
+    }
+
+    #[derive(Default)]
+    struct Calls {
+        replay: AtomicUsize,
+        advanced: AtomicUsize,
+        refused: AtomicUsize,
+    }
+    struct Handles<P> {
+        inner: P,
+        owner: u64,
+        epoch: Cell<u64>,
+        attempts: Cell<usize>,
+        evict: bool,
+        states: RefCell<Vec<(Tid, Vec<Option<Val>>)>>,
+        calls: Arc<Calls>,
+    }
+    impl<P: Program> Handles<P> {
+        fn new(inner: P, evict: bool, calls: Arc<Calls>) -> Self {
+            static OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            Self {
+                inner,
+                owner: OWNER.fetch_add(1, Ordering::Relaxed),
+                epoch: Cell::new(1),
+                attempts: Cell::new(0),
+                evict,
+                states: RefCell::new(Vec::new()),
+                calls,
+            }
+        }
+        fn remember(&self, tid: Tid, trace: Vec<Option<Val>>) -> ProgramCursor {
+            let mut states = self.states.borrow_mut();
+            let index = states.len();
+            states.push((tid, trace));
+            ProgramCursor::new([self.owner, self.epoch.get(), index as u64])
+        }
+    }
+    impl<P: Program> Program for Handles<P> {
+        fn num_threads(&self) -> usize {
+            self.inner.num_threads()
+        }
+        fn next(&self, traces: &[Vec<Option<Val>>]) -> Vec<ThreadNext> {
+            self.inner.next(traces)
+        }
+        fn next_thread(&self, tid: Tid, trace: &[Option<Val>]) -> ThreadNext {
+            self.inner.next_thread(tid, trace)
+        }
+        fn labels(&self, traces: &[Vec<Option<Val>>]) -> Vec<TraceLabel> {
+            self.inner.labels(traces)
+        }
+        fn next_thread_cursor(
+            &self,
+            tid: Tid,
+            trace: &[Option<Val>],
+        ) -> (ThreadNext, Option<ProgramCursor>) {
+            self.calls.replay.fetch_add(1, Ordering::Relaxed);
+            (
+                self.inner.next_thread(tid, trace),
+                Some(self.remember(tid, trace.to_vec())),
+            )
+        }
+        fn advance_thread(
+            &self,
+            tid: Tid,
+            cursor: ProgramCursor,
+            entry: Option<Val>,
+        ) -> Option<(ThreadNext, ProgramCursor)> {
+            let attempt = self.attempts.get() + 1;
+            self.attempts.set(attempt);
+            if self.evict && attempt % 3 == 0 {
+                self.epoch.set(self.epoch.get() + 1);
+                self.states.borrow_mut().clear();
+            }
+            let [owner, epoch, index] = cursor.words();
+            let state = if owner == self.owner && epoch == self.epoch.get() {
+                self.states
+                    .borrow()
+                    .get(usize::try_from(index).ok()?)
+                    .filter(|(thread, _)| *thread == tid)
+                    .cloned()
+            } else {
+                None
+            };
+            let Some((_, mut trace)) = state else {
+                self.calls.refused.fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
+            trace.push(entry);
+            let next = self.inner.next_thread(tid, &trace);
+            let cursor = self.remember(tid, trace);
+            self.calls.advanced.fetch_add(1, Ordering::Relaxed);
+            Some((next, cursor))
+        }
+    }
+    struct Plain<P>(P);
+    impl<P: Program> Program for Plain<P> {
+        fn num_threads(&self) -> usize {
+            self.0.num_threads()
+        }
+        fn next(&self, traces: &[Vec<Option<Val>>]) -> Vec<ThreadNext> {
+            self.0.next(traces)
+        }
+        fn next_thread(&self, tid: Tid, trace: &[Option<Val>]) -> ThreadNext {
+            self.0.next_thread(tid, trace)
+        }
+        fn labels(&self, traces: &[Vec<Option<Val>>]) -> Vec<TraceLabel> {
+            self.0.labels(traces)
+        }
+    }
+    #[derive(Default)]
+    struct Results {
+        events: AtomicUsize,
+        terminals: Mutex<BTreeMap<String, usize>>,
+        cuts: Mutex<BTreeMap<String, usize>>,
+    }
+    impl Observer for Results {
+        fn observes_rejected_rf_trials(&self) -> bool {
+            false
+        }
+        fn inspects_rf_trial_graphs(&self) -> bool {
+            false
+        }
+        fn inspects_revisit_targets(&self) -> bool {
+            false
+        }
+        fn on_event_added(&self, _: &ExecutionGraph, _: EventId) {
+            self.events.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_execution(&self, execution: &Execution, kind: ExecutionKind) {
+            let key = format!(
+                "{kind:?}:{}:{:?}",
+                execution.canonical_key(),
+                execution.labels()
+            );
+            *self.terminals.lock().unwrap().entry(key).or_default() += 1;
+        }
+        fn on_send_limit(&self, graph: &ExecutionGraph, limit: usize) {
+            *self
+                .cuts
+                .lock()
+                .unwrap()
+                .entry(format!("{limit}:{}", graph.canonical_key()))
+                .or_default() += 1;
+        }
+    }
+    fn compare<P: Program + Clone + Sync>(
+        program: P,
+        config: Config,
+        evict: bool,
+        calls: &Arc<Calls>,
+    ) {
+        let resumed = Results::default();
+        let reference = Results::default();
+        explore(
+            || Handles::new(program.clone(), evict, Arc::clone(calls)),
+            &resumed,
+            config.clone(),
+        );
+        explore(|| Plain(program.clone()), &reference, config);
+        assert_eq!(
+            *resumed.terminals.lock().unwrap(),
+            *reference.terminals.lock().unwrap()
+        );
+        assert_eq!(
+            *resumed.cuts.lock().unwrap(),
+            *reference.cuts.lock().unwrap()
+        );
+        assert_eq!(
+            resumed.events.load(Ordering::Relaxed),
+            reference.events.load(Ordering::Relaxed)
+        );
+    }
+    let calls = Arc::new(Calls::default());
+    for model in [Model::Asyn, Model::P2p, Model::Cd, Model::Mbox] {
+        let program = Decisions { model };
+        let base = Config::default()
+            .collect_errors()
+            .with_priorities(vec![2, 1, 0]);
+        for evict in [false, true] {
+            for order in [SourceOrder::EventId, SourceOrder::SelfSendFirst] {
+                for threads in [1, 4] {
+                    compare(
+                        program.clone(),
+                        base.clone().with_source_order(order).with_threads(threads),
+                        evict,
+                        &calls,
+                    );
+                }
+            }
+            compare(
+                program.clone(),
+                base.clone().with_max_sends(3),
+                evict,
+                &calls,
+            );
+            compare(
+                program.clone(),
+                Config {
+                    max_executions: Some(2),
+                    ..base.clone()
+                },
+                evict,
+                &calls,
+            );
+            compare(
+                program.clone(),
+                Config::default().with_priorities(vec![2, 1, 0]),
+                evict,
+                &calls,
+            );
+        }
+        if matches!(model, Model::Asyn | Model::P2p) {
+            compare(
+                program.clone(),
+                base.clone().with_time_filter(),
+                true,
+                &calls,
+            );
+            compare(
+                program.clone(),
+                base.clone().with_time_zombie(),
+                true,
+                &calls,
+            );
+            compare(program, base.with_time_predicate(), true, &calls);
+        }
+    }
+    let timed = SeqProgram {
+        threads: vec![
+            vec![Label::send_within(Model::P2p, 1, "a", Window::new(0, 2))],
+            vec![Label::recv_timeout_timed(Pred::eq("a"), Window::new(2, 3))],
+        ],
+    };
+    compare(
+        timed,
+        Config::default()
+            .collect_errors()
+            .with_mailbox_time()
+            .with_time_filter()
+            .with_priorities(vec![1, 0]),
+        true,
+        &calls,
+    );
+    assert!(calls.replay.load(Ordering::Relaxed) > 0);
+    assert!(calls.advanced.load(Ordering::Relaxed) > 0);
+    assert!(calls.refused.load(Ordering::Relaxed) > 0);
+}

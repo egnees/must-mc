@@ -76,6 +76,24 @@ impl ThreadNext {
     }
 }
 
+/// An opaque, program-owned continuation handle for one exact local event trace.
+///
+/// Handles are optimization state, never part of a graph or source ordering.
+/// Their three words have no meaning to the explorer. Implementations must
+/// validate owner, thread and lifetime before advancing; stale or unrelated
+/// handles must return `None` from [`Program::advance_thread`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgramCursor([u64; 3]);
+
+impl ProgramCursor {
+    pub const fn new(words: [u64; 3]) -> Self {
+        Self(words)
+    }
+    pub const fn words(self) -> [u64; 3] {
+        self.0
+    }
+}
+
 /// A program as seen by the explorer: a total, deterministic function from per-thread
 /// traces to per-thread next events.
 pub trait Program {
@@ -101,6 +119,34 @@ pub trait Program {
             *slot = trace.to_vec();
         }
         self.next(&traces).swap_remove(tid)
+    }
+
+    /// Replay one thread and optionally identify its exact committed prefix.
+    /// The answer must equal [`Self::next_thread`] for the same trace. Returning
+    /// no handle retains ordinary replay behavior without changing semantics.
+    fn next_thread_cursor(
+        &self,
+        tid: Tid,
+        trace: &[Option<Val>],
+    ) -> (ThreadNext, Option<ProgramCursor>) {
+        (self.next_thread(tid, trace), None)
+    }
+
+    /// Advance an issued prefix handle by one committed event outcome.
+    ///
+    /// `entry` is the full per-event trace entry, including send/error `None`,
+    /// receive bottom, or a nondet choice. A successful answer describes exactly
+    /// the handle's original trace followed by `entry`, and its new handle must
+    /// identify that extended trace. Handles cannot depend on interleaving or
+    /// other threads. Reject stale, foreign, malformed or unsupported handles
+    /// with `None`: the explorer then replays the complete extended trace.
+    fn advance_thread(
+        &self,
+        _tid: Tid,
+        _cursor: ProgramCursor,
+        _entry: Option<Val>,
+    ) -> Option<(ThreadNext, ProgramCursor)> {
+        None
     }
 
     /// Deterministic annotations reconstructed from each thread's committed trace,

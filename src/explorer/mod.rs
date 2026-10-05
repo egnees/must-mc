@@ -2,8 +2,8 @@
 //!
 //! [`explore`] is the entry point: it walks every consistent execution graph starting
 //! from the empty one. The backward-revisit half of the algorithm lives in [`revisit`].
-//! Each recursive branch works on a clone of the graph, so no branch ever observes
-//! another's edits.
+//! Forward branches append in place and restore the exact parent on return.
+//! Backward cuts, donated subtrees, and observer snapshots own independent graphs.
 
 mod execution;
 pub mod frozen;
@@ -22,10 +22,315 @@ use crate::consistency::consistent;
 use crate::event::{EventId, Label, Tid, Val};
 use crate::graph::ExecutionGraph;
 use crate::observer::Observer;
-use crate::program::{Program, ThreadNext};
-use crate::scheduler::{pick_with_time_semantics, traces_of, NextStep};
+use crate::program::{Program, ProgramCursor, ThreadNext};
+use crate::scheduler::{pick_with_read_marks, pooled_traces_of, traces_of, NextStep};
 
 use parallel::Spawner;
+
+thread_local! {
+    static UNREAD_POOL: std::cell::RefCell<Vec<Vec<usize>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static UNREAD_SOURCE_POOL: std::cell::RefCell<Vec<Vec<Vec<EventId>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static CURSOR_POOL: std::cell::RefCell<Vec<Vec<Option<ProgramCursor>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Committed forward RF state. Each worker rebuilds it for a root or backward
+/// cut; append/pop branches update it together with the graph and local traces.
+/// Destinations outside the program have no scheduled receiver and need no slot.
+struct ForwardReads {
+    marks: crate::graph::PooledMarks,
+    unread: Vec<usize>,
+    /// Ordered unread sends per destination, maintained only for observers that
+    /// explicitly permit omitting structurally rejected RF trials.
+    sources: Option<Vec<Vec<EventId>>>,
+    /// Continuations paired with this root's local traces/nexts. Unsupported
+    /// programs allocate no sidecar; cuts and donated roots rebuild from None.
+    cursors: Option<Vec<Option<ProgramCursor>>>,
+}
+
+impl ForwardReads {
+    fn new(g: &ExecutionGraph, threads: usize, index_sources: bool) -> Self {
+        let mut marks = crate::graph::PooledMarks::take();
+        crate::consistency::mark_read_sources(g, None, &mut marks);
+        let mut unread = UNREAD_POOL.with(|pool| pool.borrow_mut().pop().unwrap_or_default());
+        unread.clear();
+        unread.resize(threads, 0);
+        let mut sources = index_sources.then(|| {
+            let mut rows =
+                UNREAD_SOURCE_POOL.with(|pool| pool.borrow_mut().pop().unwrap_or_default());
+            for row in &mut rows {
+                row.clear();
+            }
+            rows.resize_with(threads, Vec::new);
+            rows
+        });
+        for send in g.iter_sends() {
+            if !marks.contains(send) {
+                if let Some(dst) = g.label(send).dst().filter(|&dst| dst < threads) {
+                    unread[dst] += 1;
+                    if let Some(rows) = &mut sources {
+                        // iter_sends already yields the exact source tiebreaker order.
+                        rows[dst].push(send);
+                    }
+                }
+            }
+        }
+        Self {
+            marks,
+            unread,
+            sources,
+            cursors: None,
+        }
+    }
+
+    fn cursor(&self, tid: Tid) -> Option<ProgramCursor> {
+        self.cursors.as_ref().and_then(|cursors| cursors[tid])
+    }
+
+    fn set_cursor(&mut self, tid: Tid, cursor: Option<ProgramCursor>) {
+        if cursor.is_none() && self.cursors.is_none() {
+            return;
+        }
+        let threads = self.unread.len();
+        let cursors = self.cursors.get_or_insert_with(|| {
+            let mut cursors = CURSOR_POOL.with(|pool| pool.borrow_mut().pop().unwrap_or_default());
+            cursors.clear();
+            cursors.resize(threads, None);
+            cursors
+        });
+        cursors[tid] = cursor;
+    }
+
+    fn send_added(&mut self, g: &ExecutionGraph, send: EventId) {
+        self.marks.grow(g);
+        if let Some(dst) = g.label(send).dst().filter(|&dst| dst < self.unread.len()) {
+            self.unread[dst] += 1;
+            if let Some(rows) = &mut self.sources {
+                let row = &mut rows[dst];
+                let position = row
+                    .binary_search(&send)
+                    .expect_err("a fresh send cannot already be indexed");
+                row.insert(position, send);
+            }
+        }
+    }
+
+    fn send_removed(&mut self, g: &ExecutionGraph, send: EventId) {
+        debug_assert!(!self.marks.contains(send));
+        if let Some(dst) = g.label(send).dst().filter(|&dst| dst < self.unread.len()) {
+            self.unread[dst] -= 1;
+            if let Some(rows) = &mut self.sources {
+                let row = &mut rows[dst];
+                let position = row
+                    .binary_search(&send)
+                    .expect("the removed unread send must be indexed");
+                row.remove(position);
+            }
+        }
+    }
+
+    fn consume(&mut self, receiver: Tid, source: EventId) {
+        let fresh = self.marks.insert(source);
+        debug_assert!(fresh, "a consistent receive must consume an unread send");
+        self.unread[receiver] -= 1;
+        if let Some(rows) = &mut self.sources {
+            let row = &mut rows[receiver];
+            let position = row
+                .binary_search(&source)
+                .expect("an unread source must be indexed");
+            row.remove(position);
+        }
+    }
+
+    fn restore_consume(&mut self, receiver: Tid, source: EventId) {
+        let removed = self.marks.remove(source);
+        debug_assert!(removed, "nested visits must restore committed RF marks");
+        self.unread[receiver] += 1;
+        if let Some(rows) = &mut self.sources {
+            let row = &mut rows[receiver];
+            let position = row
+                .binary_search(&source)
+                .expect_err("a consumed source must not be indexed");
+            row.insert(position, source);
+        }
+    }
+
+    fn matches_graph(&self, g: &ExecutionGraph) -> bool {
+        g.iter_sends()
+            .all(|send| self.marks.contains(send) == g.is_read(send))
+            && self.unread.iter().enumerate().all(|(tid, &count)| {
+                count
+                    == g.iter_sends()
+                        .filter(|&send| g.label(send).dst() == Some(tid) && !g.is_read(send))
+                        .count()
+            })
+            && self.sources.as_ref().is_none_or(|rows| {
+                rows.iter().enumerate().all(|(tid, sources)| {
+                    *sources
+                        == g.iter_sends()
+                            .filter(|&send| g.label(send).dst() == Some(tid) && !g.is_read(send))
+                            .collect::<Vec<_>>()
+                })
+            })
+    }
+}
+
+impl std::ops::Deref for ForwardReads {
+    type Target = crate::graph::Marks;
+    fn deref(&self) -> &Self::Target {
+        &self.marks
+    }
+}
+
+impl Drop for ForwardReads {
+    fn drop(&mut self) {
+        UNREAD_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < 32 {
+                pool.push(std::mem::take(&mut self.unread));
+            }
+        });
+        if let Some(rows) = self.sources.take() {
+            // Bound retained buffers independently of the model's thread count.
+            if rows.capacity() <= 256 && rows.iter().map(Vec::capacity).sum::<usize>() <= 4096 {
+                let _ = UNREAD_SOURCE_POOL.try_with(|pool| {
+                    let mut pool = pool.borrow_mut();
+                    if pool.len() < 32 {
+                        pool.push(rows);
+                    }
+                });
+            }
+        }
+        if let Some(cursors) = self.cursors.take() {
+            if cursors.capacity() <= 256 {
+                let _ = CURSOR_POOL.try_with(|pool| {
+                    let mut pool = pool.borrow_mut();
+                    if pool.len() < 32 {
+                        pool.push(cursors);
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod forward_read_tests {
+    use super::*;
+    use crate::event::{Model, Pred};
+
+    #[test]
+    fn committed_counters_restore_across_nested_forward_branches_and_reused_ids() {
+        let mut g = ExecutionGraph::new();
+        let old = g.add_event(0, Label::send(Model::Asyn, 1, "old"));
+        let held = g.add_event(1, Label::recv(Pred::any()));
+        g.set_rf(held, Some(old));
+        g.add_event(0, Label::send(Model::Asyn, 99, "outside"));
+        let mut read = ForwardReads::new(&g, 3, true);
+        assert_eq!(read.unread, [0, 0, 0]);
+        assert!(read.matches_graph(&g));
+
+        let send_checkpoint = g.checkpoint();
+        let source = g.add_event(2, Label::send(Model::Asyn, 1, "new"));
+        read.send_added(&g, source);
+        assert_eq!(read.unread, [0, 1, 0]);
+        assert!(read.matches_graph(&g));
+        let retained = g.clone();
+
+        let recv_checkpoint = g.checkpoint();
+        let receive = g.add_event(1, Label::recv_nb(Pred::any()));
+        g.set_rf_forward(receive, Some(source));
+        read.consume(1, source);
+        assert_eq!(read.unread, [0, 0, 0]);
+        assert!(read.matches_graph(&g));
+        read.restore_consume(1, source);
+        g.set_rf_forward(receive, None);
+        assert!(read.matches_graph(&g));
+        g.restore_append(recv_checkpoint, receive);
+        read.send_removed(&g, source);
+        g.restore_append(send_checkpoint, source);
+        assert_eq!(read.unread, [0, 0, 0]);
+        assert!(read.matches_graph(&g));
+
+        let sibling_checkpoint = g.checkpoint();
+        let sibling = g.add_event(2, Label::send(Model::Asyn, 0, "sibling"));
+        assert_eq!(sibling, source);
+        read.send_added(&g, sibling);
+        assert_eq!(read.unread, [1, 0, 0]);
+        assert!(read.matches_graph(&g));
+        read.send_removed(&g, sibling);
+        g.restore_append(sibling_checkpoint, sibling);
+        assert!(read.matches_graph(&g));
+        assert_eq!(ForwardReads::new(&retained, 3, true).unread, [0, 1, 0]);
+    }
+
+    #[test]
+    fn backward_cut_rebuilds_counts_when_a_receive_disappears() {
+        let mut g = ExecutionGraph::new();
+        let source = g.add_event(0, Label::send(Model::Asyn, 1, "message"));
+        let receive = g.add_event(1, Label::recv(Pred::any()));
+        g.set_rf(receive, Some(source));
+        let parent = ForwardReads::new(&g, 2, true);
+        assert_eq!(parent.unread, [0, 0]);
+        let keep = [source].into_iter().collect();
+        let cut = g.restrict(&keep);
+        let rebuilt = ForwardReads::new(&cut, 2, true);
+        assert_eq!(rebuilt.unread, [0, 1]);
+        assert!(rebuilt.matches_graph(&cut));
+        assert!(parent.matches_graph(&g));
+    }
+
+    #[test]
+    fn source_index_stays_ordered_across_long_nested_branches_and_rebuilds() {
+        let mut g = ExecutionGraph::new();
+        for position in 0..81 {
+            let sender = [2, 0, 1][position % 3];
+            let destination = if position % 7 == 0 {
+                99
+            } else {
+                3 + position % 2
+            };
+            let model = [Model::Asyn, Model::P2p, Model::Cd, Model::Mbox][position % 4];
+            g.add_event(sender, Label::send(model, destination, "message"));
+        }
+        let original = g.clone();
+        let mut read = ForwardReads::new(&g, 5, true);
+        assert!(read.matches_graph(&g));
+        assert!(read.sources.as_ref().unwrap()[3].len() > 32);
+        let sources = read.sources.as_ref().unwrap()[3].clone();
+        let mut undo = Vec::new();
+        for source in sources.into_iter().rev() {
+            let checkpoint = g.checkpoint();
+            let receive = g.add_event(3, Label::recv_nb(Pred::any()));
+            g.set_rf_forward(receive, Some(source));
+            read.consume(3, source);
+            assert!(read.matches_graph(&g));
+            undo.push((checkpoint, receive, source));
+        }
+        assert!(read.sources.as_ref().unwrap()[3].is_empty());
+        for (checkpoint, receive, source) in undo.into_iter().rev() {
+            read.restore_consume(3, source);
+            g.set_rf_forward(receive, None);
+            g.restore_append(checkpoint, receive);
+            assert!(read.matches_graph(&g));
+        }
+        assert_eq!(g.canonical_key(), original.canonical_key());
+        let checkpoint = g.checkpoint();
+        let send = g.add_event(0, Label::send(Model::Asyn, 3, "new"));
+        read.send_added(&g, send);
+        assert!(read.matches_graph(&g));
+        read.send_removed(&g, send);
+        g.restore_append(checkpoint, send);
+        assert!(read.matches_graph(&g));
+        let cut = g.restrict_to_lens(&[12, 20, 7, 0]);
+        assert!(ForwardReads::new(&cut, 5, true).matches_graph(&cut));
+        let unindexed = ForwardReads::new(&original, 5, false);
+        assert!(unindexed.sources.is_none());
+        assert!(unindexed.matches_graph(&original));
+    }
+}
 
 /// Limits for temporal certificates. A zero limit disables all certificate layers.
 /// Frozen-core extraction and its consistency trials are not bounded by `max_states`.
@@ -461,6 +766,8 @@ where
     let mut explorer = Explorer {
         program: &program,
         observer,
+        buffer_added_events: observer.allows_buffered_events(),
+        buffered_events_added: 0,
         priorities,
         source_order: config.source_order,
         stop_on_error: config.stop_on_error,
@@ -481,7 +788,7 @@ where
         stop: false,
         fork: None,
     };
-    explorer.visit(&ExecutionGraph::new());
+    explorer.visit(&mut ExecutionGraph::new());
 }
 
 fn is_permutation(p: &[Tid], n: usize) -> bool {
@@ -511,6 +818,8 @@ fn graph_has_error(g: &ExecutionGraph) -> bool {
 pub(crate) struct Explorer<'a, P: Program, O: Observer> {
     pub(crate) program: &'a P,
     pub(crate) observer: &'a O,
+    buffer_added_events: bool,
+    buffered_events_added: usize,
     pub(crate) priorities: Vec<Tid>,
     stop_on_error: bool,
     stop_on_terminal_error: bool,
@@ -574,23 +883,53 @@ pub(crate) struct Explorer<'a, P: Program, O: Observer> {
     pub(crate) fork: Option<Arc<Spawner>>,
 }
 
+impl<P: Program, O: Observer> Drop for Explorer<'_, P, O> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            if let Some(spawner) = &self.fork {
+                // An interrupted visit cannot call complete(). Wake idle workers
+                // before flushing, so the scope can join and propagate the panic.
+                spawner.request_stop();
+            }
+        }
+        let count = std::mem::take(&mut self.buffered_events_added);
+        if count != 0 {
+            self.observer.on_events_added_batch(count);
+        }
+    }
+}
+
 impl<P: Program, O: Observer> Explorer<'_, P, O> {
+    #[inline]
+    fn event_added(&mut self, graph: &ExecutionGraph, event: EventId) {
+        if self.buffer_added_events {
+            // Atomic counters wrap as well; keep their behavior in debug builds.
+            self.buffered_events_added = self.buffered_events_added.wrapping_add(1);
+        } else {
+            self.observer.on_event_added(graph, event);
+        }
+    }
     /// `Visit_P(G)` (Algorithm 1, lines 2-14), building the per-thread `(traces, nexts)`
     /// state from scratch. `g` is consistent on entry (its caller tested it — line 7's
     /// `consistent_after_recv`, line 13's `consistent` — or it is the empty graph). Used
     /// wherever the parent's state does
     /// not carry over: the root, a subtree taken from the work queue, and after a backward
     /// revisit restructures the graph.
-    pub(crate) fn visit(&mut self, g: &ExecutionGraph) {
+    pub(crate) fn visit(&mut self, g: &mut ExecutionGraph) {
         if self.stopping() {
             return;
         }
         // `traces[i]` is thread `i`'s per-event trace, `nexts[i]` its next event under that
         // trace. Both are threaded down the recursion; adding an event mutates only the
         // acting thread's entry, so only that thread's next is recomputed.
-        let mut traces = traces_of(g, self.program.num_threads());
+        let mut traces = pooled_traces_of(g, self.program.num_threads());
         let mut nexts = self.program.next(&traces);
-        self.visit_step(g, &mut traces, &mut nexts);
+        let mut read = ForwardReads::new(
+            g,
+            self.program.num_threads(),
+            !self.observer.observes_rejected_rf_trials(),
+        );
+        self.visit_step(g, &mut traces, &mut nexts, &mut read);
     }
 
     /// `Visit_P(G)` given the already-computed `(traces, nexts)`. Picks the next event from
@@ -599,9 +938,10 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     /// [`visit`](Self::visit).
     fn visit_step(
         &mut self,
-        g: &ExecutionGraph,
+        g: &mut ExecutionGraph,
         traces: &mut Vec<Vec<Option<Val>>>,
         nexts: &mut Vec<ThreadNext>,
+        read: &mut ForwardReads,
     ) {
         if self.stopping() {
             return;
@@ -610,6 +950,10 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             *traces == traces_of(g, self.program.num_threads())
                 && *nexts == self.program.next(traces),
             "threaded traces/nexts drifted from a fresh recompute"
+        );
+        debug_assert!(
+            read.matches_graph(g),
+            "threaded RF marks/counters drifted from the committed graph"
         );
         for next in nexts.iter().filter_map(ThreadNext::label) {
             if self.mailbox_time {
@@ -649,12 +993,14 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         }
         // The des bit: both the predicate (T-DES) and the zombie regime run under the DES
         // insertion order; zombie changes nothing else about the walk.
-        match pick_with_time_semantics(
+        match pick_with_read_marks(
             g,
             nexts,
             &self.priorities,
             self.time_predicate || self.time_zombie,
             self.mailbox_time,
+            read,
+            Some(&read.unread),
         ) {
             // line 4: next_P(G) = nothing - a terminal execution.
             NextStep::Terminal { blocked } => {
@@ -671,19 +1017,23 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                     }
                     ExecutionKind::Blocked
                 };
-                self.record(g.clone(), kind);
+                self.record(g.clone(), kind, Some(traces));
             }
             NextStep::Event { tid, label } => match &label {
                 // line 5: error - see `visit_error`.
                 Label::Error { .. } => self.visit_error(g, tid, label),
                 // line 6: nondet - enumerate every value of the option set.
-                Label::Nondet { .. } => self.visit_nondet(g, tid, label, traces, nexts),
+                Label::Nondet { .. } => self.visit_nondet(g, tid, label, traces, nexts, read),
                 // line 7: receive - enumerate rf sources.
-                Label::Recv { .. } => self.visit_recv(g, tid, label, traces, nexts),
+                Label::Recv { .. } => self.visit_recv(g, tid, label, traces, nexts, read),
                 // lines 8-13: send - the no-revisit branch plus backward revisits.
-                Label::Send { .. } => self.visit_send(g, tid, label, traces, nexts),
+                Label::Send { .. } => self.visit_send(g, tid, label, traces, nexts, read),
             },
         }
+        debug_assert!(
+            read.matches_graph(g),
+            "a child changed its parent's RF state"
+        );
         self.observer
             .on_visit_exit(g, self.terminals_recorded > terminals_before);
     }
@@ -793,7 +1143,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     }
 
     /// Append `entry` to thread `tid`'s trace, recompute just that thread's next event, run
-    /// `body` with the updated `(traces, nexts)`, then restore both. `entry` is the value the
+    /// `body` with updated traces, nexts and its continuation sidecar, then restore all three. `entry` is the value the
     /// new event contributes to its thread's trace: the value a receive read (`None` = ⊥), a
     /// nondet's chosen value, or `None` for a send/error.
     fn with_child_memo(
@@ -802,12 +1152,30 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         entry: Option<Val>,
         traces: &mut Vec<Vec<Option<Val>>>,
         nexts: &mut Vec<ThreadNext>,
-        body: impl FnOnce(&mut Self, &mut Vec<Vec<Option<Val>>>, &mut Vec<ThreadNext>),
+        read: &mut ForwardReads,
+        body: impl FnOnce(
+            &mut Self,
+            &mut Vec<Vec<Option<Val>>>,
+            &mut Vec<ThreadNext>,
+            &mut ForwardReads,
+        ),
     ) {
         traces[tid].push(entry);
-        let saved = std::mem::replace(&mut nexts[tid], self.program.next_thread(tid, &traces[tid]));
-        body(self, traces, nexts);
+        let saved_cursor = read.cursor(tid);
+        let (next, cursor) = saved_cursor
+            .and_then(|cursor| self.program.advance_thread(tid, cursor, entry))
+            .map(|(next, cursor)| (next, Some(cursor)))
+            .unwrap_or_else(|| self.program.next_thread_cursor(tid, &traces[tid]));
+        debug_assert_eq!(
+            next,
+            self.program.next_thread(tid, &traces[tid]),
+            "cursor continuation changed the full-trace next event"
+        );
+        let saved = std::mem::replace(&mut nexts[tid], next);
+        read.set_cursor(tid, cursor);
+        body(self, traces, nexts, read);
         nexts[tid] = saved;
+        read.set_cursor(tid, saved_cursor);
         traces[tid].pop();
     }
 
@@ -845,7 +1213,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     /// whether explored inline or by another worker with an equivalent program. Each child
     /// is enqueued or recursed exactly once; the only shared effects are the notifications
     /// to the shared observer and the atomics (terminal count, stop flag).
-    fn branch(&mut self, first: &mut bool, g: &ExecutionGraph) {
+    fn branch(&mut self, first: &mut bool, g: &mut ExecutionGraph) {
         if !*first {
             if let Some(sp) = &self.fork {
                 if sp.wants_work() {
@@ -864,9 +1232,10 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     fn branch_memo(
         &mut self,
         first: &mut bool,
-        g: &ExecutionGraph,
+        g: &mut ExecutionGraph,
         traces: &mut Vec<Vec<Option<Val>>>,
         nexts: &mut Vec<ThreadNext>,
+        read: &mut ForwardReads,
     ) {
         if !*first {
             if let Some(sp) = &self.fork {
@@ -877,7 +1246,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             }
         }
         *first = false;
-        self.visit_step(g, traces, nexts);
+        self.visit_step(g, traces, nexts, read);
     }
 
     /// line 5: an `error` event.
@@ -891,70 +1260,108 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     /// terminal, where `graph_has_error` classifies it Error. Truncating the whole branch
     /// instead would hide errors reachable only after this one (`T0: assert(false) || T1:
     /// recv(); assert(...) || T2: send(1,...)` - T1's assert would never be explored).
-    fn visit_error(&mut self, g: &ExecutionGraph, tid: Tid, label: Label) {
-        let mut g2 = g.clone();
-        let e = g2.add_event(tid, label);
-        self.observer.on_event_added(&g2, e);
+    fn visit_error(&mut self, g: &mut ExecutionGraph, tid: Tid, label: Label) {
+        let checkpoint = g.checkpoint();
+        let e = g.add_event(tid, label);
+        self.event_added(g, e);
         if self.stop_on_error {
-            self.record(g2, ExecutionKind::Error);
+            self.record(g.clone(), ExecutionKind::Error, None);
             self.request_stop();
         } else {
             // The error event is now in the trace, so this thread's `next` returns
             // Finished: the recursion cannot re-pick it and cannot run past it. A single
             // child, so it is always explored inline (never donated).
-            self.visit(&g2);
+            self.visit(g);
         }
+        g.restore_append(checkpoint, e);
     }
 
     /// line 7: `for s in G.S union {bottom} do VisitIfConsistent(SetRF(G, e, s))`.
     ///
-    /// No syntactic prefilter: every send plus bottom (the no-message source) is tried,
-    /// and consistency does the filtering (a non-matching send, or bottom under a blocking
-    /// receive, fails well-formedness). The bottom option is never dropped - it is the
-    /// timeout of a non-blocking receive.
+    /// Every send plus bottom (the no-message source) is tried. Wrong-destination sends
+    /// and blocking bottom choices are rejected by well-formedness; graph-agnostic
+    /// observers can report those trials without storing the rejected RF edge. Every
+    /// source still emits its original callbacks. Non-blocking bottom remains eligible.
     fn visit_recv(
         &mut self,
-        g: &ExecutionGraph,
+        g: &mut ExecutionGraph,
         tid: Tid,
         label: Label,
         traces: &mut Vec<Vec<Option<Val>>>,
         nexts: &mut Vec<ThreadNext>,
+        read: &mut ForwardReads,
     ) {
-        let mut base = g.clone();
-        let e = base.add_event(tid, label);
+        let checkpoint = g.checkpoint();
+        let e = g.add_event(tid, label);
         // Discipline (graph.rs): assign an rf immediately after adding a receive.
-        base.set_rf(e, None);
-        self.observer.on_event_added(&base, e);
+        g.set_rf_forward(e, None);
+        self.event_added(g, e);
 
         // Sources in a deterministic order: sends in (tid, idx) order, then bottom. The
         // enumeration order does not affect the set of explored executions (each rf source
         // is a distinct child, visited once), so the natural event order suffices.
-        let mut sources: Vec<Option<EventId>> = base.iter_sends().map(Some).collect();
-        sources.push(None); // bottom
-
-        // Which sends are read by the *other* receives is the same for every source `e` is
-        // about to try, so the scan happens once here instead of inside each rf-choice's
-        // consistency check.
-        let mut read = crate::graph::PooledMarks::take();
-        crate::consistency::mark_read_sources(&base, Some(e), &mut read);
-
-        // `branch` never mutates the graph it is handed (it clones internally for its own
-        // children, and once when donating to the queue), so one `base` is reused across
-        // sources, re-pointing `e`'s rf in place for each.
-        let mut first = true;
-        for src in sources {
-            if self.stopping() {
-                return;
+        // Snapshot sources before descending: children append/pop on this same
+        // graph. Small bounded protocols need no allocation for this snapshot.
+        let mut inline = [None; 32];
+        let mut overflow = Vec::new();
+        // Opt-in observers need no callbacks for universally inconsistent
+        // wrong-destination/already-consumed sources. The maintained destination
+        // index is their exact ordered subsequence of the ordinary send list.
+        let indexed = read.sources.as_ref().map(|rows| rows[tid].as_slice());
+        let source_count = indexed.map_or(g.num_sends(), <[EventId]>::len);
+        let sources = if source_count < inline.len() {
+            if let Some(indexed) = indexed {
+                for (slot, &send) in inline.iter_mut().zip(indexed) {
+                    *slot = Some(send);
+                }
+            } else {
+                for (slot, send) in inline.iter_mut().zip(g.iter_sends()) {
+                    *slot = Some(send);
+                }
             }
-            base.set_rf(e, src);
-            self.observer.on_rf_choice(&base, e, src);
+            &inline[..source_count + 1]
+        } else {
+            if let Some(indexed) = indexed {
+                overflow.extend(indexed.iter().copied().map(Some));
+            } else {
+                overflow.extend(g.iter_sends().map(Some));
+            }
+            overflow.push(None); // bottom
+            overflow.as_slice()
+        };
+
+        // The freshly appended receive has not committed a source yet. The
+        // parent's maintained marks are exactly the reads of all other receives.
+
+        // Each inline child restores this exact graph before returning. Donated
+        // subtrees and observer snapshots own COW clones, so changing the next
+        // source cannot change an already explored or queued sibling.
+        let mut first = true;
+        let materialize_rejected = self.observer.inspects_rf_trial_graphs();
+        let blocking = g.label(e).blocking() == Some(true);
+        for &src in sources {
+            if self.stopping() {
+                break;
+            }
+            if !materialize_rejected
+                && src.map_or(blocking, |source| g.label(source).dst() != Some(tid))
+            {
+                // Neither rejection evaluates a predicate or temporal/model clause
+                // in the original consistency check. Preserve every trial notification,
+                // including blocking bottom, without changing valid-source handling.
+                self.observer.on_rf_choice(g, e, src);
+                self.observer.on_inconsistent(g);
+                continue;
+            }
+            g.set_rf_forward(e, src);
+            self.observer.on_rf_choice(g, e, src);
             // `e` is the freshly added maximal receive, so only clauses mentioning it can
             // break: the incremental `consistent_after_recv` suffices. Filter here, before
             // the `(traces, nexts)` update, so a rejected source costs no recompute.
-            let cons = crate::consistency::consistent_after_recv_with(&base, e, &read);
+            let cons = crate::consistency::consistent_after_recv_with(g, e, read);
             debug_assert_eq!(
                 cons,
-                consistent(&base),
+                consistent(g),
                 "incremental recv-consistency must agree with the full check"
             );
             // T-PRED (T2_PLAN §2a, §5): under the eager-time predicate an rf-fork is taken only
@@ -970,20 +1377,34 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             // the plain consistency test here. Dropping a *pruner* can only add children, never
             // remove one (M2, §0.2), so a lower rung explores a superset of level 4's tree.
             let ok = if self.time_predicate && self.time_level >= 3 {
-                cons && crate::time::check(&base).is_feasible()
+                cons && crate::time::check(g).is_feasible()
             } else {
                 cons
             };
             if !ok {
-                self.observer.on_inconsistent(&base);
+                self.observer.on_inconsistent(g);
                 continue;
             }
             // Trace entry for `e`: the value it read (`None` for a ⊥/timeout read).
-            let entry = src.map(|s| base.label(s).payload().expect("send carries a payload"));
-            self.with_child_memo(tid, entry, traces, nexts, |this, traces, nexts| {
-                this.branch_memo(&mut first, &base, traces, nexts);
-            });
+            let entry = src.map(|s| g.label(s).payload().expect("send carries a payload"));
+            if let Some(source) = src {
+                read.consume(tid, source);
+            }
+            self.with_child_memo(
+                tid,
+                entry,
+                traces,
+                nexts,
+                read,
+                |this, traces, nexts, read| {
+                    this.branch_memo(&mut first, g, traces, nexts, read);
+                },
+            );
+            if let Some(source) = src {
+                read.restore_consume(tid, source);
+            }
         }
+        g.restore_append(checkpoint, e);
     }
 
     /// line 6: `case e in ND: for v in S do Visit_P(SetND(G, e, v))`.
@@ -994,36 +1415,45 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     /// makes every `SetND` result consistent by construction.
     fn visit_nondet(
         &mut self,
-        g: &ExecutionGraph,
+        g: &mut ExecutionGraph,
         tid: Tid,
         label: Label,
         traces: &mut Vec<Vec<Option<Val>>>,
         nexts: &mut Vec<ThreadNext>,
+        read: &mut ForwardReads,
     ) {
-        let mut g_add = g.clone();
-        let e = g_add.add_event(tid, label);
-        self.observer.on_event_added(&g_add, e);
+        let checkpoint = g.checkpoint();
+        let e = g.add_event(tid, label);
+        self.event_added(g, e);
 
         // `Label::nondet` canonicalised the set to sorted+unique, so this explores
         // min(S) first (the line-19 canonical value) and each value exactly once.
-        let set = g_add
+        let set = g
             .label(e)
             .nd_set()
             .expect("visit_nondet on a non-nondet label")
             .to_vec();
-        // Reuse one `g_add` across all values (see `visit_recv`), re-pointing `e`'s nondet
+        // Reuse one graph across all values (see `visit_recv`), re-pointing `e`'s nondet
         // choice in place.
         let mut first = true;
         for v in set {
             if self.stopping() {
-                return;
+                break;
             }
-            g_add.set_nd(e, v);
+            g.set_nd(e, v);
             // A nondet event's trace entry is its chosen value.
-            self.with_child_memo(tid, Some(v), traces, nexts, |this, traces, nexts| {
-                this.branch_memo(&mut first, &g_add, traces, nexts);
-            });
+            self.with_child_memo(
+                tid,
+                Some(v),
+                traces,
+                nexts,
+                read,
+                |this, traces, nexts, read| {
+                    this.branch_memo(&mut first, g, traces, nexts, read);
+                },
+            );
         }
+        g.restore_append(checkpoint, e);
     }
 
     /// lines 8-13: add the send, explore the no-revisit branch (line 9), then attempt every
@@ -1032,14 +1462,15 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     /// can delete the very events that made `g_add` inconsistent.
     fn visit_send(
         &mut self,
-        g: &ExecutionGraph,
+        g: &mut ExecutionGraph,
         tid: Tid,
         label: Label,
         traces: &mut Vec<Vec<Option<Val>>>,
         nexts: &mut Vec<ThreadNext>,
+        read: &mut ForwardReads,
     ) {
         if let Some(limit) = self.max_sends {
-            if g.iter_sends().count() >= limit {
+            if g.num_sends() >= limit {
                 // This also skips potential repairing revisits. Report incomplete
                 // search even for a currently time-infeasible construction prefix;
                 // never route this through the terminal timing filter.
@@ -1047,9 +1478,10 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                 return;
             }
         }
-        let mut g_add = g.clone();
-        let e = g_add.add_event(tid, label);
-        self.observer.on_event_added(&g_add, e);
+        let checkpoint = g.checkpoint();
+        let e = g.add_event(tid, label);
+        read.send_added(g, e);
+        self.event_added(g, e);
 
         // The line-9 child and every backward-revisit child are siblings of this send
         // node, so they share one `first` flag (the first explored inline, the rest
@@ -1075,31 +1507,39 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             // every rung — it is a property of a ≤_G-maximal unread send, not of the regime.
             let forward_ok = if self.time_predicate && self.time_level >= 4 {
                 crate::time::gate_feasible_cached(
-                    &g_add,
+                    g,
                     self.program,
                     &self.priorities,
                     &mut self.viable_memo,
                 )
             } else {
                 debug_assert!(
-                    consistent(&g_add),
+                    consistent(g),
                     "line-9 maximal unread send must be consistent"
                 );
                 true
             };
             if forward_ok {
                 // A send contributes no read value to its thread's trace.
-                self.with_child_memo(tid, None, traces, nexts, |this, traces, nexts| {
-                    this.branch_memo(&mut first, &g_add, traces, nexts);
-                });
+                self.with_child_memo(
+                    tid,
+                    None,
+                    traces,
+                    nexts,
+                    read,
+                    |this, traces, nexts, read| {
+                        this.branch_memo(&mut first, g, traces, nexts, read);
+                    },
+                );
             }
-        }
-        if self.stopping() {
-            return;
         }
         // lines 10-13. A backward revisit restructures the graph, so its children take the
         // fresh `visit` path rather than a derived state.
-        self.backward_revisits(&mut first, &g_add, e);
+        if !self.stopping() {
+            self.backward_revisits(&mut first, g, e);
+        }
+        read.send_removed(g, e);
+        g.restore_append(checkpoint, e);
     }
 
     /// Record a terminal execution and honour terminal stopping rules. Returns whether the
@@ -1111,10 +1551,18 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     /// routed to `on_execution_filtered` and counts towards neither `terminal_count` nor
     /// `max_executions` (engine_plan §3): a suppressed terminal is not an execution of the
     /// timed program.
-    fn record(&mut self, graph: ExecutionGraph, kind: ExecutionKind) -> bool {
-        let labels = self
-            .program
-            .labels(&traces_of(&graph, self.program.num_threads()));
+    fn record(
+        &mut self,
+        graph: ExecutionGraph,
+        kind: ExecutionKind,
+        traces: Option<&[Vec<Option<Val>>]>,
+    ) -> bool {
+        let labels = match traces {
+            Some(traces) => self.program.labels(traces),
+            None => self
+                .program
+                .labels(&pooled_traces_of(&graph, self.program.num_threads())),
+        };
         let exec = Execution::new(graph).with_labels(labels);
         if self.time_filter || self.time_zombie || self.time_predicate {
             // The v1 model guard is a precondition of the time extension, not an invariant of

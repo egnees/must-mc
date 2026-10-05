@@ -18,13 +18,14 @@
 //! the parent explorer passes its configured total consistent-source selector internally.
 //! No stamp-free graph-key memoization is used.
 
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use super::source_order::SourceOrder;
 use crate::consistency::consistent;
 use crate::event::{EventId, Label, Model, Tid};
-use crate::graph::ExecutionGraph;
+use crate::graph::{EventMembership, ExecutionGraph};
 use crate::program::Program;
 use crate::scheduler::{pick, traces_of, NextStep};
 
@@ -174,7 +175,7 @@ impl OwnershipCheck {
 pub(crate) fn untimed_revisit_condition(
     g: &ExecutionGraph,
     ep: EventId,
-    porf_s: &BTreeSet<EventId>,
+    porf_s: &impl EventMembership,
 ) -> bool {
     untimed_revisit_condition_with_order(g, ep, porf_s, SourceOrder::EventId)
 }
@@ -183,7 +184,7 @@ pub(crate) fn untimed_revisit_condition(
 pub(crate) fn untimed_revisit_condition_with_order(
     g: &ExecutionGraph,
     ep: EventId,
-    porf_s: &BTreeSet<EventId>,
+    porf_s: &impl EventMembership,
     source_order: SourceOrder,
 ) -> bool {
     match g.label(ep) {
@@ -191,6 +192,21 @@ pub(crate) fn untimed_revisit_condition_with_order(
             blocking: false, ..
         } => g.reads_bottom(ep),
         Label::Recv { blocking: true, .. } => {
+            if let Some(selected) = (source_order == SourceOrder::EventId)
+                .then(|| asyn_previous_tiebreaker(g, ep, porf_s, source_order))
+                .flatten()
+            {
+                debug_assert_eq!(
+                    selected,
+                    get_cons_tiebreaker_with_order(
+                        &restrict_previous(g, ep, porf_s),
+                        ep,
+                        source_order,
+                    ),
+                    "virtual Asyn Previous must match the materialized canonical selector"
+                );
+                return g.reads_from(ep) == selected;
+            }
             let h = restrict_previous(g, ep, porf_s);
             g.reads_from(ep) == get_cons_tiebreaker_with_order(&h, ep, source_order)
         }
@@ -209,6 +225,71 @@ pub(crate) fn untimed_revisit_condition_with_order(
     }
 }
 
+/// Select on the virtual `Previous` without allocating/copying its graph. `g` must
+/// be consistent, as it is at every call to the original canonical arms.
+///
+/// `Previous` is po-prefix-closed. A retained blocking receive other than `ep`
+/// losing its source makes every candidate inconsistent. A nonblocking receive
+/// losing its source instead reads bottom, which is valid and consumes no send.
+/// Erasing an incoming rf preserves acyclicity;
+/// with Asyn sends, a replacement can violate only matching, single-consumption,
+/// or acyclicity. When the remaining RF edges are predecessor-closed, the last
+/// condition is exactly `ep porf source` in `g`. Otherwise an original path may
+/// cross cut vertices, so only a path inside `Previous` excludes the candidate.
+/// A path starting at `ep` cannot use its old incoming rf in the acyclic parent.
+/// Foreign retained models need their so conditions and use the original path.
+fn asyn_previous_tiebreaker(
+    g: &ExecutionGraph,
+    ep: EventId,
+    porf_s: &impl EventMembership,
+    order: SourceOrder,
+) -> Option<Option<EventId>> {
+    let stamp = g.stamp(ep);
+    let retained = |event| g.stamp(event) <= stamp || porf_s.contains(&event);
+    if g.iter_sends()
+        .any(|s| retained(s) && g.send_model(s) != Some(Model::Asyn))
+    {
+        return None;
+    }
+    let mut read = crate::graph::PooledMarks::take();
+    read.begin(g);
+    let mut rf_closed = true;
+    for r in g.iter_recvs() {
+        if r != ep && retained(r) {
+            if let Some(source) = g.reads_from(r) {
+                if !retained(source) {
+                    if g.label(r).blocking() == Some(true) {
+                        return Some(None);
+                    }
+                    rf_closed = false;
+                    continue;
+                }
+                read.insert(source);
+            }
+        }
+    }
+    let mut selected = None;
+    for source in g.iter_sends() {
+        if !retained(source)
+            || read.contains(source)
+            || selected.is_some_and(|old| order.key(g, old) <= order.key(g, source))
+            || !g.matches(source, ep)
+        {
+            continue;
+        }
+        if g.porf_reaches(ep, source)
+            && (rf_closed || g.porf_reaches_kept(ep, source, retained, Some(ep)))
+        {
+            continue;
+        }
+        selected = Some(source);
+        if order == SourceOrder::EventId {
+            break;
+        }
+    }
+    Some(selected)
+}
+
 /// Exact original candidate, target-consistency, and canonical tests. A `None`
 /// answer proves that this newly emitted send has no backward construction children.
 fn first_untimed_revisit(
@@ -217,7 +298,7 @@ fn first_untimed_revisit(
     stats: &mut OwnershipStats,
     source_order: SourceOrder,
 ) -> Option<RevisitObligation> {
-    let porf_send = g.porf_prefix(send);
+    let porf_send = g.causal_prefix(send);
     for receive in g.iter_recvs() {
         if !g.matches(send, receive) || porf_send.contains(&receive) {
             continue;
@@ -436,6 +517,167 @@ mod tests {
     }
     fn recv() -> Label {
         Label::recv(Pred::any())
+    }
+
+    #[test]
+    fn virtual_asyn_previous_matches_materialized_selector() {
+        let mut seed = 71_u64;
+        let mut draw = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 32) as usize
+        };
+        for _ in 0..96 {
+            let mut g = ExecutionGraph::new();
+            for _ in 0..16 {
+                let tid = draw() % 3;
+                let unread: Vec<_> = g
+                    .iter_sends()
+                    .filter(|&s| g.label(s).dst() == Some(tid) && !g.is_read(s))
+                    .collect();
+                if draw() % 5 == 0 {
+                    let r = g.add_event(tid, Label::recv_nb(Pred::any()));
+                    g.set_rf(r, None);
+                } else if !unread.is_empty() && draw() % 2 == 0 {
+                    let source = unread[draw() % unread.len()];
+                    let r = g.add_event(
+                        tid,
+                        if draw() % 2 == 0 {
+                            recv()
+                        } else {
+                            Label::recv_nb(Pred::any())
+                        },
+                    );
+                    g.set_rf(r, Some(source));
+                } else {
+                    g.add_event(tid, Label::send(Model::Asyn, draw() % 3, "message"));
+                }
+            }
+            assert!(consistent(&g));
+            // Repoint old receives to later independent sends as well: this covers
+            // construction graphs containing backward rf edges, not just traces
+            // whose causal order equals their insertion order.
+            let pairs: Vec<_> = g
+                .iter_recvs()
+                .filter(|&r| g.label(r).blocking() == Some(true))
+                .flat_map(|r| g.iter_sends().map(move |s| (r, s)))
+                .collect();
+            for (r, s) in pairs {
+                let mut trial = g.clone();
+                trial.set_rf(r, Some(s));
+                if !consistent(&trial) {
+                    continue;
+                }
+                for revisiting in trial.iter_sends() {
+                    let prefix = trial.porf_prefix(revisiting);
+                    let compact = trial.causal_prefix(revisiting);
+                    let previous = restrict_previous(&trial, r, &prefix);
+                    assert_eq!(
+                        restrict_previous(&trial, r, &compact).canonical_key(),
+                        previous.canonical_key()
+                    );
+                    for order in [SourceOrder::EventId, SourceOrder::SelfSendFirst] {
+                        let actual = asyn_previous_tiebreaker(&trial, r, &prefix, order)
+                            .expect("all-Asyn Previous must never require materialized fallback");
+                        assert_eq!(actual, get_cons_tiebreaker_with_order(&previous, r, order),);
+                        assert_eq!(
+                            asyn_previous_tiebreaker(&trial, r, &compact, order),
+                            Some(actual)
+                        );
+                        assert_eq!(
+                            untimed_revisit_condition_with_order(&trial, r, &compact, order),
+                            untimed_revisit_condition_with_order(&trial, r, &prefix, order)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn virtual_asyn_previous_rejects_all_sources_when_a_blocking_reader_loses_its_source() {
+        let mut g = ExecutionGraph::new();
+        let old = g.add_event(0, Label::send(Model::Asyn, 2, "old"));
+        let earlier = g.add_event(1, recv());
+        let ep = g.add_event(2, recv());
+        g.set_rf(ep, Some(old));
+        let later = g.add_event(0, Label::send(Model::Asyn, 1, "later"));
+        g.set_rf(earlier, Some(later));
+        assert!(consistent(&g));
+        assert_eq!(
+            asyn_previous_tiebreaker(&g, ep, &BTreeSet::new(), SourceOrder::EventId),
+            Some(None),
+        );
+        assert_eq!(
+            get_cons_tiebreaker_with_order(
+                &restrict_previous(&g, ep, &BTreeSet::new()),
+                ep,
+                SourceOrder::EventId,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn virtual_asyn_previous_allows_a_source_when_a_cut_nonblocking_rf_breaks_its_cycle() {
+        let mut g = ExecutionGraph::new();
+        let old = g.add_event(2, Label::send(Model::Asyn, 0, "old"));
+        let nonblocking = g.add_event(1, Label::recv_nb(Pred::any()));
+        g.set_rf(nonblocking, None);
+        let candidate = g.add_event(1, Label::send(Model::Asyn, 0, "candidate"));
+        let ep = g.add_event(0, recv());
+        g.set_rf(ep, Some(old));
+        let removed = g.add_event(0, Label::send(Model::Asyn, 1, "relay"));
+        g.set_rf(nonblocking, Some(removed));
+        assert!(consistent(&g));
+        assert!(g.porf_reaches(ep, candidate));
+
+        // The stamp cut retains both path endpoints and the nonblocking reader,
+        // but removes its RF source. The normalized bottom breaks that path.
+        let prefix = BTreeSet::new();
+        let previous = restrict_previous(&g, ep, &prefix);
+        assert_eq!(previous.reads_from(nonblocking), None);
+        assert!(!previous.porf_reaches(ep, candidate));
+        for order in [SourceOrder::EventId, SourceOrder::SelfSendFirst] {
+            assert_eq!(
+                asyn_previous_tiebreaker(&g, ep, &prefix, order),
+                Some(Some(candidate)),
+            );
+            assert_eq!(
+                get_cons_tiebreaker_with_order(&previous, ep, order),
+                Some(candidate)
+            );
+        }
+
+        // Keeping the relay preserves the path and excludes the candidate.
+        // The receive's own held RF must nevertheless be erased: old is eligible.
+        let prefix = BTreeSet::from([removed]);
+        let previous = restrict_previous(&g, ep, &prefix);
+        assert!(previous.porf_reaches(ep, candidate));
+        assert_eq!(
+            asyn_previous_tiebreaker(&g, ep, &prefix, SourceOrder::EventId),
+            Some(Some(old)),
+        );
+        assert_eq!(
+            get_cons_tiebreaker_with_order(&previous, ep, SourceOrder::EventId),
+            Some(old)
+        );
+    }
+
+    #[test]
+    fn virtual_asyn_previous_falls_back_only_for_retained_foreign_sends() {
+        let mut g = ExecutionGraph::new();
+        let source = g.add_event(0, Label::send(Model::Asyn, 1, "message"));
+        let r = g.add_event(1, recv());
+        g.set_rf(r, Some(source));
+        let foreign = g.add_event(2, Label::send(Model::Mbox, 1, "foreign"));
+        assert_eq!(
+            asyn_previous_tiebreaker(&g, r, &BTreeSet::new(), SourceOrder::EventId),
+            Some(Some(source)),
+        );
+        assert_eq!(
+            asyn_previous_tiebreaker(&g, r, &BTreeSet::from([foreign]), SourceOrder::EventId,),
+            None,
+        );
     }
 
     #[test]
