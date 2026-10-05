@@ -9,6 +9,7 @@ use crate::event::{EventId, Label};
 use crate::explorer::Execution;
 use crate::graph::ExecutionGraph;
 use crate::observer::{RecordingObserver, Step, StepKind};
+use crate::program::TraceLabel;
 
 /// Render one event's label compactly, e.g. `S p2p->2 "1"` or `err "..."`.
 fn label_cell(l: &Label) -> String {
@@ -50,26 +51,46 @@ fn label_cell(l: &Label) -> String {
 
 /// Render a graph as thread columns (one row per po index) plus its rf edges.
 pub fn render_graph(g: &ExecutionGraph) -> String {
-    let n = g.num_threads();
+    render_annotated_graph(g, &[])
+}
+
+fn render_annotated_graph(g: &ExecutionGraph, labels: &[TraceLabel]) -> String {
+    let n = labels
+        .iter()
+        .map(|label| label.tid + 1)
+        .max()
+        .unwrap_or(0)
+        .max(g.num_threads());
     if n == 0 {
         return "(empty graph)\n".to_string();
     }
-    let heights: Vec<usize> = (0..n).map(|t| g.thread_len(t)).collect();
-    let rows = heights.iter().copied().max().unwrap_or(0);
-
-    // Build the cell text for every (thread, row), then pad each column to its width.
-    let mut cells: Vec<Vec<String>> = vec![vec![String::new(); n]; rows];
-    for (idx, row) in cells.iter_mut().enumerate() {
-        for (t, cell) in row.iter_mut().enumerate() {
-            if idx < heights[t] {
-                *cell = label_cell(g.label(EventId::new(t, idx)));
+    let columns: Vec<Vec<String>> = (0..n)
+        .map(|tid| {
+            let mut column = Vec::new();
+            let mut local = labels.iter().filter(|label| label.tid == tid).peekable();
+            for idx in 0..=g.thread_len(tid) {
+                while let Some(label) = local.next_if(|label| label.position == idx) {
+                    column.push(format!("label[{}]", crate::intern::resolve(label.value)));
+                }
+                if idx < g.thread_len(tid) {
+                    let cell = label_cell(g.label(EventId::new(tid, idx)));
+                    // Annotation rows have no EventId. Keep the real po indices
+                    // visible so rf references still identify the correct cells.
+                    column.push(if labels.is_empty() {
+                        cell
+                    } else {
+                        format!("#{idx} {cell}")
+                    });
+                }
             }
-        }
-    }
+            column
+        })
+        .collect();
+    let rows = columns.iter().map(Vec::len).max().unwrap_or(0);
     let headers: Vec<String> = (0..n).map(|t| format!("T{t}")).collect();
     let widths: Vec<usize> = (0..n)
         .map(|t| {
-            let body = (0..rows).map(|r| cells[r][t].len()).max().unwrap_or(0);
+            let body = columns[t].iter().map(String::len).max().unwrap_or(0);
             body.max(headers[t].len())
         })
         .collect();
@@ -79,8 +100,9 @@ pub fn render_graph(g: &ExecutionGraph) -> String {
         let _ = write!(out, "{:<width$}  ", headers[t], width = widths[t]);
     }
     out.push('\n');
-    for row in cells.iter().take(rows) {
-        for (t, cell) in row.iter().enumerate() {
+    for row in 0..rows {
+        for (t, column) in columns.iter().enumerate() {
+            let cell = column.get(row).map_or("", String::as_str);
             let _ = write!(out, "{:<width$}  ", cell, width = widths[t]);
         }
         out.push('\n');
@@ -109,9 +131,10 @@ fn fmt_id(e: EventId) -> String {
     format!("⟨{},{}⟩", e.tid, e.idx)
 }
 
-/// Render a completed execution: its graph plus the list of pending (unread) sends.
+/// Render a completed execution with local labels inline in the thread columns,
+/// followed by rf edges and the list of pending (unread) sends.
 pub fn render_execution(exec: &Execution) -> String {
-    let mut out = render_graph(exec.graph());
+    let mut out = render_annotated_graph(exec.graph(), exec.labels());
     out.push_str("pending sends:");
     let pending = exec.pending_sends();
     if pending.is_empty() {

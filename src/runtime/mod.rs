@@ -33,7 +33,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 use crate::event::{Label, Model, ReceiveTiming, Tid, Val, Window};
-use crate::program::{Program, ThreadNext};
+use crate::program::{Program, ThreadNext, TraceLabel};
 
 use replay::{run_once, ThreadCell};
 
@@ -179,17 +179,29 @@ impl System {
 
     /// Replay thread `tid` against `trace` and read off its next event.
     fn run_thread(&self, tid: Tid, trace: Vec<Option<Val>>) -> ThreadNext {
+        self.replay_thread(tid, trace, false).0
+    }
+
+    fn replay_thread(
+        &self,
+        tid: Tid,
+        trace: Vec<Option<Val>>,
+        collect_labels: bool,
+    ) -> (ThreadNext, Vec<TraceLabel>) {
         let cell = Rc::new(RefCell::new(ThreadCell::new(
             trace,
             self.max_events,
             self.recv_budgets[tid],
+            collect_labels,
         )));
         let ctx = Ctx {
             tid,
             cell: cell.clone(),
         };
         let fut = (self.factories[tid])(ctx);
-        run_once(fut, &cell)
+        let next = run_once(fut, &cell);
+        let labels = cell.borrow_mut().take_labels();
+        (next, labels)
     }
 }
 
@@ -215,6 +227,18 @@ impl Program for System {
     /// Per-thread replay: re-run only thread `tid`'s body, not all of them.
     fn next_thread(&self, tid: Tid, trace: &[Option<Val>]) -> ThreadNext {
         self.run_thread(tid, trace.to_vec())
+    }
+
+    /// Reconstruct all annotations in one replay per thread, independent of the
+    /// number of labels. No annotation creates an additional exploration step.
+    fn labels(&self, traces: &[Vec<Option<Val>>]) -> Vec<TraceLabel> {
+        debug_assert_eq!(traces.len(), self.num_threads());
+        (0..self.num_threads())
+            .flat_map(|tid| {
+                let trace = traces.get(tid).cloned().unwrap_or_default();
+                self.replay_thread(tid, trace, true).1
+            })
+            .collect()
     }
 
     /// A coroutine body's future is value-dependent (it branches on received messages and
@@ -264,6 +288,19 @@ impl Ctx {
     /// This process's thread id.
     pub fn tid(&self) -> Tid {
         self.tid
+    }
+
+    /// Annotate this local execution position without emitting a graph event.
+    /// Synchronous: no await, nondeterministic choice, event-budget charge, or
+    /// additional exploration step. Read the annotations via `Execution::labels()`.
+    /// Calls retain local order, including several labels between two events.
+    ///
+    /// Annotations are reconstructed once per reported execution by replay, not
+    /// persisted as side effects of a body. Like all local computation, they must
+    /// be deterministic. They are not scheduling points and cannot encode a
+    /// nondeterministic choice; use [`nondet`](Self::nondet) for that.
+    pub fn insert_label(&self, value: impl Into<Val>) {
+        self.cell.borrow_mut().insert_label(self.tid, value.into());
     }
 
     /// Send `msg` to thread `to` under communication model `model` (fire-and-forget).

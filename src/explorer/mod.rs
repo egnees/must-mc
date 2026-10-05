@@ -1055,7 +1055,8 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     /// `max_executions` (engine_plan §3): a suppressed terminal is not an execution of the
     /// timed program.
     fn record(&mut self, graph: ExecutionGraph, kind: ExecutionKind) -> bool {
-        let exec = Execution::new(graph);
+        let labels = self.program.labels(&traces_of(&graph, self.program.num_threads()));
+        let exec = Execution::new(graph).with_labels(labels);
         if self.time_filter || self.time_zombie || self.time_predicate {
             // The v1 model guard is a precondition of the time extension, not an invariant of
             // any regime, so it runs on every timed terminal regardless of level or profile.

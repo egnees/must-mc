@@ -10,13 +10,14 @@
 
 use crate::event::EventId;
 use crate::graph::ExecutionGraph;
+use crate::program::TraceLabel;
 
 /// How an explored execution terminated.
 ///
-/// * `Full` - nothing more can be added and every thread finished.
-/// * `Blocked` - nothing more can be added but some thread is stuck on a blocking receive
-///   that never got a message (a maximal consistent prefix).
-/// * `Error` - an `error` event was reached.
+/// * `Full` - `next_P(G) = nothing` with every thread finished (line 4).
+/// * `Blocked` - `next_P(G) = nothing` with some thread stuck on a blocking receive that
+///   never got a message (a maximal consistent prefix).
+/// * `Error` - an `error` event was reached (line 5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ExecutionKind {
     Full,
@@ -28,15 +29,31 @@ pub enum ExecutionKind {
 #[derive(Clone, Debug)]
 pub struct Execution {
     graph: ExecutionGraph,
+    labels: Vec<TraceLabel>,
 }
 
 impl Execution {
     pub fn new(graph: ExecutionGraph) -> Self {
-        Execution { graph }
+        Execution {
+            graph,
+            labels: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_labels(mut self, labels: Vec<TraceLabel>) -> Self {
+        self.labels = labels;
+        self
     }
 
     pub fn graph(&self) -> &ExecutionGraph {
         &self.graph
+    }
+
+    /// Local annotations, ordered by thread and insertion order within each thread.
+    /// They do not participate in graph identity or timing. For early error prefixes,
+    /// see [`Program::labels`](crate::Program::labels) for the prefix semantics.
+    pub fn labels(&self) -> &[TraceLabel] {
+        &self.labels
     }
 
     /// Pending (unread) sends `G.US` - a hook for reasoning about undelivered messages.

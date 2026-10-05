@@ -91,7 +91,7 @@ pub use observer::{
     NullObserver, Observer, RecordingObserver, Step, StepKind, TimeCertificateEvent,
     TimeCertificateOutcome,
 };
-pub use program::{Program, ThreadNext};
+pub use program::{Program, ThreadNext, TraceLabel};
 pub use runtime::{Ctx, NondetFuture, RecvFuture, RecvTimeoutFuture, System, DEFAULT_MAX_EVENTS};
 pub use scheduler::{next_step, traces_of, NextStep};
 pub use time::{check, check_mailbox, eager_feasible, TimedVerdict};

@@ -44,6 +44,16 @@
 
 use crate::event::{Label, Tid, Val};
 
+/// A deterministic local annotation, not an event of the execution graph.
+/// Annotations at the same position retain their insertion order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceLabel {
+    pub tid: Tid,
+    /// Number of committed events preceding the annotation in this thread.
+    pub position: usize,
+    pub value: Val,
+}
+
 /// The next step of a single thread under a given trace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ThreadNext {
@@ -91,6 +101,18 @@ pub trait Program {
             *slot = trace.to_vec();
         }
         self.next(&traces).swap_remove(tid)
+    }
+
+    /// Deterministic annotations reconstructed from each thread's committed trace,
+    /// including local work before its next uncommitted event (or termination).
+    /// They do not add events, affect scheduling, or participate in graph identity.
+    /// Return them in thread order and then local insertion order.
+    ///
+    /// On an early error prefix, another thread's annotations may include local
+    /// work before its next event, even though that event was never scheduled.
+    /// These are local prefix annotations, not a globally ordered action log.
+    fn labels(&self, _traces: &[Vec<Option<Val>>]) -> Vec<TraceLabel> {
+        Vec::new()
     }
 
     /// A **sound over-approximation** of the events thread `tid` may still produce, given

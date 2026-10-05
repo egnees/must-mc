@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::task::{Context, Poll, Waker};
 
 use crate::event::{Label, Model, ReceiveTiming, Tid, Val, Window};
-use crate::program::ThreadNext;
+use crate::program::{ThreadNext, TraceLabel};
 
 use super::{BoxedPred, LocalFut};
 
@@ -69,11 +69,18 @@ pub(crate) struct ThreadCell {
     /// receive halts the thread as `Finished` instead of becoming an event. `usize::MAX`
     /// (the default) means unbounded.
     max_recvs: usize,
+    /// Collected only when reconstructing execution annotations, not on ordinary next().
+    labels: Option<Vec<TraceLabel>>,
     halt: Halt,
 }
 
 impl ThreadCell {
-    pub(crate) fn new(trace: Vec<Option<Val>>, max_events: usize, max_recvs: usize) -> Self {
+    pub(crate) fn new(
+        trace: Vec<Option<Val>>,
+        max_events: usize,
+        max_recvs: usize,
+        collect_labels: bool,
+    ) -> Self {
         ThreadCell {
             trace,
             cursor: 0,
@@ -81,12 +88,32 @@ impl ThreadCell {
             op_count: 0,
             max_events,
             max_recvs,
+            labels: collect_labels.then(Vec::new),
             halt: Halt::Running,
         }
     }
 
     fn halted(&self) -> bool {
         !matches!(self.halt, Halt::Running)
+    }
+
+    pub(crate) fn insert_label(&mut self, tid: Tid, value: Val) {
+        // Synchronous sends/assertions can leave the Rust body running after the
+        // first new event. Such a tail is outside the committed trace.
+        if self.halted() {
+            return;
+        }
+        if let Some(labels) = &mut self.labels {
+            labels.push(TraceLabel {
+                tid,
+                position: self.cursor,
+                value,
+            });
+        }
+    }
+
+    pub(crate) fn take_labels(&mut self) -> Vec<TraceLabel> {
+        self.labels.take().unwrap_or_default()
     }
 
     /// Charge one operation against the event budget; returns `true` (and halts) once the
