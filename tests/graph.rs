@@ -167,3 +167,93 @@ fn canonical_key_does_not_collide_on_tricky_vals() {
 
     assert_ne!(g1.canonical_key(), g2.canonical_key());
 }
+
+/// A separate transitive-closure oracle (no graph traversal or cached answers).
+fn independently_acyclic(g: &ExecutionGraph) -> bool {
+    let events = g.all_events();
+    let mut reach = vec![vec![false; events.len()]; events.len()];
+    for (to, &event) in events.iter().enumerate() {
+        if event.idx > 0 {
+            let before = EventId::new(event.tid, event.idx - 1);
+            let from = events.iter().position(|&e| e == before).unwrap();
+            reach[from][to] = true;
+        }
+        if let Some(source) = g.reads_from(event) {
+            let from = events.iter().position(|&e| e == source).unwrap();
+            reach[from][to] = true;
+        }
+    }
+    for mid in 0..events.len() {
+        for from in 0..events.len() {
+            for to in 0..events.len() {
+                let through = reach[from][mid] && reach[mid][to];
+                reach[from][to] |= through;
+            }
+        }
+    }
+    (0..events.len()).all(|i| !reach[i][i])
+}
+
+#[test]
+fn acyclicity_cache_agrees_with_closure_after_mutations_and_cuts() {
+    let mut g = ExecutionGraph::new();
+    let r0 = g.add_event(0, Label::recv(Pred::any()));
+    let s0 = g.add_event(0, send(1, "a"));
+    let r1 = g.add_event(1, Label::recv(Pred::any()));
+    let s1 = g.add_event(1, send(0, "b"));
+    let check = |g: &ExecutionGraph| {
+        let expected = independently_acyclic(g);
+        // The second call exercises the memoized answer as well.
+        assert_eq!(g.is_porf_acyclic(), expected);
+        assert_eq!(g.is_porf_acyclic(), expected);
+    };
+    check(&g);
+    g.set_rf(r1, Some(s0)); // forward rf, all stamps form a topological order
+    check(&g);
+    let parent = g.clone();
+    g.set_rf(r0, Some(s1)); // backwards rf completes a cycle
+    check(&g);
+    check(&parent); // cache and annotations are not shared with the clone
+    g.set_rf(r1, None); // remove an edge from a cyclic graph
+    check(&g);
+    let keep = [r0, s0, r1].into_iter().collect();
+    let cut = g.restrict(&keep); // dropping s1 normalizes r0's source
+    check(&cut);
+    g.set_rf(r1, Some(s0));
+    check(&g);
+    g.set_rf(r0, None); // all-forward invariant restored
+    check(&g);
+    g.add_event(2, send(0, "c"));
+    check(&g);
+    g.set_rf(r0, Some(s1));
+    check(&g);
+    let keep = [r0, r1, s1].into_iter().collect();
+    check(&g.restrict(&keep)); // drops s0, breaks the cycle
+}
+
+#[test]
+fn cached_send_count_matches_iteration_after_append_clone_and_restrict() {
+    let mut g = ExecutionGraph::new();
+    assert_eq!(g.num_sends(), 0);
+    let s0 = g.add_event(0, send(1, "a"));
+    let r1 = g.add_event(1, Label::recv(Pred::any()));
+    g.set_rf(r1, Some(s0));
+    let parent = g.clone();
+    let s1 = g.add_event(1, send(0, "b"));
+    g.add_event(2, Label::nondet(["x", "y"]));
+    assert_eq!(parent.num_sends(), 1);
+    assert_eq!(g.num_sends(), g.iter_sends().count());
+    assert_eq!(g.num_sends(), 2);
+    for keep in [
+        BTreeSet::new(),
+        [s0].into_iter().collect(),
+        [r1, s1].into_iter().collect(),
+        [s0, r1, s1].into_iter().collect(),
+        g.all_events().into_iter().collect(),
+    ] {
+        let mut cut = g.restrict(&keep);
+        assert_eq!(cut.num_sends(), cut.iter_sends().count());
+        cut.add_event(3, send(0, "c"));
+        assert_eq!(cut.num_sends(), cut.iter_sends().count());
+    }
+}

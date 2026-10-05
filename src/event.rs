@@ -146,6 +146,8 @@ impl fmt::Display for ReceiveTiming {
     }
 }
 
+type PredicateTest = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// Predicate of a selective receive. `vals(r)` from Definition 3.1 is the set of values
 /// accepted by `test`; `repr` is a human-readable tag used for `Debug`/`Display` and for
 /// the canonical key of a graph.
@@ -160,7 +162,10 @@ pub struct Pred {
     repr: Arc<str>,
     // `Arc` (not `Rc`) keeps `Pred` — and hence `Label` and `ExecutionGraph` — `Send +
     // Sync`, so parallel exploration can hand graph subtrees to worker threads.
-    test: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    // None is reserved for a constructor-proven predicate `true`. Predicate tags
+    // are not semantic identities: a custom closure tagged "true" is still run.
+    // Option uses the Arc pointer's niche, preserving the predicate's layout.
+    test: Option<PredicateTest>,
     /// Fast path for equality predicates: `Some(sym)` iff this predicate accepts exactly
     /// the interned payload `sym`. Lets [`test_sym`](Self::test_sym) compare handles
     /// directly, skipping the resolve-and-run-closure step. `None` for a general predicate.
@@ -174,7 +179,7 @@ impl Pred {
     ) -> Self {
         Pred {
             repr: Arc::from(repr.into()),
-            test: Arc::new(test),
+            test: Some(Arc::new(test)),
             eq_target: None,
         }
     }
@@ -192,14 +197,30 @@ impl Pred {
     ) -> Self {
         Pred {
             repr,
-            test: Arc::from(test),
+            test: Some(Arc::from(test)),
             eq_target: None,
         }
     }
 
     /// Predicate `true`: accepts any message (the default `recv()`).
     pub fn any() -> Self {
-        Pred::new("true", |_| true)
+        Self::any_with_repr(Arc::from("true"))
+    }
+
+    /// Constructor-proven predicate `true` with the replay driver's stable tag.
+    /// Skips closure allocation, payload resolution and dynamic dispatch.
+    pub(crate) fn any_with_repr(repr: Arc<str>) -> Self {
+        Self {
+            repr,
+            test: None,
+            eq_target: None,
+        }
+    }
+
+    /// Whether this predicate was constructed to accept every payload.
+    /// Custom predicates cannot be classified from their printable tags.
+    pub(crate) fn is_any(&self) -> bool {
+        self.test.is_none()
     }
 
     /// Predicate `x == v`. Records the interned target so [`test_sym`](Self::test_sym) can
@@ -214,15 +235,19 @@ impl Pred {
 
     /// Whether `v` satisfies the predicate, i.e. `v` is in `vals(r)`.
     pub fn test(&self, v: &str) -> bool {
-        (self.test)(v)
+        self.test.as_ref().is_none_or(|test| test(v))
     }
 
     /// Whether the interned payload `v` satisfies the predicate. Equality predicates match
-    /// by handle (no resolve); a general predicate resolves `v` and runs its closure.
+    /// by handle (no resolve); constructor-proven `true` accepts without resolving;
+    /// a general predicate resolves `v` and runs its closure.
     pub fn test_sym(&self, v: Val) -> bool {
         match self.eq_target {
             Some(t) => v == t,
-            None => (self.test)(crate::intern::resolve(v)),
+            None => self
+                .test
+                .as_ref()
+                .is_none_or(|test| test(crate::intern::resolve(v))),
         }
     }
 
@@ -492,6 +517,50 @@ mod tests {
         assert!(!Pred::eq("42").test("7"));
         assert_eq!(Pred::eq("42").repr(), "=42");
         assert_eq!(Pred::any().repr(), "true");
+    }
+
+    #[test]
+    fn proven_any_accepts_values_and_preserves_runtime_tags() {
+        let tagged = Pred::any_with_repr(Arc::from("recv_17"));
+        assert_eq!(tagged.repr(), "recv_17");
+        assert!(tagged.test.is_none());
+        assert!(tagged.clone().test.is_none());
+        for value in ["", "message", "Unicode: привет"] {
+            assert!(tagged.test(value));
+            assert!(tagged.test_sym(value.into()));
+        }
+        assert!(Pred::any().test.is_none());
+        assert_eq!(
+            std::mem::size_of::<Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>>(),
+            std::mem::size_of::<Arc<dyn Fn(&str) -> bool + Send + Sync>>()
+        );
+    }
+
+    #[test]
+    fn custom_predicate_tagged_true_is_never_assumed_to_accept() {
+        let custom = Pred::new("true", |_| false);
+        let boxed = Pred::from_boxed(Arc::from("true"), Box::new(|_| false));
+        let value: Val = "message".into();
+        for predicate in [custom, boxed] {
+            assert!(!predicate.is_any());
+            assert!(predicate.test.is_some());
+            assert!(!predicate.test("message"));
+            assert!(!predicate.test_sym(value));
+        }
+        // Equality is also semantic, including the textual value "true".
+        let equality = Pred::eq("true");
+        assert!(!equality.is_any());
+        assert!(equality.test_sym("true".into()));
+        assert!(!equality.test_sym(value));
+    }
+
+    #[test]
+    fn constructor_proven_any_is_independent_of_its_tag() {
+        assert!(Pred::any().is_any());
+        assert!(Pred::any_with_repr(Arc::from("recv@7")).is_any());
+        assert!(!Pred::new("true", |_| true).is_any());
+        assert!(!Pred::new("true", |_| false).is_any());
+        assert!(!Pred::from_boxed(Arc::from("true"), Box::new(|_| true)).is_any());
     }
 
     #[test]

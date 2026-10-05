@@ -46,18 +46,72 @@ pub fn consistent(g: &ExecutionGraph) -> bool {
     well_formed(g) && models_consistent(g)
 }
 
-fn models_consistent(g: &ExecutionGraph) -> bool {
-    let (mut p2p, mut cd, mut mbox) = (false, false, false);
-    for s in g.iter_sends() {
-        match g.send_model(s) {
-            Some(Model::P2p) => p2p = true,
-            Some(Model::Cd) => cd = true,
-            Some(Model::Mbox) => mbox = true,
-            // asyn adds nothing beyond well-formedness (Definition 3.4).
-            Some(Model::Asyn) | None => {}
-        }
+/// Incremental validation of Algorithm 1's backward-revisit graph.
+///
+/// The caller supplies a consistent `original`, its freshly appended, unread,
+/// insertion-maximal send `send`, and a matching receive `receive` outside
+/// `porf_prefix(send)`. `revisited` is exactly the po-prefix restriction retaining
+/// `stamp <= stamp(receive)` and `porf_prefix(send)` and `send`, followed by
+/// `rf(receive) := send`. These are the backward-revisit construction invariants.
+///
+/// For Asyn only, all surviving old RF edges retain their matching labels and
+/// single-reader property. The new RF source was unread. Restriction and removal
+/// of the receive's old incoming RF edge cannot introduce a cycle; adding
+/// `send -> receive` could close a cycle only if `receive -> send` already existed,
+/// which the candidate filter excludes. Thus only a retained blocking receive
+/// whose old source was cut away can violate well-formedness. Restriction has
+/// normalized precisely those missing sources to bottom. Mixed models retain
+/// the complete consistency check, including their additional ordering clauses.
+pub(crate) fn consistent_after_asyn_revisit(
+    original: &ExecutionGraph,
+    revisited: &ExecutionGraph,
+    receive: EventId,
+    send: EventId,
+) -> bool {
+    if original.uses_model(Model::P2p)
+        || original.uses_model(Model::Cd)
+        || original.uses_model(Model::Mbox)
+    {
+        return consistent(revisited);
     }
-    (!p2p || consistent_p2p(g)) && (!cd || consistent_cd(g)) && (!mbox || consistent_mbox(g))
+    debug_assert!(consistent(original));
+    debug_assert!(original.label(send).is_send());
+    debug_assert!(!original.is_read(send));
+    debug_assert!(original.matches(send, receive));
+    debug_assert!(!original.porf_reaches(receive, send));
+    debug_assert!(original
+        .iter_events()
+        .all(|event| original.stamp(event) <= original.stamp(send)));
+    debug_assert_eq!(revisited.reads_from(receive), Some(send));
+    revisited.retained_receive_sources_valid(receive)
+}
+
+/// The Asyn-only validation above, applied to a virtual cut before allocation.
+/// All construction invariants of [`consistent_after_asyn_revisit`] apply; the
+/// caller also supplies the exact strict porf-prefix of the fresh send and
+/// selects this helper only when no non-Asyn communication model is present.
+pub(crate) fn consistent_asyn_revisit_before_restrict(
+    original: &ExecutionGraph,
+    receive: EventId,
+    send: EventId,
+    send_prefix: &impl crate::graph::EventMembership,
+) -> bool {
+    debug_assert!(!original.uses_model(Model::P2p));
+    debug_assert!(!original.uses_model(Model::Cd));
+    debug_assert!(!original.uses_model(Model::Mbox));
+    debug_assert!(consistent(original));
+    debug_assert!(original.matches(send, receive));
+    debug_assert!(!original.is_read(send));
+    debug_assert!(!send_prefix.contains(&receive));
+    original.blocking_sources_survive_revisit(receive, send, send_prefix)
+}
+
+fn models_consistent(g: &ExecutionGraph) -> bool {
+    // asyn adds no clauses beyond well-formedness (Definition 3.4). The model
+    // mask is maintained by graph append/restrict, avoiding a full send scan.
+    (!g.uses_model(Model::P2p) || consistent_p2p(g))
+        && (!g.uses_model(Model::Cd) || consistent_cd(g))
+        && (!g.uses_model(Model::Mbox) || consistent_mbox(g))
 }
 
 /// Well-formedness (Definition 3.3), minus the send/receive model-match clause (a
@@ -122,15 +176,7 @@ pub fn consistent_after_recv(g: &ExecutionGraph, r: EventId) -> bool {
 /// to vary). One pass, reusable across a whole rf-source enumeration: which *other* sends
 /// are read does not depend on what `skip` reads.
 pub(crate) fn mark_read_sources(g: &ExecutionGraph, skip: Option<EventId>, read: &mut Marks) {
-    read.begin(g);
-    for rr in g.iter_recvs() {
-        if Some(rr) == skip {
-            continue;
-        }
-        if let Some(src) = g.reads_from(rr) {
-            read.insert(src);
-        }
-    }
+    g.mark_read_sources(skip, read);
 }
 
 /// [`consistent_after_recv`] with the "which sends are already read" marks supplied by the
@@ -506,5 +552,144 @@ mod tests {
         g.set_rf(r, None);
         assert!(!well_formed(&g));
         assert!(!consistent(&g));
+    }
+
+    fn revisit_cut(g: &ExecutionGraph, receive: EventId, send: EventId) -> ExecutionGraph {
+        let prefix = g.porf_prefix(send);
+        let keep = g
+            .iter_events()
+            .filter(|&event| {
+                g.stamp(event) <= g.stamp(receive) || prefix.contains(&event) || event == send
+            })
+            .collect();
+        let mut cut = g.restrict(&keep);
+        cut.set_rf(receive, Some(send));
+        cut
+    }
+
+    #[test]
+    fn asyn_revisit_rejects_another_retained_blocking_receive_losing_its_source() {
+        let mut g = ExecutionGraph::new();
+        let blocked = g.add_event(1, Label::recv(Pred::any()));
+        let receive = g.add_event(0, Label::recv_nb(Pred::any()));
+        let source = g.add_event(2, Label::send(Model::Asyn, 1, "value"));
+        g.set_rf(blocked, Some(source));
+        let send = g.add_event(3, Label::send(Model::Asyn, 0, "value"));
+        assert!(consistent(&g));
+        let cut = revisit_cut(&g, receive, send);
+        assert!(cut.contains(blocked));
+        assert!(!cut.contains(source));
+        assert_eq!(cut.reads_from(blocked), None);
+        assert!(!consistent_asyn_revisit_before_restrict(
+            &g,
+            receive,
+            send,
+            &g.porf_prefix(send)
+        ));
+        assert!(!consistent_after_asyn_revisit(&g, &cut, receive, send));
+        assert!(!consistent(&cut));
+    }
+
+    #[test]
+    fn asyn_revisit_allows_a_retained_nonblocking_receive_losing_its_source() {
+        let mut g = ExecutionGraph::new();
+        let other = g.add_event(1, Label::recv_nb(Pred::eq("value")));
+        let receive = g.add_event(0, Label::recv_nb(Pred::any()));
+        let source = g.add_event(2, Label::send(Model::Asyn, 1, "value"));
+        g.set_rf(other, Some(source));
+        let send = g.add_event(3, Label::send(Model::Asyn, 0, "value"));
+        assert!(consistent(&g));
+        let cut = revisit_cut(&g, receive, send);
+        assert_eq!(cut.reads_from(other), None);
+        assert!(consistent_asyn_revisit_before_restrict(
+            &g,
+            receive,
+            send,
+            &g.porf_prefix(send)
+        ));
+        assert!(consistent_after_asyn_revisit(&g, &cut, receive, send));
+        assert!(consistent(&cut));
+    }
+
+    #[test]
+    fn incremental_revisit_matches_full_consistency_on_cut_corpus() {
+        let mut state = 0x1298_aeba_725f_8821u64;
+        let mut draw = |limit: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize % limit
+        };
+        let mut cuts = 0;
+        let mut backward_rf = 0;
+        let mut mixed = 0;
+        for case in 0..3000 {
+            let model = [Model::Asyn, Model::P2p, Model::Cd, Model::Mbox][case % 4];
+            let mut g = ExecutionGraph::new();
+            for _ in 0..8 {
+                let tid = draw(3);
+                let label = if draw(2) == 0 {
+                    Label::send(model, draw(3), "value")
+                } else if draw(4) == 0 {
+                    Label::recv(Pred::any())
+                } else {
+                    Label::recv_nb(Pred::any())
+                };
+                g.add_event(tid, label);
+            }
+            for receive in g.recvs() {
+                let sources: Vec<_> = g
+                    .iter_sends()
+                    .filter(|&send| g.matches(send, receive) && !g.is_read(send))
+                    .collect();
+                if !sources.is_empty()
+                    && (g.label(receive).blocking() == Some(true) || draw(2) == 0)
+                {
+                    g.set_rf(receive, Some(sources[draw(sources.len())]));
+                }
+            }
+            if !consistent(&g) {
+                continue;
+            }
+            let send = g.add_event(draw(3), Label::send(Model::Asyn, draw(3), "value"));
+            assert!(consistent(&g));
+            let has_backward_rf = g.iter_recvs().any(|receive| {
+                g.reads_from(receive)
+                    .is_some_and(|source| g.stamp(source) > g.stamp(receive))
+            });
+            for receive in g.recvs() {
+                if !g.matches(send, receive) || g.porf_reaches(receive, send) {
+                    continue;
+                }
+                let cut = revisit_cut(&g, receive, send);
+                if !g.uses_model(Model::P2p)
+                    && !g.uses_model(Model::Cd)
+                    && !g.uses_model(Model::Mbox)
+                {
+                    assert_eq!(
+                        consistent_asyn_revisit_before_restrict(
+                            &g,
+                            receive,
+                            send,
+                            &g.porf_prefix(send)
+                        ),
+                        consistent(&cut)
+                    );
+                }
+                assert_eq!(
+                    consistent_after_asyn_revisit(&g, &cut, receive, send),
+                    consistent(&cut),
+                    "original={} revisited={}",
+                    g.canonical_key(),
+                    cut.canonical_key()
+                );
+                cuts += 1;
+                backward_rf += usize::from(has_backward_rf);
+                mixed += usize::from(model != Model::Asyn && g.uses_model(model));
+            }
+        }
+        assert!(cuts > 100);
+        assert!(backward_rf > 0);
+        assert!(mixed > 0);
     }
 }

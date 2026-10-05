@@ -184,6 +184,8 @@ impl OracleWitness {
 }
 
 #[derive(Clone, Debug)]
+// Keep witnesses inline: boxing would add an allocation to each oracle success.
+#[allow(clippy::large_enum_variant)]
 pub enum OracleOutcome {
     Witness(OracleWitness),
     /// The existing oracle's search returned false; this is not a proof that no semantic

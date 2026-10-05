@@ -25,9 +25,17 @@ pub enum NextStep {
 /// Extract `trace_G(i)` for every thread: one value per event in po, `Some(v)` for a
 /// receive that read value `v`, `None` for a send/error or a receive that read nothing.
 pub fn traces_of(g: &ExecutionGraph, num_threads: usize) -> Vec<Vec<Option<Val>>> {
-    let mut traces = vec![Vec::new(); num_threads];
+    let mut traces = Vec::new();
+    fill_traces(g, num_threads, &mut traces);
+    traces
+}
+
+fn fill_traces(g: &ExecutionGraph, num_threads: usize, traces: &mut Vec<Vec<Option<Val>>>) {
+    traces.resize_with(num_threads, Vec::new);
     for (tid, trace) in traces.iter_mut().enumerate() {
         let len = g.thread_len(tid);
+        trace.clear();
+        trace.reserve(len);
         for idx in 0..len {
             let e = EventId::new(tid, idx);
             let entry = match g.label(e) {
@@ -41,7 +49,46 @@ pub fn traces_of(g: &ExecutionGraph, num_threads: usize) -> Vec<Vec<Option<Val>>
             trace.push(entry);
         }
     }
-    traces
+}
+
+thread_local! {
+    static TRACE_POOL: std::cell::RefCell<Vec<Vec<Vec<Option<Val>>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Owned scratch, so nested visits never alias their parent's trace buffers.
+/// Only idle vectors live in the per-worker pool; no RefCell borrow spans replay,
+/// observer callbacks, or recursion. Bound idle retention independently of depth.
+pub(crate) struct PooledTraces(Vec<Vec<Option<Val>>>);
+
+impl std::ops::Deref for PooledTraces {
+    type Target = Vec<Vec<Option<Val>>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for PooledTraces {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for PooledTraces {
+    fn drop(&mut self) {
+        TRACE_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < 32 {
+                pool.push(std::mem::take(&mut self.0));
+            }
+        });
+    }
+}
+
+pub(crate) fn pooled_traces_of(g: &ExecutionGraph, num_threads: usize) -> PooledTraces {
+    let mut traces = TRACE_POOL.with(|pool| pool.borrow_mut().pop().unwrap_or_default());
+    fill_traces(g, num_threads, &mut traces);
+    PooledTraces(traces)
 }
 
 /// Whether thread `tid`'s next event `label` can be added to `g` right now.
@@ -68,6 +115,16 @@ fn addable(g: &ExecutionGraph, tid: Tid, label: &Label) -> bool {
 /// (destination, then the mark, then the predicate), which only changes how often the
 /// user's predicate closure is evaluated, never the answer.
 fn addable_with(g: &ExecutionGraph, tid: Tid, label: &Label, read: &crate::graph::Marks) -> bool {
+    addable_with_counts(g, tid, label, read, None)
+}
+
+fn addable_with_counts(
+    g: &ExecutionGraph,
+    tid: Tid,
+    label: &Label,
+    read: &crate::graph::Marks,
+    unread: Option<&[usize]>,
+) -> bool {
     match label {
         Label::Send { .. } | Label::Error { .. } => true,
         // A nondet choice is always addable; assumption (ii) constrains blocking receives only.
@@ -80,12 +137,19 @@ fn addable_with(g: &ExecutionGraph, tid: Tid, label: &Label, read: &crate::graph
             blocking: true,
             pred,
             ..
-        } => g.iter_sends().any(|s| {
-            let lbl = g.label(s);
-            lbl.dst() == Some(tid)
-                && !read.contains(s)
-                && lbl.payload().is_some_and(|v| pred.test_sym(v))
-        }),
+        } => {
+            if pred.is_any() {
+                if let Some(unread) = unread {
+                    return unread.get(tid).is_some_and(|&count| count != 0);
+                }
+            }
+            g.iter_sends().any(|s| {
+                let lbl = g.label(s);
+                lbl.dst() == Some(tid)
+                    && !read.contains(s)
+                    && lbl.payload().is_some_and(|v| pred.test_sym(v))
+            })
+        }
     }
 }
 
@@ -122,8 +186,35 @@ pub(crate) fn pick_with_time_semantics(
     des: bool,
     mailbox_time: bool,
 ) -> NextStep {
+    pick_with_optional_read(g, nexts, priorities, des, mailbox_time, None, None)
+}
+
+/// The explorer maintains these exact committed sources alongside its traces.
+/// Scheduling still recomputes addability; only rebuilding the same marks is skipped.
+pub(crate) fn pick_with_read_marks(
+    g: &ExecutionGraph,
+    nexts: &[ThreadNext],
+    priorities: &[Tid],
+    des: bool,
+    mailbox_time: bool,
+    read: &crate::graph::Marks,
+    unread: Option<&[usize]>,
+) -> NextStep {
+    pick_with_optional_read(g, nexts, priorities, des, mailbox_time, Some(read), unread)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pick_with_optional_read(
+    g: &ExecutionGraph,
+    nexts: &[ThreadNext],
+    priorities: &[Tid],
+    des: bool,
+    mailbox_time: bool,
+    supplied_read: Option<&crate::graph::Marks>,
+    unread: Option<&[usize]>,
+) -> NextStep {
     if des {
-        return pick_des(g, nexts, mailbox_time);
+        return pick_des(g, nexts, mailbox_time, supplied_read, unread);
     }
     // The read-source marks are shared by every addability query of this decision, and are
     // built only once a blocking receive actually needs them (the common case is a thread
@@ -133,12 +224,15 @@ pub(crate) fn pick_with_time_semantics(
         if let ThreadNext::Next(label) = &nexts[tid] {
             let addable = match label {
                 Label::Recv { blocking: true, .. } => {
-                    let marks = read.get_or_insert_with(|| {
-                        let mut m = crate::graph::PooledMarks::take();
-                        crate::consistency::mark_read_sources(g, None, &mut m);
-                        m
-                    });
-                    addable_with(g, tid, label, marks)
+                    let marks: &crate::graph::Marks = match supplied_read {
+                        Some(marks) => marks,
+                        None => read.get_or_insert_with(|| {
+                            let mut m = crate::graph::PooledMarks::take();
+                            crate::consistency::mark_read_sources(g, None, &mut m);
+                            m
+                        }),
+                    };
+                    addable_with_counts(g, tid, label, marks, unread)
                 }
                 _ => true,
             };
@@ -212,7 +306,13 @@ fn blocked_threads(nexts: &[ThreadNext]) -> Vec<Tid> {
 /// so it is woken only when no can-fire receive exists; this is the choice that reproduces the
 /// untimed terminal set (a permanently-unreadable receive is added-and-dies, never a spurious
 /// blocked terminal).
-fn pick_des(g: &ExecutionGraph, nexts: &[ThreadNext], mailbox_time: bool) -> NextStep {
+fn pick_des(
+    g: &ExecutionGraph,
+    nexts: &[ThreadNext],
+    mailbox_time: bool,
+    supplied_read: Option<&crate::graph::Marks>,
+    unread: Option<&[usize]>,
+) -> NextStep {
     // `None` only on an eager-infeasible `g`: every Visit the T2-predicate explorer reaches is
     // gated feasible, so there `Some`; its hard-only LBs may still be loose. The zombie regime visits
     // infeasible graphs too; there the LBs fall back to 0 and the policy stays a deterministic
@@ -273,7 +373,14 @@ fn pick_des(g: &ExecutionGraph, nexts: &[ThreadNext], mailbox_time: bool) -> Nex
         let ThreadNext::Next(label) = next else {
             continue;
         };
-        if label.blocking() != Some(true) || !addable(g, tid, label) {
+        if label.blocking() != Some(true) {
+            continue;
+        }
+        let addable = supplied_read.map_or_else(
+            || addable(g, tid, label),
+            |read| addable_with_counts(g, tid, label, read, unread),
+        );
+        if !addable {
             continue;
         }
         let sources = crate::time::consistent_sources(g, tid, label);
@@ -326,6 +433,98 @@ mod tests {
 
     fn send(dst: Tid, v: &str) -> Label {
         Label::send(Model::P2p, dst, v)
+    }
+
+    #[test]
+    fn supplied_read_marks_preserve_priority_and_des_decisions() {
+        fn assert_same(left: NextStep, right: NextStep) {
+            match (left, right) {
+                (
+                    NextStep::Event { tid: lt, label: ll },
+                    NextStep::Event { tid: rt, label: rl },
+                ) => {
+                    assert_eq!(lt, rt);
+                    assert_eq!(ll, rl);
+                }
+                (NextStep::Terminal { blocked: left }, NextStep::Terminal { blocked: right }) => {
+                    assert_eq!(left, right)
+                }
+                _ => panic!("supplied marks changed terminal/event classification"),
+            }
+        }
+        let mut g = ExecutionGraph::new();
+        let a = g.add_event(0, Label::send(Model::Asyn, 2, "a"));
+        let b = g.add_event(1, Label::send(Model::Asyn, 2, "b"));
+        let r = g.add_event(2, Label::recv(Pred::any()));
+        for source in [a, b] {
+            g.set_rf(r, Some(source));
+            let mut read = crate::graph::PooledMarks::take();
+            crate::consistency::mark_read_sources(&g, None, &mut read);
+            let unread: Vec<_> = (0..3)
+                .map(|tid| {
+                    g.iter_sends()
+                        .filter(|&s| g.label(s).dst() == Some(tid) && !read.contains(s))
+                        .count()
+                })
+                .collect();
+            for next in [
+                Label::recv(Pred::any()),
+                Label::recv(Pred::eq("a")),
+                Label::recv(Pred::eq("b")),
+                Label::recv(Pred::eq("missing")),
+                Label::recv(Pred::new("true", |_| false)),
+                Label::recv(Pred::new("true", |_| true)),
+                Label::recv_nb(Pred::any()),
+            ] {
+                let nexts = [
+                    ThreadNext::Next(Label::recv(Pred::any())),
+                    ThreadNext::Finished,
+                    ThreadNext::Next(next),
+                ];
+                for priorities in [[0, 1, 2], [2, 1, 0]] {
+                    for des in [false, true] {
+                        assert_same(
+                            pick_with_read_marks(
+                                &g,
+                                &nexts,
+                                &priorities,
+                                des,
+                                false,
+                                &read,
+                                Some(&unread),
+                            ),
+                            pick_with_time_semantics(&g, &nexts, &priorities, des, false),
+                        );
+                        assert_same(
+                            pick_with_read_marks(&g, &nexts, &priorities, des, false, &read, None),
+                            pick_with_time_semantics(&g, &nexts, &priorities, des, false),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pooled_traces_remain_independent_across_nested_visits() {
+        let mut g = ExecutionGraph::new();
+        let source = g.add_event(0, send(1, "value"));
+        let receive = g.add_event(1, Label::recv(Pred::any()));
+        g.set_rf(receive, Some(source));
+        let mut parent = pooled_traces_of(&g, 3);
+        assert_eq!(*parent, traces_of(&g, 3));
+        let mut child = g.clone();
+        let nondet = child.add_event(2, Label::nondet(["chosen"]));
+        child.set_nd(nondet, crate::intern::intern("chosen"));
+        {
+            let nested = pooled_traces_of(&child, 3);
+            assert_eq!(*nested, traces_of(&child, 3));
+            assert_eq!(*parent, traces_of(&g, 3));
+        }
+        parent[0].push(None);
+        drop(parent);
+        assert_eq!(*pooled_traces_of(&g, 3), traces_of(&g, 3));
+        assert_eq!(*pooled_traces_of(&ExecutionGraph::new(), 1), vec![vec![]]);
     }
 
     #[test]
