@@ -6,18 +6,19 @@ use super::{
     network,
 };
 use crate::{
-    proc::{Outputs, Process},
+    proc::{Factory, Outputs, Process},
     tests::common::crash,
 };
 
-pub fn run(factory: fn(usize, usize) -> Box<dyn Process>) -> Result<usize, String> {
-    common::run(|faulty| system(factory, faulty))
+pub fn run(factory: Factory) -> Result<usize, String> {
+    common::run(|faulty| system(factory.clone(), faulty))
         .map_err(|error| format!("Liveness / sequential: {error}"))
 }
 
-fn system(factory: fn(usize, usize) -> Box<dyn Process>, faulty: Option<usize>) -> must::System {
+fn system(factory: Factory, faulty: Option<usize>) -> must::System {
     let mut sys = must::System::new();
     for id in 0..NODES {
+        let factory = factory.clone();
         sys.add(move |ctx| runner(ctx, factory(id, NODES), Some(id) == faulty));
     }
     sys

@@ -3,11 +3,10 @@ use std::sync::OnceLock;
 use super::network;
 use crate::{
     proc::{Output, Outputs},
-    tests::common::{crash, THREADS},
+    tests::common::{crash, max_sends, threads},
 };
 
 pub(super) const NODES: usize = 3;
-const MAX_SENDS: usize = 16;
 const MESSAGES: [&str; 2] = ["first", "second"];
 const BROADCAST: [&str; 2] = ["broadcast:first", "broadcast:second"];
 const DELIVERED: [&str; 2] = ["deliver:first", "deliver:second"];
@@ -26,6 +25,22 @@ impl FirstFailure {
 }
 
 impl must::Observer for FirstFailure {
+    fn inspects_rf_trial_graphs(&self) -> bool {
+        false
+    }
+
+    fn inspects_revisit_targets(&self) -> bool {
+        false
+    }
+
+    fn observes_rejected_rf_trials(&self) -> bool {
+        false
+    }
+
+    fn allows_buffered_events(&self) -> bool {
+        true
+    }
+
     fn on_execution(&self, execution: &must::Execution, kind: must::ExecutionKind) {
         if self.trace.get().is_some() {
             return;
@@ -101,7 +116,7 @@ pub(super) fn run(
     let mut events = 0;
     for faulty in std::iter::once(None).chain((0..NODES).map(Some)) {
         let observer = (
-            must::CountingObserver::with_shards(THREADS),
+            must::EventCountingObserver::with_shards(threads()).with_buffered_events(),
             FirstFailure::default(),
         );
         must::explore(
@@ -112,8 +127,8 @@ pub(super) fn run(
             },
             &observer,
             must::Config::default()
-                .with_threads(THREADS)
-                .with_max_sends(MAX_SENDS)
+                .with_threads(threads())
+                .with_max_sends(max_sends())
                 .with_stop_on_terminal_error(),
         );
 
@@ -140,6 +155,10 @@ pub(super) async fn flush(
 ) -> bool {
     for output in outputs.take() {
         match output {
+            Output::Error(message) => {
+                ctx.assert_that(false, &message);
+                return false;
+            }
             Output::LocalMessage(message) => deliver_local(ctx, &message, delivered),
             Output::Message { to, message } => {
                 ctx.assert_that(to < NODES, "broadcast destination is out of range");

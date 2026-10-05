@@ -2,15 +2,17 @@
 //! Everyone must deliver first before second.
 
 use super::common::{self, flush, NODES};
-use crate::proc::{Outputs, Process};
+use crate::proc::{Factory, Outputs, Process};
 
-pub fn run(factory: fn(usize, usize) -> Box<dyn Process>) -> Result<usize, String> {
-    common::run(|| system(factory)).map_err(|error| format!("Safety / after_delivery: {error}"))
+pub fn run(factory: Factory) -> Result<usize, String> {
+    common::run(|| system(factory.clone()))
+        .map_err(|error| format!("Safety / after_delivery: {error}"))
 }
 
-fn system(factory: fn(usize, usize) -> Box<dyn Process>) -> must::System {
+fn system(factory: Factory) -> must::System {
     let mut sys = must::System::new();
     for id in 0..NODES {
+        let factory = factory.clone();
         sys.add(move |ctx| runner(ctx, factory(id, NODES)));
     }
     sys
@@ -35,7 +37,7 @@ async fn runner(ctx: must::Ctx, mut process: Box<dyn Process>) {
             ctx.insert_label("broadcast:second");
             process.on_local_message("second", &mut outputs);
         } else {
-            let message = ctx.recv(|_| true).await;
+            let message = ctx.recv_any().await;
             process.on_message(&message, &mut outputs);
         }
         if !flush(&ctx, &mut outputs, &mut delivered, true) {

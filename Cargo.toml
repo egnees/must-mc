@@ -19,7 +19,11 @@ name = "must"
 # The library has zero dependencies. `clap` and `mimalloc` are used only by the
 # examples: `clap` parses their CLI flags, and `mimalloc` is a faster global allocator
 # for the allocation-heavy search. Neither is compiled into the library.
+[features]
+system-allocator = []
+
 [dev-dependencies]
+must-python = { path = "crates/must-python" }
 clap = { version = "4", features = ["derive"] }
 mimalloc = "0.1"
 # The `extended` feature exposes mimalloc's runtime options, letting the Raft example
@@ -31,3 +35,8 @@ libmimalloc-sys = { version = "0.1", features = ["extended"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[workspace]
+members = ["crates/must-python"]
+default-members = [".", "crates/must-python"]
+resolver = "2"

@@ -29,12 +29,12 @@ pub(super) async fn send(ctx: &must::Ctx, to: usize, message: String, faulty: bo
 
 pub(super) async fn recv(ctx: &must::Ctx, faulty: bool) -> Option<String> {
     if !faulty {
-        return Some(ctx.recv(|_| true).await);
+        return Some(ctx.recv_any().await);
     }
 
     // Abstract nonblocking receive: None chooses a crash, even if mail is
     // available. This is a fault choice in the test, not a protocol timeout.
-    let message = ctx.recv_timeout(|_| true).await;
+    let message = ctx.recv_timeout_any().await;
     if message.is_none() {
         ctx.insert_label("crash");
     }

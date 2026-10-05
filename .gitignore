@@ -2,3 +2,5 @@
 Cargo.lock
 CLAUDE.md
 TIME_PLAN.md
+__pycache__/
+*.py[cod]
