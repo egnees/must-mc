@@ -43,7 +43,7 @@ pub(crate) struct Spawner {
     /// this is `> 0`; while every worker is busy it stays 0, so
     /// [`wants_work`](Self::wants_work) returns false and no busy worker touches the queue.
     hungry: AtomicUsize,
-    /// Aborts the whole run (execution cap hit, or `stop_on_error` first error).
+    /// Aborts the whole run (execution cap hit, or either error-stopping policy).
     pub(crate) stop: AtomicBool,
     /// Global full+blocked terminal count for the `max_executions` cap (best-effort).
     terminal_count: AtomicUsize,
@@ -111,6 +111,9 @@ impl Spawner {
 
     /// Trip the stop flag and wake every worker so they unwind.
     pub(crate) fn request_stop(&self) {
+        // Synchronize with pop's stop check and transition into cvar.wait().
+        // Otherwise notification could fall between them and strand an idle worker.
+        let _guard = self.shared.lock().unwrap();
         self.stop.store(true, Ordering::Relaxed);
         self.cvar.notify_all();
     }
@@ -130,7 +133,8 @@ impl Spawner {
 ///
 /// The *set* of executions the observer sees equals the sequential
 /// [`explore`](super::explore)'s; only their order differs. `max_executions` /
-/// `stop_on_error` stay honoured but become best-effort: in-flight workers may record a few
+/// `stop_on_error` / `stop_on_terminal_error` stay honoured but become best-effort:
+/// in-flight workers may record a few
 /// extra terminals before observing the stop flag, and which error surfaces first is
 /// nondeterministic. Use a single thread when that determinism matters.
 pub(crate) fn explore_parallel<P, MK, O>(make_program: MK, observer: &O, config: Config)
@@ -159,6 +163,7 @@ where
             let sp = Arc::clone(&spawner);
             let priorities = priorities.clone();
             let stop_on_error = config.stop_on_error;
+            let stop_on_terminal_error = config.stop_on_terminal_error;
             let max_executions = config.max_executions;
             let time_filter = config.time_filter;
             let time_predicate = config.time_predicate;
@@ -178,6 +183,7 @@ where
                     observer,
                     priorities,
                     stop_on_error,
+                    stop_on_terminal_error,
                     max_executions,
                     time_filter,
                     mailbox_time,

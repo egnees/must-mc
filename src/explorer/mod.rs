@@ -63,6 +63,13 @@ pub struct Config {
     /// error event the terminal classification never runs the error scan, so full/blocked
     /// counts are identical to the `true` case.
     pub stop_on_error: bool,
+    /// Stop after reporting the first accepted Error terminal, after timing verification.
+    /// Unlike `stop_on_error`, error prefixes remain explorable until a terminal is
+    /// reached. Filtered errors, Full and Blocked terminals do not trigger this flag.
+    /// Default false. Use [`with_stop_on_terminal_error`](Self::with_stop_on_terminal_error)
+    /// to also disable immediate error-prefix stopping. In parallel this is best-effort:
+    /// workers already reporting terminals may produce additional outcomes.
+    pub stop_on_terminal_error: bool,
     /// Optional cap on the number of terminal (full + blocked) executions; the run
     /// stops once it is reached. `None` = unbounded.
     ///
@@ -82,7 +89,9 @@ pub struct Config {
     /// `on_execution`, and counts towards neither the terminal count nor `max_executions`.
     /// Default `false` (every untimed oracle count is unchanged).
     ///
-    /// Requires [`collect_errors`](Self::collect_errors): `time_filter` with `stop_on_error`
+    /// Requires [`collect_errors`](Self::collect_errors) or
+    /// [`with_stop_on_terminal_error`](Self::with_stop_on_terminal_error):
+    /// `time_filter` with `stop_on_error`
     /// is unsupported and panics, because an eager-infeasible *error* prefix must stay
     /// explorable — a consistent, time-realizable terminal can be reachable only by a
     /// backward revisit *out of* that error graph (revisit completeness, engine_plan §3 B1).
@@ -201,6 +210,7 @@ impl Default for Config {
             priorities: None,
             source_order: SourceOrder::default(),
             stop_on_error: true,
+            stop_on_terminal_error: false,
             max_executions: None,
             threads: 1,
             time_filter: false,
@@ -230,6 +240,16 @@ impl Config {
     /// Keep exploring after an error instead of stopping.
     pub fn collect_errors(mut self) -> Self {
         self.stop_on_error = false;
+        self.stop_on_terminal_error = false;
+        self
+    }
+    /// Stop on the first accepted Error terminal, keeping error prefixes explorable.
+    /// Compatible with terminal timing filters and certified pruning. The observer
+    /// receives the counterexample before stopping; time-infeasible errors do not stop
+    /// the search. Full and Blocked terminals do not stop it either.
+    pub fn with_stop_on_terminal_error(mut self) -> Self {
+        self.stop_on_error = false;
+        self.stop_on_terminal_error = true;
         self
     }
     /// Explore across `threads` worker threads (clamped to at least one).
@@ -238,13 +258,15 @@ impl Config {
         self
     }
     /// Enable the eager-time realizability filter (see [`time_filter`](Self::time_filter)).
-    /// Must be combined with [`collect_errors`](Self::collect_errors), or `explore` panics.
+    /// Combine with [`collect_errors`](Self::collect_errors) or
+    /// [`with_stop_on_terminal_error`](Self::with_stop_on_terminal_error), or `explore` panics.
     pub fn with_time_filter(mut self) -> Self {
         self.time_filter = true;
         self
     }
     /// Select the timed mailbox semantics described in `docs/P2P_AND_TIMED_RECEIVES.md`.
-    /// Combine with `collect_errors()` and `with_time_filter()`, `with_time_zombie()`
+    /// Combine with `collect_errors()` or `with_stop_on_terminal_error()`, and
+    /// `with_time_filter()`, `with_time_zombie()`
     /// or `with_certified_time()`. This selects semantics independently of pruning.
     pub fn with_mailbox_time(mut self) -> Self {
         self.mailbox_time = true;
@@ -358,7 +380,7 @@ where
                 && !config.time_predicate
                 && !config.time_canon_free
                 && !config.stop_on_error),
-        "certified timing requires collect_errors(), time_filter or time_zombie, and \
+        "certified timing requires collect_errors() or with_stop_on_terminal_error(), time_filter or time_zombie, and \
          original canonical rules (no time_predicate or time_canon_free)"
     );
     // B1 (engine_plan §3): the time filter needs the whole error-subtree to stay explorable,
@@ -367,14 +389,14 @@ where
     // combination is rejected up front — for both the sequential and the parallel path.
     assert!(
         !(config.time_filter && config.stop_on_error),
-        "Config::with_time_filter() requires collect_errors(): time-infeasible error \
+        "Config::with_time_filter() requires collect_errors() or with_stop_on_terminal_error(): time-infeasible error \
          prefixes must stay explorable (revisit completeness)"
     );
     // T2 (T2_PLAN §5): `with_time_predicate` needs the whole error subtree explorable for the
     // same revisit-completeness reason as `with_time_filter`.
     assert!(
         !(config.time_predicate && config.stop_on_error),
-        "Config::with_time_predicate() requires collect_errors(): eager-infeasible error \
+        "Config::with_time_predicate() requires collect_errors() or with_stop_on_terminal_error(): eager-infeasible error \
          prefixes must stay explorable (revisit completeness)"
     );
     // The filter (post-hoc on terminals) and the predicate (drives the search) are two distinct
@@ -387,7 +409,7 @@ where
     // (its `record` routing IS the filter's), and a third mutually-exclusive regime.
     assert!(
         !(config.time_zombie && config.stop_on_error),
-        "Config::with_time_zombie() requires collect_errors(): time-infeasible error \
+        "Config::with_time_zombie() requires collect_errors() or with_stop_on_terminal_error(): time-infeasible error \
          prefixes must stay explorable (revisit completeness)"
     );
     assert!(
@@ -420,6 +442,7 @@ where
         priorities,
         source_order: config.source_order,
         stop_on_error: config.stop_on_error,
+        stop_on_terminal_error: config.stop_on_terminal_error,
         max_executions: config.max_executions,
         time_filter: config.time_filter,
         mailbox_time: config.mailbox_time,
@@ -467,6 +490,7 @@ pub(crate) struct Explorer<'a, P: Program, O: Observer> {
     pub(crate) observer: &'a O,
     pub(crate) priorities: Vec<Tid>,
     stop_on_error: bool,
+    stop_on_terminal_error: bool,
     max_executions: Option<usize>,
     /// Suppress non-eager-time-realizable terminals ([`Config::time_filter`]). Read only in
     /// [`record`](Self::record); `eager_feasible` is a pure function of the graph, so this
@@ -1045,7 +1069,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         self.backward_revisits(&mut first, &g_add, e);
     }
 
-    /// Record a terminal execution and honour the `max_executions` cap. Returns whether the
+    /// Record a terminal execution and honour terminal stopping rules. Returns whether the
     /// terminal was reported (`true`) or suppressed by the eager time filter (`false`).
     ///
     /// This is the single funnel every terminal (sequential and parallel; full, blocked or
@@ -1097,6 +1121,9 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         self.terminals_recorded += 1;
         if matches!(kind, ExecutionKind::Full | ExecutionKind::Blocked) {
             self.terminal_count += 1;
+        }
+        if self.stop_on_terminal_error && kind == ExecutionKind::Error {
+            self.request_stop();
         }
         if let Some(limit) = self.max_executions {
             let hit = if let Some(sp) = &self.fork {
