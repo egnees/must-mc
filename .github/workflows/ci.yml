@@ -20,6 +20,8 @@ jobs:
       # Debug: exercises overflow checks + debug_assertions (the heavy oracles are
       # debug-gated with #[cfg_attr(debug_assertions, ignore)], so they stay skipped here).
       - run: cargo test
+      - run: cargo test --example broadcast
+      - run: python3 -B -m unittest discover -s scripts -p 'test_test_broadcast_submissions.py'
       # Release: same suite optimized, and it additionally runs the heavy debug-gated oracles.
       - run: cargo test --release
 
