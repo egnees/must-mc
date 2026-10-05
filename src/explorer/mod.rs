@@ -76,6 +76,21 @@ pub struct Config {
     /// A terminal suppressed by [`time_filter`](Self::time_filter) is *not* an execution of
     /// the timed program, so it counts towards neither this cap nor the terminal count.
     pub max_executions: Option<usize>,
+    /// Optional construction budget: maximum sends in the current graph, across all
+    /// threads (including already consumed sends). `None` = unbounded.
+    ///
+    /// Before adding a send beyond this budget, abandon that subtree and notify
+    /// [`Observer::on_send_limit`](crate::Observer::on_send_limit). This is an
+    /// inconclusive cutoff, NOT a terminal execution or a protocol error. Receives
+    /// and other events may still run at exactly the limit.
+    ///
+    /// This is a resource bound, not complete bounded model checking: a backward
+    /// revisit may need an over-budget intermediate graph to discover a smaller
+    /// execution. If any cutoff occurs, absence of errors proves nothing about
+    /// unexplored executions, even those with at most this many sends. It also
+    /// does not bound loops that make progress without sending, or temporary
+    /// graphs built by internal consistency and timing lookahead.
+    pub max_sends: Option<usize>,
     /// Worker threads for the exploration. `1` (the default) runs the ordinary sequential
     /// search on the calling thread; `> 1` fans the independent subtrees out across that
     /// many workers. The set of executions is identical either way (only their order, and
@@ -212,6 +227,7 @@ impl Default for Config {
             stop_on_error: true,
             stop_on_terminal_error: false,
             max_executions: None,
+            max_sends: None,
             threads: 1,
             time_filter: false,
             mailbox_time: false,
@@ -250,6 +266,12 @@ impl Config {
     pub fn with_stop_on_terminal_error(mut self) -> Self {
         self.stop_on_error = false;
         self.stop_on_terminal_error = true;
+        self
+    }
+    /// Limit sends across all threads of a construction graph. Any cutoff makes
+    /// the search incomplete; see [`max_sends`](Self::max_sends).
+    pub fn with_max_sends(mut self, max_sends: usize) -> Self {
+        self.max_sends = Some(max_sends);
         self
     }
     /// Explore across `threads` worker threads (clamped to at least one).
@@ -444,6 +466,7 @@ where
         stop_on_error: config.stop_on_error,
         stop_on_terminal_error: config.stop_on_terminal_error,
         max_executions: config.max_executions,
+        max_sends: config.max_sends,
         time_filter: config.time_filter,
         mailbox_time: config.mailbox_time,
         time_predicate: config.time_predicate,
@@ -492,6 +515,7 @@ pub(crate) struct Explorer<'a, P: Program, O: Observer> {
     stop_on_error: bool,
     stop_on_terminal_error: bool,
     max_executions: Option<usize>,
+    max_sends: Option<usize>,
     /// Suppress non-eager-time-realizable terminals ([`Config::time_filter`]). Read only in
     /// [`record`](Self::record); `eager_feasible` is a pure function of the graph, so this
     /// carries no cross-branch state and is safe to copy into every parallel worker.
@@ -1014,6 +1038,15 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         traces: &mut Vec<Vec<Option<Val>>>,
         nexts: &mut Vec<ThreadNext>,
     ) {
+        if let Some(limit) = self.max_sends {
+            if g.iter_sends().count() >= limit {
+                // This also skips potential repairing revisits. Report incomplete
+                // search even for a currently time-infeasible construction prefix;
+                // never route this through the terminal timing filter.
+                self.observer.on_send_limit(g, limit);
+                return;
+            }
+        }
         let mut g_add = g.clone();
         let e = g_add.add_event(tid, label);
         self.observer.on_event_added(&g_add, e);

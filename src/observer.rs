@@ -224,6 +224,12 @@ pub trait Observer {
     fn on_frozen_time(&self, _g: &ExecutionGraph, _event: &FrozenTimeEvent) {}
     /// A terminal execution (full / blocked / error) was reached.
     fn on_execution(&self, _exec: &Execution, _kind: ExecutionKind) {}
+    /// Construction stopped before another send would exceed `Config::max_sends`.
+    /// `g` is the prefix before that send, not a completed execution or a proven
+    /// counterexample. Any such callback makes the search incomplete; even executions
+    /// within the budget may require an over-budget construction and a backward revisit.
+    /// This callback is not subject to terminal timing filters.
+    fn on_send_limit(&self, _g: &ExecutionGraph, _limit: usize) {}
     /// A terminal suppressed by the eager time filter (`Config::time_filter`): the graph is
     /// consistent but not time-realisable. [`on_execution`](Self::on_execution) is *not*
     /// called for it, and it does not count towards `max_executions`.
@@ -281,6 +287,7 @@ struct Shard {
     full: AtomicUsize,
     blocked: AtomicUsize,
     errors: AtomicUsize,
+    send_limit_hits: AtomicUsize,
     filtered_full: AtomicUsize,
     filtered_blocked: AtomicUsize,
     filtered_errors: AtomicUsize,
@@ -378,6 +385,11 @@ impl CountingObserver {
     }
     pub fn errors(&self) -> usize {
         self.total(|s| &s.errors)
+    }
+    /// Inconclusive construction cutoffs, separate from all terminal counts.
+    /// Any nonzero value means absence of errors is not a complete verification.
+    pub fn send_limit_hits(&self) -> usize {
+        self.total(|s| &s.send_limit_hits)
     }
     /// Full terminals suppressed by the eager time filter.
     pub fn filtered_full(&self) -> usize {
@@ -637,6 +649,9 @@ impl Observer for CountingObserver {
             ExecutionKind::Error => &shard.filtered_errors,
         }
         .fetch_add(1, Ordering::Relaxed);
+    }
+    fn on_send_limit(&self, _g: &ExecutionGraph, _limit: usize) {
+        self.shard().send_limit_hits.fetch_add(1, Ordering::Relaxed);
     }
     fn on_thread_blocked(&self, _g: &ExecutionGraph, _tid: Tid) {
         self.shard().threads_blocked.fetch_add(1, Ordering::Relaxed);
@@ -1041,6 +1056,10 @@ impl<A: Observer, B: Observer> Observer for (A, B) {
     fn on_execution(&self, exec: &Execution, kind: ExecutionKind) {
         self.0.on_execution(exec, kind);
         self.1.on_execution(exec, kind);
+    }
+    fn on_send_limit(&self, g: &ExecutionGraph, limit: usize) {
+        self.0.on_send_limit(g, limit);
+        self.1.on_send_limit(g, limit);
     }
     fn on_execution_filtered(&self, exec: &Execution, kind: ExecutionKind) {
         self.0.on_execution_filtered(exec, kind);

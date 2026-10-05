@@ -165,6 +165,7 @@ where
             let stop_on_error = config.stop_on_error;
             let stop_on_terminal_error = config.stop_on_terminal_error;
             let max_executions = config.max_executions;
+            let max_sends = config.max_sends;
             let time_filter = config.time_filter;
             let time_predicate = config.time_predicate;
             let time_level = config.time_predicate_level;
@@ -185,6 +186,7 @@ where
                     stop_on_error,
                     stop_on_terminal_error,
                     max_executions,
+                    max_sends,
                     time_filter,
                     mailbox_time,
                     time_predicate,
