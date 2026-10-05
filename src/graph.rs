@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use crate::event::{EventId, Label, Model, Tid, Val};
+use crate::event::{EventId, Label, Model, Tid, Val, Window};
 
 /// One event as stored in the graph: its label, its insertion stamp, and — inlined rather
 /// than held in side maps — the receive's reads-from source and the nondet event's chosen
@@ -24,8 +24,8 @@ pub struct StoredEvent {
     /// [`reads_from`](ExecutionGraph::reads_from). `None` for every non-receive event and
     /// never read for them.
     rf: Option<EventId>,
-    /// The value a nondet event resolved to: `Some` once assigned, `None` before assignment
-    /// and for every non-nondet event.
+    /// The value a nondet event resolved to (Algorithm 1, line 6): `Some` once assigned,
+    /// `None` before assignment and for every non-nondet event.
     nd: Option<Val>,
 }
 
@@ -36,15 +36,17 @@ pub struct StoredEvent {
 /// sets valid.
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionGraph {
-    /// `threads[t]` holds thread `t`'s events in program order, so the vector index is the
-    /// event's `idx` and `po` is exactly the vector order. Each event carries its `rf`/`nd`
-    /// inline. No inverse (read-by) map is cached; `is_read`/`unread_sends` scan the events,
-    /// which stays correct through the transient double-read states that exploration creates.
+    /// `threads[t]` holds the events of thread `t` in program order; the vector
+    /// index is the event's `idx`, so `po` is exactly the vector order. Each event carries
+    /// its own `rf`/`nd` inline (see [`StoredEvent`]). No inverse (read-by) map is cached:
+    /// `is_read`/`unread_sends` scan the events, which stays correct even through the
+    /// transient double-read states that arise during exploration.
     ///
-    /// Each thread's vector sits behind a copy-on-write `Arc`: cloning a graph only bumps
-    /// refcounts, and a mutation copies just the one thread it touches, but only while that
-    /// thread is still shared. A child graph relies on this — it differs from its parent by a
-    /// single appended event in one thread.
+    /// Each thread's vector sits behind an `Arc` with copy-on-write. Cloning a graph shares
+    /// the thread vectors (a refcount bump per thread); a mutation
+    /// (`add_event`/`set_rf`/`set_nd`) copies only the one thread it touches, and only while
+    /// that thread is still shared with another graph. This is what a child graph exploits:
+    /// it differs from its parent by a single appended event in one thread.
     threads: Vec<Arc<Vec<StoredEvent>>>,
     /// Monotonic insertion counter; the next added event gets this stamp.
     next_stamp: u64,
@@ -137,7 +139,8 @@ impl ExecutionGraph {
         self.iter_events().any(|e| self.stored(e).rf == Some(s))
     }
 
-    /// Assign the chosen value `v` to nondet event `e`, replacing any previous choice.
+    /// Assign the chosen value `v` to nondet event `e` (Algorithm 1, line 6), replacing
+    /// any previous choice.
     pub fn set_nd(&mut self, e: EventId, v: Val) {
         debug_assert!(
             self.contains(e) && self.label(e).is_nondet(),
@@ -157,13 +160,24 @@ impl ExecutionGraph {
 
     /// All nondet events in `(tid, idx)` order.
     pub fn nondet_events(&self) -> Vec<EventId> {
-        self.iter_events()
+        self.all_events()
+            .into_iter()
             .filter(|&e| self.label(e).is_nondet())
             .collect()
     }
 
     pub fn send_model(&self, e: EventId) -> Option<Model> {
         self.label(e).model()
+    }
+
+    /// A send's delivery [`Window`] (`None` for a non-send or a missing event). The seam
+    /// through which the time-intervals filter reads windows off the graph.
+    pub fn send_window(&self, e: EventId) -> Option<Window> {
+        if self.contains(e) {
+            self.label(e).window()
+        } else {
+            None
+        }
     }
 
     /// All events in `(tid, idx)` order, without allocating a `Vec`: the iterator
@@ -200,14 +214,20 @@ impl ExecutionGraph {
     }
 
     pub fn sends(&self) -> Vec<EventId> {
-        self.iter_sends().collect()
+        self.all_events()
+            .into_iter()
+            .filter(|&e| self.label(e).is_send())
+            .collect()
     }
 
     pub fn recvs(&self) -> Vec<EventId> {
-        self.iter_recvs().collect()
+        self.all_events()
+            .into_iter()
+            .filter(|&e| self.label(e).is_recv())
+            .collect()
     }
 
-    /// Sends that no receive reads.
+    /// Unread sends `G.US`: sends no receive reads.
     pub fn unread_sends(&self) -> Vec<EventId> {
         let read: BTreeSet<EventId> = self
             .iter_events()
@@ -219,8 +239,8 @@ impl ExecutionGraph {
             .collect()
     }
 
-    /// Whether send `s` matches receive `r`: `s`'s destination is `r`'s thread and `r`'s
-    /// predicate accepts `s`'s value.
+    /// `matches(s, r)`: `mval` with destination, i.e. `dst(s) = tid(r)` and `val(s)` is
+    /// in `vals(r)`.
     pub fn matches(&self, s: EventId, r: EventId) -> bool {
         let (Label::Send { dst, val, .. }, Label::Recv { pred, .. }) =
             (self.label(s), self.label(r))
@@ -460,9 +480,23 @@ const _: fn() = || {
 // pair of separate labels.
 fn label_key(l: &Label) -> String {
     match l {
-        Label::Send { model, dst, val } => {
+        Label::Send {
+            model,
+            dst,
+            val,
+            window,
+        } => {
             let v = crate::intern::resolve(*val);
-            format!("S{model}({dst},{}:{v})", v.len())
+            // The window is part of graph identity, but the suffix is emitted ONLY for a
+            // non-default (timed) window: an untimed send keeps the exact pre-window key,
+            // so every existing key stays byte-identical. `@` after the length-prefixed
+            // val (always after `)`) makes the suffix unambiguous to parse.
+            let win = if window.is_untimed() {
+                String::new()
+            } else {
+                format!("@{window}")
+            };
+            format!("S{model}({dst},{}:{v}){win}", v.len())
         }
         Label::Recv { pred, blocking } => {
             let b = if *blocking { "b" } else { "nb" };
@@ -544,9 +578,63 @@ mod tests {
     }
 
     #[test]
+    fn untimed_send_label_key_is_byte_identical() {
+        // An ordinary (ASAP) send must keep the exact pre-window key: no `@` suffix.
+        let l = Label::send(Model::P2p, 2, "1");
+        assert_eq!(label_key(&l), "Sp2p(2,1:1)");
+        // send_within with ASAP is indistinguishable from send.
+        let l2 = Label::send_within(Model::P2p, 2, "1", Window::ASAP);
+        assert_eq!(label_key(&l2), "Sp2p(2,1:1)");
+    }
+
+    #[test]
+    fn timed_send_label_key_appends_window_suffix() {
+        let finite = Label::send_within(Model::P2p, 2, "x", Window::new(10, 20));
+        assert_eq!(label_key(&finite), "Sp2p(2,1:x)@[10,20]");
+        let unbounded = Label::send_within(Model::Asyn, 1, "x", Window::at_least(10));
+        assert_eq!(label_key(&unbounded), "Sasyn(1,1:x)@[10,∞]");
+    }
+
+    #[test]
+    fn window_participates_in_canonical_key() {
+        // Two graphs differing only in a send's window are distinct graphs.
+        let mut g = ExecutionGraph::new();
+        g.add_event(
+            0,
+            Label::send_within(Model::P2p, 1, "x", Window::new(10, 20)),
+        );
+        let mut h = ExecutionGraph::new();
+        h.add_event(
+            0,
+            Label::send_within(Model::P2p, 1, "x", Window::new(30, 40)),
+        );
+        assert_ne!(g.canonical_key(), h.canonical_key());
+
+        // An untimed graph keys identically whether built via send or send_within(ASAP).
+        let mut a = ExecutionGraph::new();
+        a.add_event(0, Label::send(Model::P2p, 1, "x"));
+        let mut b = ExecutionGraph::new();
+        b.add_event(0, Label::send_within(Model::P2p, 1, "x", Window::ASAP));
+        assert_eq!(a.canonical_key(), b.canonical_key());
+    }
+
+    #[test]
+    fn send_window_accessor() {
+        let mut g = ExecutionGraph::new();
+        let s = g.add_event(
+            0,
+            Label::send_within(Model::P2p, 1, "x", Window::new(10, 20)),
+        );
+        let r = g.add_event(1, Label::recv(Pred::any()));
+        assert_eq!(g.send_window(s), Some(Window::new(10, 20)));
+        assert_eq!(g.send_window(r), None); // non-send
+        assert_eq!(g.send_window(EventId::new(9, 9)), None); // missing event
+    }
+
+    #[test]
     fn read_bookkeeping_survives_transient_double_read() {
-        // A transient double-read (r2 points at s, then away) must not disturb the fact that
-        // r1 still reads s — read state is derived from the events, never cached.
+        // Regression: with a cached inverse map, set_rf(r2, Some(s)); set_rf(r2, None)
+        // used to erase the fact that r1 still reads s.
         let mut g = ExecutionGraph::new();
         let s = g.add_event(0, Label::send(Model::P2p, 1, "1"));
         let r1 = g.add_event(1, Label::recv(Pred::any()));

@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 use std::task::{Context, Poll, Waker};
 
-use crate::event::{Label, Model, Tid, Val};
+use crate::event::{Label, Model, Tid, Val, Window};
 use crate::program::ThreadNext;
 
 use super::{BoxedPred, LocalFut};
@@ -87,7 +87,7 @@ impl ThreadCell {
 
     /// `Ctx::send`. If this send is still within the trace it is already in the graph
     /// (advance past it); otherwise it is this thread's next event.
-    pub(crate) fn record_send(&mut self, to: Tid, msg: Val, model: Model) {
+    pub(crate) fn record_send(&mut self, to: Tid, msg: Val, model: Model, window: Window) {
         if self.halted() || self.over_budget() {
             return;
         }
@@ -100,7 +100,7 @@ impl ThreadCell {
             );
             self.cursor += 1;
         } else {
-            self.halt = Halt::Emit(Label::send(model, to, msg));
+            self.halt = Halt::Emit(Label::send_within(model, to, msg, window));
         }
     }
 
@@ -164,10 +164,10 @@ impl ThreadCell {
         }
     }
 
-    /// `NondetFuture::poll`. Mirrors `poll_recv` but for a data non-determinism choice: it
-    /// never touches `recv_index`, a committed slot is always a value (a nondet event never
-    /// reads nothing), and parking emits `Label::nondet(set)`. Advances `cursor` on a
-    /// committed replay so po position stays in step.
+    /// `NondetFuture::poll`. Mirrors `poll_recv` but for a data non-determinism choice
+    /// (ND, Algorithm 1 line 6): it never touches `recv_index`, a committed slot is always
+    /// a value (a nondet event never reads nothing), and parking emits `Label::nondet(set)`.
+    /// Advances `cursor` on a committed replay so po position stays in step.
     pub(crate) fn poll_nondet(&mut self, set: &mut Option<Vec<Val>>) -> Poll<Val> {
         // Once the next event is recorded (or the thread finished) further awaits park.
         if self.halted() || self.over_budget() {

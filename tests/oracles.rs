@@ -22,69 +22,15 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::{
-    assert_no_duplicates, assert_oracle, assert_oracle_default, factorial, permutations, recv,
-    recv_eq, sample_perms, send, SeqProgram,
+    assert_no_duplicates, assert_oracle, assert_oracle_default, blocked_and_full, blocked_no_match,
+    example_2_8, factorial, ns_nr, ns_nr_sel, ns_r, nworkers, permutations, sample_perms, ssr,
 };
 use must::event::Model;
 use must::{explore, Config, ExecutionCollector, System};
 
-const P2P: Model = Model::P2p;
-
-// -- Program builders -------------------------------------------------------------
-
-/// s+s+r: `T0: send(2,1) || T1: send(2,2) || T2: recv()` -- two senders to the receiver
-/// (tid 2). The receive reads one of the two sends: 2 full executions.
-fn ssr() -> SeqProgram {
-    SeqProgram::new(vec![
-        vec![send(P2P, 2, "1")],
-        vec![send(P2P, 2, "2")],
-        vec![recv()],
-    ])
-}
-
-/// ns+r(N): `T0..T(N-1): send(N, i) || TN: recv()`. N senders to the receiver (tid N),
-/// one blocking receive that reads exactly one of them: N full executions (lazy
-/// ordering -- N instead of N!).
-fn ns_r(n: usize) -> SeqProgram {
-    let mut threads: Vec<_> = (0..n).map(|i| vec![send(P2P, n, &i.to_string())]).collect();
-    threads.push(vec![recv()]);
-    SeqProgram::new(threads)
-}
-
-/// ns+nr(N): `T0..T(N-1): send(N, i) || TN: recv() ... recv()` (N receives). N sends
-/// consumed by N non-selective receives in one thread: every permutation of the
-/// delivery order is a distinct execution -- N! full executions.
-fn ns_nr(n: usize) -> SeqProgram {
-    let mut threads: Vec<_> = (0..n).map(|i| vec![send(P2P, n, &i.to_string())]).collect();
-    threads.push((0..n).map(|_| recv()).collect());
-    SeqProgram::new(threads)
-}
-
-/// ns+nr-sel(N): like ns+nr but the k-th receive is selective (`recv(x == k)`). Each
-/// receive matches exactly one send, so there is a single consistent execution for any
-/// N (selective receives collapse the N! down to 1).
-fn ns_nr_sel(n: usize) -> SeqProgram {
-    let mut threads: Vec<_> = (0..n).map(|i| vec![send(P2P, n, &i.to_string())]).collect();
-    threads.push((0..n).map(|i| recv_eq(&i.to_string())).collect());
-    SeqProgram::new(threads)
-}
-
-/// nworkers(N): main (tid 0) sends a message to *itself*, then receives; N workers
-/// (tids 1..=N) each send to the coordinator (tid N+1); the coordinator receives all N
-/// then sends "done" to main. The coordinator's N receives can consume the workers in
-/// any order (N! ways) and main's receive may read either its own message or the
-/// coordinator's (2 ways): 2*N! full executions (note the send-to-self).
-fn nworkers(n: usize) -> SeqProgram {
-    let coord = n + 1;
-    let mut threads = vec![vec![send(P2P, 0, "self"), recv()]]; // main
-    for w in 0..n {
-        threads.push(vec![send(P2P, coord, &format!("w{w}"))]);
-    }
-    let mut coord_evs: Vec<_> = (0..n).map(|_| recv()).collect();
-    coord_evs.push(send(P2P, 0, "done"));
-    threads.push(coord_evs);
-    SeqProgram::new(threads)
-}
+// The oracle program builders (ssr, ns_r, ns_nr, ns_nr_sel, nworkers, example_2_8,
+// blocked_*) live in `tests/common/mod.rs` so the timed-filter tests can replay the same
+// table; this file only asserts the counts.
 
 // -- s+s+r ------------------------------------------------------------------------
 
@@ -110,7 +56,7 @@ fn nsr_5() {
 
 #[test]
 fn nsr_8() {
-    // 9 threads: a sample of permutations.
+    // 9 threads: default + reverse + rotation. 8 executions, trivially cheap.
     assert_oracle("ns+r(8)", &ns_r(8), &sample_perms(9), 8, 0);
 }
 
@@ -123,7 +69,8 @@ fn nsnr_2() {
 
 #[test]
 fn nsnr_4() {
-    // 24 = 4! interpolates the N! law (Table 1 lists only N = 2/5/8).
+    // 24 = 4! interpolates the N! law (Table 1 tabulates only N = 2/5/8). 5 threads =
+    // 120 permutations; each yields 24 executions.
     assert_oracle("ns+nr(4)", &ns_nr(4), &permutations(5), factorial(4), 0);
 }
 
@@ -168,18 +115,15 @@ fn nsnr_sel_8() {
 /// reading is the crossed one (2nd receive gets "1"): exactly 1 execution.
 #[test]
 fn example_2_8_one_full() {
-    let prog = SeqProgram::new(vec![
-        vec![send(P2P, 1, "1"), send(P2P, 1, "2")],
-        vec![recv_eq("2"), recv_eq("1")],
-    ]);
-    assert_oracle("Example 2.8", &prog, &permutations(2), 1, 0);
+    assert_oracle("Example 2.8", &example_2_8(), &permutations(2), 1, 0);
 }
 
 // -- nworkers(N) = 2*N! -----------------------------------------------------------
 
 #[test]
 fn nworkers_3() {
-    // 12 = 2*3! by the 2*N! identity (Table 1 lists only N >= 7).
+    // 12 = 2*3! by the 2*N! identity (Table 1 tabulates only N >= 7). 5
+    // threads; all 120 permutations, 12 executions each.
     assert_oracle(
         "nworkers(3)",
         &nworkers(3),
@@ -191,7 +135,7 @@ fn nworkers_3() {
 
 #[test]
 fn nworkers_4() {
-    // 48 = 2*4! (formula).
+    // 48 = 2*4! (formula). 6 threads; sample of permutations.
     assert_oracle(
         "nworkers(4)",
         &nworkers(4),
@@ -229,8 +173,13 @@ fn nworkers_7() {
 /// receive is never added). Also checks the predicate participates in addability.
 #[test]
 fn blocked_no_matching_message() {
-    let prog = SeqProgram::new(vec![vec![send(P2P, 1, "a")], vec![recv_eq("b")]]);
-    assert_oracle("blocked (no match)", &prog, &permutations(2), 0, 1);
+    assert_oracle(
+        "blocked (no match)",
+        &blocked_no_match(),
+        &permutations(2),
+        0,
+        1,
+    );
 }
 
 /// Non-degenerate blocked oracle -- a program with both a full *and* a blocked terminal:
@@ -245,12 +194,7 @@ fn blocked_no_matching_message() {
 /// mirroring the fuzz harness's full-and-blocked terminal check.
 #[test]
 fn blocked_and_full_coexist() {
-    let prog = SeqProgram::new(vec![
-        vec![recv(), recv_eq("b")],
-        vec![send(P2P, 0, "a")],
-        vec![send(P2P, 0, "b")],
-    ]);
-    assert_oracle("blocked+full", &prog, &permutations(3), 1, 1);
+    assert_oracle("blocked+full", &blocked_and_full(), &permutations(3), 1, 1);
 }
 
 // -- Runtime cross-checks: the same numbers through the real System runtime ---------

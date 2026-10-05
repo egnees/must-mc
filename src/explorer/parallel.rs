@@ -160,6 +160,7 @@ where
             let priorities = priorities.clone();
             let stop_on_error = config.stop_on_error;
             let max_executions = config.max_executions;
+            let time_filter = config.time_filter;
             let make_program = &make_program;
             scope.spawn(move || {
                 // Route this worker's tallies to its own shard of a shared observer.
@@ -171,6 +172,7 @@ where
                     priorities,
                     stop_on_error,
                     max_executions,
+                    time_filter,
                     terminal_count: 0,
                     stop: false,
                     fork: Some(Arc::clone(&sp)),

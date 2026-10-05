@@ -65,7 +65,7 @@
 //! - [`scheduler`]: the scheduling policy the explorer follows.
 //! - [`explorer`]: the exploration itself, [`explore`].
 //! - [`observer`] / [`render`]: inspecting and displaying a run.
-//! - [`viz`]: dumping a run as a JSON trace.
+//! - [`viz`]: dumping a run as a `must-viz` JSON trace for the visualizer.
 
 pub mod consistency;
 pub mod event;
@@ -77,12 +77,13 @@ pub mod program;
 pub mod render;
 pub mod runtime;
 pub mod scheduler;
+pub mod time;
 pub mod viz;
 
 pub use consistency::{
     consistent, consistent_asyn, consistent_cd, consistent_mbox, consistent_p2p, well_formed,
 };
-pub use event::{Event, EventId, Label, Model, Pred, Tid, Val};
+pub use event::{Event, EventId, Label, Model, Pred, Tid, Val, Window};
 pub use explorer::{explore, Config, Execution, ExecutionKind};
 pub use graph::ExecutionGraph;
 pub use observer::{
@@ -91,4 +92,5 @@ pub use observer::{
 pub use program::{Program, ThreadNext};
 pub use runtime::{Ctx, NondetFuture, RecvFuture, RecvTimeoutFuture, System, DEFAULT_MAX_EVENTS};
 pub use scheduler::{next_step, traces_of, NextStep};
+pub use time::{check, eager_feasible, TimedVerdict};
 pub use viz::{Summary as TraceSummary, TraceObserver};

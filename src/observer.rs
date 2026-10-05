@@ -49,6 +49,10 @@ pub trait Observer {
     fn on_revisit_rejected(&self, _g: &ExecutionGraph, _r: EventId, _s: EventId) {}
     /// A terminal execution (full / blocked / error) was reached.
     fn on_execution(&self, _exec: &Execution, _kind: ExecutionKind) {}
+    /// A terminal suppressed by the eager time filter (`Config::time_filter`): the graph is
+    /// consistent but not time-realisable. [`on_execution`](Self::on_execution) is *not*
+    /// called for it, and it does not count towards `max_executions`.
+    fn on_execution_filtered(&self, _exec: &Execution, _kind: ExecutionKind) {}
     /// Thread `tid` is blocked on a receive with no message in `g`.
     fn on_thread_blocked(&self, _g: &ExecutionGraph, _tid: Tid) {}
 }
@@ -102,6 +106,9 @@ struct Shard {
     full: AtomicUsize,
     blocked: AtomicUsize,
     errors: AtomicUsize,
+    filtered_full: AtomicUsize,
+    filtered_blocked: AtomicUsize,
+    filtered_errors: AtomicUsize,
     threads_blocked: AtomicUsize,
 }
 
@@ -170,6 +177,22 @@ impl CountingObserver {
     pub fn errors(&self) -> usize {
         self.total(|s| &s.errors)
     }
+    /// Full terminals suppressed by the eager time filter.
+    pub fn filtered_full(&self) -> usize {
+        self.total(|s| &s.filtered_full)
+    }
+    /// Blocked terminals suppressed by the eager time filter.
+    pub fn filtered_blocked(&self) -> usize {
+        self.total(|s| &s.filtered_blocked)
+    }
+    /// Error terminals suppressed by the eager time filter.
+    pub fn filtered_errors(&self) -> usize {
+        self.total(|s| &s.filtered_errors)
+    }
+    /// All time-filtered terminals (full + blocked + error).
+    pub fn filtered(&self) -> usize {
+        self.filtered_full() + self.filtered_blocked() + self.filtered_errors()
+    }
     pub fn threads_blocked(&self) -> usize {
         self.total(|s| &s.threads_blocked)
     }
@@ -215,6 +238,15 @@ impl Observer for CountingObserver {
         }
         .fetch_add(1, Ordering::Relaxed);
     }
+    fn on_execution_filtered(&self, _exec: &Execution, kind: ExecutionKind) {
+        let shard = self.shard();
+        match kind {
+            ExecutionKind::Full => &shard.filtered_full,
+            ExecutionKind::Blocked => &shard.filtered_blocked,
+            ExecutionKind::Error => &shard.filtered_errors,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
     fn on_thread_blocked(&self, _g: &ExecutionGraph, _tid: Tid) {
         self.shard().threads_blocked.fetch_add(1, Ordering::Relaxed);
     }
@@ -251,13 +283,16 @@ pub enum StepKind {
     Execution {
         kind: ExecutionKind,
     },
+    ExecutionFiltered {
+        kind: ExecutionKind,
+    },
     ThreadBlocked {
         tid: Tid,
     },
 }
 
-/// Flat log of every step, for later rendering. Best for sequential runs — a parallel run
-/// interleaves the workers' steps into one meaningless log.
+/// Flat log of every step, for later rendering. For sequential runs in practice: a
+/// parallel run interleaves the workers' steps into one meaningless log.
 #[derive(Debug, Default)]
 pub struct RecordingObserver {
     steps: Mutex<Vec<Step>>,
@@ -315,6 +350,9 @@ impl Observer for RecordingObserver {
     fn on_execution(&self, exec: &Execution, kind: ExecutionKind) {
         self.record(StepKind::Execution { kind }, exec.graph());
     }
+    fn on_execution_filtered(&self, exec: &Execution, kind: ExecutionKind) {
+        self.record(StepKind::ExecutionFiltered { kind }, exec.graph());
+    }
     fn on_thread_blocked(&self, g: &ExecutionGraph, tid: Tid) {
         self.record(StepKind::ThreadBlocked { tid }, g);
     }
@@ -336,6 +374,7 @@ struct Collected {
     full: Vec<Execution>,
     blocked: Vec<Execution>,
     errors: Vec<Execution>,
+    filtered: Vec<(Execution, ExecutionKind)>,
 }
 
 impl ExecutionCollector {
@@ -355,7 +394,12 @@ impl ExecutionCollector {
     pub fn errors(&self) -> Vec<Execution> {
         self.inner.lock().unwrap().errors.clone()
     }
-    /// Full followed by blocked - the terminal executions the search must not duplicate.
+    /// The terminals suppressed by the eager time filter, each paired with its kind.
+    pub fn filtered(&self) -> Vec<(Execution, ExecutionKind)> {
+        self.inner.lock().unwrap().filtered.clone()
+    }
+    /// Full followed by blocked - the terminal executions over which Theorem 4.1 forbids
+    /// duplicates.
     pub fn terminals(&self) -> Vec<Execution> {
         let c = self.inner.lock().unwrap();
         c.full.iter().chain(c.blocked.iter()).cloned().collect()
@@ -369,6 +413,10 @@ impl ExecutionCollector {
     }
     pub fn error_count(&self) -> usize {
         self.inner.lock().unwrap().errors.len()
+    }
+    /// How many terminals the eager time filter suppressed.
+    pub fn filtered_count(&self) -> usize {
+        self.inner.lock().unwrap().filtered.len()
     }
     /// Full + blocked, the terminal count.
     pub fn terminal_count(&self) -> usize {
@@ -405,6 +453,20 @@ impl ExecutionCollector {
             .map(Execution::canonical_key)
             .collect()
     }
+    /// Canonical keys of the time-filtered terminals, sorted so the set is deterministic
+    /// regardless of the (possibly parallel) collection order.
+    pub fn filtered_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .inner
+            .lock()
+            .unwrap()
+            .filtered
+            .iter()
+            .map(|(e, _)| e.canonical_key())
+            .collect();
+        keys.sort();
+        keys
+    }
 }
 
 impl Observer for ExecutionCollector {
@@ -415,6 +477,13 @@ impl Observer for ExecutionCollector {
             ExecutionKind::Blocked => c.blocked.push(exec.clone()),
             ExecutionKind::Error => c.errors.push(exec.clone()),
         }
+    }
+    fn on_execution_filtered(&self, exec: &Execution, kind: ExecutionKind) {
+        self.inner
+            .lock()
+            .unwrap()
+            .filtered
+            .push((exec.clone(), kind));
     }
 }
 
@@ -449,6 +518,10 @@ impl<A: Observer, B: Observer> Observer for (A, B) {
     fn on_execution(&self, exec: &Execution, kind: ExecutionKind) {
         self.0.on_execution(exec, kind);
         self.1.on_execution(exec, kind);
+    }
+    fn on_execution_filtered(&self, exec: &Execution, kind: ExecutionKind) {
+        self.0.on_execution_filtered(exec, kind);
+        self.1.on_execution_filtered(exec, kind);
     }
     fn on_thread_blocked(&self, g: &ExecutionGraph, tid: Tid) {
         self.0.on_thread_blocked(g, tid);

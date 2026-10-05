@@ -13,8 +13,19 @@ use crate::observer::{RecordingObserver, Step, StepKind};
 /// Render one event's label compactly, e.g. `S p2p->2 "1"` or `err "..."`.
 fn label_cell(l: &Label) -> String {
     match l {
-        Label::Send { model, dst, val } => {
-            format!("S {model}→{dst} \"{}\"", crate::intern::resolve(*val))
+        Label::Send {
+            model,
+            dst,
+            val,
+            window,
+        } => {
+            // Append the window only for a timed send, so untimed output is unchanged.
+            let win = if window.is_untimed() {
+                String::new()
+            } else {
+                format!(" {window}")
+            };
+            format!("S {model}→{dst} \"{}\"{win}", crate::intern::resolve(*val))
         }
         Label::Recv { pred, blocking } => {
             let b = if *blocking { "b" } else { "nb" };
@@ -126,6 +137,9 @@ fn step_headline(kind: &StepKind) -> String {
             format!("revisit rejected {}←{}", fmt_id(*r), fmt_id(*s))
         }
         StepKind::Execution { kind } => format!("== {kind:?} execution =="),
+        StepKind::ExecutionFiltered { kind } => {
+            format!("== {kind:?} execution (time-filtered) ==")
+        }
         StepKind::ThreadBlocked { tid } => format!("thread T{tid} blocked"),
     }
 }

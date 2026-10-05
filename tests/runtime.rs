@@ -3,7 +3,7 @@
 //! no explorer.
 
 use must::event::{Label, Val};
-use must::{Model, Program, System, ThreadNext};
+use must::{Model, Program, System, ThreadNext, Window};
 
 /// Convenience: a `None` trace entry stands for a send/error event (its `G.val` is nothing).
 const S: Option<Val> = None;
@@ -124,12 +124,37 @@ fn send_to_self() {
         ctx.send(me, "self", Model::Mbox);
     });
     match &sys.next(&[vec![]])[0] {
-        ThreadNext::Next(Label::Send { dst, val, model }) => {
+        ThreadNext::Next(Label::Send {
+            dst, val, model, ..
+        }) => {
             assert_eq!(*dst, 0);
             assert_eq!(must::intern::resolve(*val), "self");
             assert_eq!(*model, Model::Mbox);
         }
         other => panic!("expected self-send, got {other:?}"),
+    }
+}
+
+/// A plain `send` carries the default (untimed) window; `send_within` carries the given
+/// one. The window rides through replay into the emitted `Label::Send`.
+#[test]
+fn send_within_emits_window() {
+    let mut sys = System::new();
+    sys.add(|ctx| async move {
+        ctx.send(1, "plain", Model::P2p);
+        ctx.send_within(1, "timed", Model::P2p, Window::new(10, 20));
+    });
+    match &sys.next(&[vec![]])[0] {
+        ThreadNext::Next(l @ Label::Send { .. }) => {
+            assert_eq!(l.window(), Some(Window::ASAP), "plain send is untimed");
+        }
+        other => panic!("expected Send, got {other:?}"),
+    }
+    match &sys.next(&[vec![S]])[0] {
+        ThreadNext::Next(l @ Label::Send { .. }) => {
+            assert_eq!(l.window(), Some(Window::new(10, 20)), "send_within window");
+        }
+        other => panic!("expected Send, got {other:?}"),
     }
 }
 

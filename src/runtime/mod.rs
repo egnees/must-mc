@@ -26,7 +26,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 
-use crate::event::{Model, Tid, Val};
+use crate::event::{Model, Tid, Val, Window};
 use crate::program::{Program, ThreadNext};
 
 use replay::{run_once, ThreadCell};
@@ -136,9 +136,20 @@ impl Ctx {
 
     /// Send `msg` to thread `to` under communication model `model` (fire-and-forget).
     /// Synchronous: emits a `Label::Send`. Sending to oneself (`to == self.tid()`) is
-    /// allowed.
+    /// allowed. Equivalent to `send_within(to, msg, model, Window::ASAP)`.
     pub fn send(&self, to: Tid, msg: impl Into<Val>, model: Model) {
-        self.cell.borrow_mut().record_send(to, msg.into(), model);
+        self.cell
+            .borrow_mut()
+            .record_send(to, msg.into(), model, Window::ASAP);
+    }
+
+    /// Like [`send`](Self::send) but with a delivery [`Window`] on the message: it arrives
+    /// at some time in `occ(s) + window` under the time-intervals extension. An ordinary
+    /// [`send`](Self::send) is `send_within(.., Window::ASAP)`.
+    pub fn send_within(&self, to: Tid, msg: impl Into<Val>, model: Model, window: Window) {
+        self.cell
+            .borrow_mut()
+            .record_send(to, msg.into(), model, window);
     }
 
     /// Blocking selective receive: awaits a message satisfying `pred` and returns it.
@@ -169,10 +180,10 @@ impl Ctx {
         }
     }
 
-    /// Data non-determinism: returns some value of the finite option set `set`. The search
-    /// enumerates every value of `set`; during replay it resolves to the value already
-    /// committed for this choice, or — when this is the thread's next event — parks and emits
-    /// `Label::nondet(set)`. `set` must be non-empty.
+    /// Data non-determinism (ND, Algorithm 1 lines 6 and 19): returns some value of the
+    /// finite option set `set`. The DPOR enumerates every value of `set`; during replay it
+    /// resolves to the value already committed for this choice, or - when this is the
+    /// thread's next event - parks and emits `Label::nondet(set)`. `set` must be non-empty.
     pub fn nondet(&self, set: impl IntoIterator<Item = impl Into<Val>>) -> NondetFuture {
         NondetFuture {
             cell: self.cell.clone(),
@@ -180,8 +191,8 @@ impl Ctx {
         }
     }
 
-    /// Assertion: if `cond` is false, emit `Label::Error` as this thread's next event. A
-    /// holding assertion is pure control flow.
+    /// Assertion: if `cond` is false, emit `Label::Error` as this thread's next event
+    /// (line 5 of Algorithm 1). A holding assertion is pure control flow.
     pub fn assert_that(&self, cond: bool, msg: &str) {
         self.cell.borrow_mut().record_assert(cond, msg);
     }

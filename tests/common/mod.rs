@@ -11,10 +11,13 @@
 // expected per-crate; silence the resulting dead-code warnings for the shared module.
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use must::event::{Label, Model, Pred};
-use must::{explore, Config, ExecutionCollector, Program, System, ThreadNext, Val};
+use must::event::{EventId, Label, Model, Pred};
+use must::{
+    explore, Config, CountingObserver, ExecutionCollector, ExecutionGraph, Program, System,
+    ThreadNext, Val,
+};
 
 /// A straight-line (value-independent) program: `threads[i]` is thread `i`'s ordered
 /// event list. `next(traces)[i]` is the `(len+1)`-th event of thread `i`, where `len`
@@ -75,6 +78,102 @@ pub fn recv_nb_eq(v: &str) -> Label {
 /// Data-nondeterminism `ND^S` over the option set `vals` (Algorithm 1 lines 6/19).
 pub fn nondet(vals: &[&str]) -> Label {
     Label::nondet(vals.iter().copied())
+}
+
+// -- Oracle program builders (the paper's Table 1 benchmarks) ----------------------
+//
+// These were once inline in `tests/oracles.rs`; they moved here so the timed-filter
+// tests can replay the whole oracle table under `Config::with_time_filter` without
+// duplicating the constructions. The counts they assert are unchanged.
+
+const P2P: Model = Model::P2p;
+
+/// s+s+r: `T0: send(2,1) || T1: send(2,2) || T2: recv()` -- two senders to the receiver
+/// (tid 2). The receive reads one of the two sends: 2 full executions.
+pub fn ssr() -> SeqProgram {
+    SeqProgram::new(vec![
+        vec![send(P2P, 2, "1")],
+        vec![send(P2P, 2, "2")],
+        vec![recv()],
+    ])
+}
+
+/// ns+r(N): `T0..T(N-1): send(N, i) || TN: recv()`. N senders to the receiver (tid N),
+/// one blocking receive that reads exactly one of them: N full executions (lazy
+/// ordering -- N instead of N!).
+pub fn ns_r(n: usize) -> SeqProgram {
+    let mut threads: Vec<_> = (0..n).map(|i| vec![send(P2P, n, &i.to_string())]).collect();
+    threads.push(vec![recv()]);
+    SeqProgram::new(threads)
+}
+
+/// ns+nr(N): `T0..T(N-1): send(N, i) || TN: recv() ... recv()` (N receives). N sends
+/// consumed by N non-selective receives in one thread: every permutation of the
+/// delivery order is a distinct execution -- N! full executions.
+pub fn ns_nr(n: usize) -> SeqProgram {
+    let mut threads: Vec<_> = (0..n).map(|i| vec![send(P2P, n, &i.to_string())]).collect();
+    threads.push((0..n).map(|_| recv()).collect());
+    SeqProgram::new(threads)
+}
+
+/// ns+nr-sel(N): like ns+nr but the k-th receive is selective (`recv(x == k)`). Each
+/// receive matches exactly one send, so there is a single consistent execution for any
+/// N (selective receives collapse the N! down to 1).
+pub fn ns_nr_sel(n: usize) -> SeqProgram {
+    let mut threads: Vec<_> = (0..n).map(|i| vec![send(P2P, n, &i.to_string())]).collect();
+    threads.push((0..n).map(|i| recv_eq(&i.to_string())).collect());
+    SeqProgram::new(threads)
+}
+
+/// nworkers(N): main (tid 0) sends a message to *itself*, then receives; N workers
+/// (tids 1..=N) each send to the coordinator (tid N+1); the coordinator receives all N
+/// then sends "done" to main. The coordinator's N receives can consume the workers in
+/// any order (N! ways) and main's receive may read either its own message or the
+/// coordinator's (2 ways): 2*N! full executions (note the send-to-self).
+pub fn nworkers(n: usize) -> SeqProgram {
+    let coord = n + 1;
+    let mut threads = vec![vec![send(P2P, 0, "self"), recv()]]; // main
+    for w in 0..n {
+        threads.push(vec![send(P2P, coord, &format!("w{w}"))]);
+    }
+    let mut coord_evs: Vec<_> = (0..n).map(|_| recv()).collect();
+    coord_evs.push(send(P2P, 0, "done"));
+    threads.push(coord_evs);
+    SeqProgram::new(threads)
+}
+
+/// Example 2.8: `T1: send(T2,1); send(T2,2) || T2: recv(x==2); recv(x==1)`. Here the
+/// paper's T-numbering is kept: `send(T2, ...)` targets tid 1 (the second, receiving
+/// thread). Under p2p the two same-sender messages arrive in send order, so the only
+/// consistent reading is the crossed one (2nd receive gets "1"): exactly 1 execution.
+pub fn example_2_8() -> SeqProgram {
+    SeqProgram::new(vec![
+        vec![send(P2P, 1, "1"), send(P2P, 1, "2")],
+        vec![recv_eq("2"), recv_eq("1")],
+    ])
+}
+
+/// Degenerate blocked oracle: `T0: send(1,"a") || T1: recv(x=="b")`. The predicate never
+/// matches the only send, so there is no full execution and exactly one blocked one (the
+/// receive is never added). Also checks the predicate participates in addability.
+pub fn blocked_no_match() -> SeqProgram {
+    SeqProgram::new(vec![vec![send(P2P, 1, "a")], vec![recv_eq("b")]])
+}
+
+/// Non-degenerate blocked oracle -- a program with both a full *and* a blocked terminal:
+/// `T0: recv(); recv(x=="b") || T1: send(0,"a") || T2: send(0,"b")`. T0's first (any)
+/// receive reads "a" or "b"; the second (`x=="b"`) needs "b".
+///   * If the first reads "a", the second reads "b" -- a full execution.
+///   * If the first reads "b", "b" is consumed, so the second `recv(x=="b")` has no
+///     matching unread send and T0 blocks there -- a maximal consistent prefix.
+///
+/// So exactly 1 full + 1 blocked under every permutation.
+pub fn blocked_and_full() -> SeqProgram {
+    SeqProgram::new(vec![
+        vec![recv(), recv_eq("b")],
+        vec![send(P2P, 0, "a")],
+        vec![send(P2P, 0, "b")],
+    ])
 }
 
 // -- Combinatorics ----------------------------------------------------------------
@@ -147,22 +246,33 @@ pub fn assert_no_duplicates(col: &ExecutionCollector, ctx: &str) {
     );
 }
 
-/// Core oracle assertion. For every permutation in `perms`, run `prog` and require:
+/// Core oracle assertion, starting from an explicit `base_cfg`. For every permutation in
+/// `perms`, run `prog` under `base_cfg` with that permutation's priorities and require:
 ///   * `full_count == full`, `blocked_count == blocked`, `error_count == 0`;
 ///   * no duplicate terminal executions;
 ///   * the *set* of terminal canonical keys is identical across permutations
 ///     (execution equivalence classes are priority-independent -- completeness +
 ///     optimality of Must).
-pub fn assert_oracle(
+///
+/// [`assert_oracle`] is the `Config::default()` case; passing a customised `base_cfg`
+/// (e.g. one built with `with_time_filter`) lets a caller assert the same table under a
+/// different configuration.
+pub fn assert_oracle_cfg(
     name: &str,
     prog: &SeqProgram,
     perms: &[Vec<usize>],
     full: usize,
     blocked: usize,
+    base_cfg: Config,
 ) {
     let mut reference: Option<BTreeSet<String>> = None;
     for perm in perms {
-        let col = run(prog, perm);
+        let col = ExecutionCollector::new();
+        explore(
+            || prog.clone(),
+            &col,
+            base_cfg.clone().with_priorities(perm.to_vec()),
+        );
         assert_eq!(
             col.full_count(),
             full,
@@ -192,12 +302,235 @@ pub fn assert_oracle(
     }
 }
 
+/// Core oracle assertion under `Config::default()`; see [`assert_oracle_cfg`].
+pub fn assert_oracle(
+    name: &str,
+    prog: &SeqProgram,
+    perms: &[Vec<usize>],
+    full: usize,
+    blocked: usize,
+) {
+    assert_oracle_cfg(name, prog, perms, full, blocked, Config::default());
+}
+
 /// Convenience: assert an oracle under the default `0..N` priorities only (for large
 /// benchmarks where sweeping permutations is unnecessary).
 pub fn assert_oracle_default(name: &str, prog: &SeqProgram, full: usize, blocked: usize) {
     let n = prog.num_threads();
     let id: Vec<usize> = (0..n).collect();
     assert_oracle(name, prog, &[id], full, blocked);
+}
+
+/// Timed-filter invariance (engine_plan §5.б.16): an all-untimed program is completely
+/// unaffected by the eager time filter. Asserts the same `(full, blocked)` table, no
+/// duplicates and priority invariance as [`assert_oracle`] — but under
+/// `collect_errors().with_time_filter()` — and additionally that the filter suppressed
+/// *nothing* (`filtered() == 0`), since every untimed send takes the `eager_feasible` fast
+/// path (ahead of the Asyn/P2p-only model guard, so cd/mbox oracles are covered too).
+pub fn assert_timed_invariant(
+    name: &str,
+    prog: &SeqProgram,
+    perms: &[Vec<usize>],
+    full: usize,
+    blocked: usize,
+) {
+    // `with_time_filter` requires `collect_errors`; an all-untimed oracle has no error
+    // events, so collect_errors leaves its counts identical to `Config::default`.
+    let cfg = Config::default().collect_errors().with_time_filter();
+    assert_oracle_cfg(name, prog, perms, full, blocked, cfg.clone());
+    // Matching counts is necessary but not sufficient: assert the filter reported zero
+    // suppressions directly (a CountingObserver, which assert_oracle_cfg does not use).
+    for perm in perms {
+        let counter = CountingObserver::new();
+        explore(
+            || prog.clone(),
+            &counter,
+            cfg.clone().with_priorities(perm.to_vec()),
+        );
+        assert_eq!(
+            counter.filtered(),
+            0,
+            "{name} under priorities {perm:?}: untimed program had {} time-filtered terminals",
+            counter.filtered()
+        );
+    }
+}
+
+// -- Independent eager-time realizability reference (engine_plan §0 / §5.в) -----------
+//
+// A from-scratch integer-enumeration oracle for the eager receive semantics, implemented
+// straight from engine_plan §0 and deliberately NOT calling `must::time` — it is the
+// differential reference the time filter is checked against (tests/timed.rs cross-checks,
+// tests/fuzz_timed.rs corpus). Windows must be finite (the timed corpus, Б3).
+
+/// Evaluator of the §0 clocks for one fixed integer delay vector `d` over a graph's sends.
+struct TimeEval<'a> {
+    g: &'a ExecutionGraph,
+    send_idx: &'a BTreeMap<EventId, usize>,
+    /// `d[send_idx[s]]` is the chosen integer delay of send `s` (within its window).
+    d: &'a [i64],
+    /// Memoised `fire` of each blocking receive (a pure function of `d`).
+    fire: BTreeMap<EventId, i64>,
+}
+
+impl TimeEval<'_> {
+    /// `Occ(e)`: fire of the last blocking receive po-before `e` in its thread, else 0.
+    fn occ(&mut self, e: EventId) -> i64 {
+        for idx in (0..e.idx).rev() {
+            let p = EventId::new(e.tid, idx);
+            if self.g.label(p).blocking() == Some(true) {
+                return self.fire_of(p);
+            }
+        }
+        0
+    }
+
+    /// `arr(s) = Occ(s) + d(s)`.
+    fn arr(&mut self, s: EventId) -> i64 {
+        self.occ(s) + self.d[self.send_idx[&s]]
+    }
+
+    /// `avail(s)`: for p2p, the max arrival over `s`'s channel prefix (FIFO reorder buffer);
+    /// for asyn, just `arr(s)`.
+    fn avail(&mut self, s: EventId) -> i64 {
+        if self.g.send_model(s) == Some(Model::P2p) {
+            let dst = self.g.label(s).dst();
+            let mut m = i64::MIN;
+            for idx in 0..=s.idx {
+                let s2 = EventId::new(s.tid, idx);
+                if self.g.send_model(s2) == Some(Model::P2p) && self.g.label(s2).dst() == dst {
+                    let a = self.arr(s2);
+                    m = m.max(a);
+                }
+            }
+            m
+        } else {
+            self.arr(s)
+        }
+    }
+
+    /// `fire(r) = max(Occ(r), avail(rf(r)))` (the coherent form; §0).
+    fn fire_of(&mut self, r: EventId) -> i64 {
+        if let Some(&v) = self.fire.get(&r) {
+            return v;
+        }
+        let occ_r = self.occ(r);
+        let v = match self.g.reads_from(r) {
+            Some(s) => occ_r.max(self.avail(s)),
+            None => occ_r, // a blocking recv reading ⊥ is absent from a consistent terminal
+        };
+        self.fire.insert(r, v);
+        v
+    }
+
+    /// Whether every blocking receive's §0 A/B disjunction holds under this `d`.
+    fn feasible(&mut self) -> bool {
+        for r in self.g.recvs() {
+            if self.g.label(r).blocking() != Some(true) {
+                continue; // non-blocking receives are time-transparent
+            }
+            let Some(s) = self.g.reads_from(r) else {
+                continue; // ⊥ (not present in a consistent terminal)
+            };
+            let occ_r = self.occ(r);
+            let av_s = self.avail(s);
+            // A: avail(rf) ≤ Occ(r) — accept, competitors NOT checked. Otherwise B requires
+            // every competitor to be at-least-as-available as rf.
+            if av_s <= occ_r {
+                continue;
+            }
+            let competitors: Vec<EventId> = self
+                .g
+                .iter_sends()
+                .filter(|&m| m != s && self.g.matches(m, r) && !consumed_before(self.g, m, r))
+                .collect();
+            for m in competitors {
+                let av_m = self.avail(m);
+                if av_m < av_s {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Whether send `m` is consumed by the moment of blocking receive `r`: read by a receive
+/// (of any kind, including non-blocking) po-earlier than `r` on `r`'s thread. Unread, or
+/// read by a po-later receive, is *not* consumed — that is what makes it a competitor.
+fn consumed_before(g: &ExecutionGraph, m: EventId, r: EventId) -> bool {
+    match g.iter_recvs().find(|&r2| g.reads_from(r2) == Some(m)) {
+        Some(r2) => r2.tid == r.tid && r2.idx < r.idx,
+        None => false,
+    }
+}
+
+/// Independent integer-enumeration reference for the eager-time semantics (engine_plan §0),
+/// deliberately NOT using `must::time`. Returns whether the consistent terminal graph `g`
+/// is time-realizable, or `None` if enumerating the delay vectors would exceed `budget`
+/// (the caller then skips the time cross-check for this graph).
+///
+/// Integrality (engine_plan §5.в): fixing an integer delay `d(s) ∈ [lo, hi] ∩ ℤ` per send
+/// turns every §0 constraint into a difference `x − y ≤ c` with integer `c`; the feasible
+/// region is a difference-bound polytope, which is integral, so real feasibility ⇔ integer
+/// feasibility. No horizon is needed because every window here is finite (Б3).
+pub fn time_feasible_ref(g: &ExecutionGraph, budget: &mut usize) -> Option<bool> {
+    let sends: Vec<EventId> = g.iter_sends().collect();
+    let windows: Vec<(u64, u64)> = sends
+        .iter()
+        .map(|&s| {
+            let w = g.send_window(s).expect("send has a window");
+            (
+                w.lo(),
+                w.hi().expect("time_feasible_ref requires finite windows"),
+            )
+        })
+        .collect();
+    let combos: u128 = windows
+        .iter()
+        .map(|&(lo, hi)| (hi - lo + 1) as u128)
+        .product();
+    if combos > *budget as u128 {
+        return None;
+    }
+    *budget -= combos as usize;
+
+    let send_idx: BTreeMap<EventId, usize> =
+        sends.iter().enumerate().map(|(i, &s)| (s, i)).collect();
+    let n = sends.len();
+    let spans: Vec<usize> = windows.iter().map(|&(lo, hi)| (hi - lo) as usize).collect();
+
+    let mut off = vec![0usize; n];
+    loop {
+        let d: Vec<i64> = (0..n)
+            .map(|i| windows[i].0 as i64 + off[i] as i64)
+            .collect();
+        let mut eval = TimeEval {
+            g,
+            send_idx: &send_idx,
+            d: &d,
+            fire: BTreeMap::new(),
+        };
+        if eval.feasible() {
+            return Some(true);
+        }
+        // Advance the mixed-radix offset; a full wrap means no delay vector worked.
+        if n == 0 {
+            return Some(false);
+        }
+        let mut i = 0;
+        loop {
+            if i == n {
+                return Some(false);
+            }
+            off[i] += 1;
+            if off[i] <= spans[i] {
+                break;
+            }
+            off[i] = 0;
+            i += 1;
+        }
+    }
 }
 
 // -- Runtime (coroutine) oracle helpers -------------------------------------------
