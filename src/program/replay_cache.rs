@@ -285,7 +285,7 @@ impl<P: Program> CachedProgram<P> {
             system,
             enabled,
             owner: CACHE_OWNERS
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .ok(),
             cache: RefCell::new(ReplayCache {
                 roots: Vec::new(),
