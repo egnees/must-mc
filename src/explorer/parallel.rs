@@ -161,6 +161,10 @@ where
             let stop_on_error = config.stop_on_error;
             let max_executions = config.max_executions;
             let time_filter = config.time_filter;
+            let time_predicate = config.time_predicate;
+            let time_level = config.time_predicate_level;
+            let canon_free = config.time_canon_free;
+            let time_zombie = config.time_zombie;
             let make_program = &make_program;
             scope.spawn(move || {
                 // Route this worker's tallies to its own shard of a shared observer.
@@ -173,7 +177,13 @@ where
                     stop_on_error,
                     max_executions,
                     time_filter,
+                    time_predicate,
+                    time_level,
+                    canon_free,
+                    time_zombie,
+                    viable_memo: crate::time::ViableMemo::new(),
                     terminal_count: 0,
+                    terminals_recorded: 0,
                     stop: false,
                     fork: Some(Arc::clone(&sp)),
                 };

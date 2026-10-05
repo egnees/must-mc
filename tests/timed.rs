@@ -383,6 +383,45 @@ fn timed_error_gating() {
     assert_eq!(cnt.filtered_full(), 0);
 }
 
+/// A timed send under a model v1 does not support (Cd/Mbox) must be rejected, not checked
+/// with the wrong semantics: `channel_prefix` only knows how to order Asyn/P2p, so a cd/mbox
+/// `so` order never reaches the constraint system at all.
+fn cd_send_with_a_timed_window() -> System {
+    let mut sys = System::new();
+    sys.add(|c: Ctx| async move {
+        c.send_within(1, "x", Model::Cd, Window::new(1, 5));
+    });
+    sys.add(|c: Ctx| async move {
+        c.recv(|_| true).await;
+    });
+    sys
+}
+
+/// The guard holds under the T1 filter.
+#[test]
+#[should_panic(expected = "supports only Asyn/P2p")]
+fn timed_filter_rejects_cd_sends() {
+    let col = ExecutionCollector::new();
+    explore(
+        cd_send_with_a_timed_window,
+        &col,
+        Config::default().collect_errors().with_time_filter(),
+    );
+}
+
+/// ...and under the T2 predicate, where it used to be reachable only through the
+/// `debug_assert!` in `record` - i.e. not at all in a release build.
+#[test]
+#[should_panic(expected = "supports only Asyn/P2p")]
+fn timed_predicate_rejects_cd_sends() {
+    let col = ExecutionCollector::new();
+    explore(
+        cd_send_with_a_timed_window,
+        &col,
+        Config::default().collect_errors().with_time_predicate(),
+    );
+}
+
 /// `with_time_filter()` without `collect_errors()` is unsupported and panics up front (B1).
 #[test]
 #[should_panic(expected = "requires collect_errors")]
@@ -390,6 +429,47 @@ fn timed_filter_requires_collect_errors() {
     let prog = ssr();
     let col = ExecutionCollector::new();
     explore(|| prog.clone(), &col, Config::default().with_time_filter());
+}
+
+/// `with_time_zombie()` without `collect_errors()` panics for the same B1 reason.
+#[test]
+#[should_panic(expected = "requires collect_errors")]
+fn timed_zombie_requires_collect_errors() {
+    let prog = ssr();
+    let col = ExecutionCollector::new();
+    explore(|| prog.clone(), &col, Config::default().with_time_zombie());
+}
+
+/// Zombie is mutually exclusive with the T1 filter (three distinct regimes).
+#[test]
+#[should_panic(expected = "mutually exclusive")]
+fn timed_zombie_excludes_filter() {
+    let prog = ssr();
+    let col = ExecutionCollector::new();
+    explore(
+        || prog.clone(),
+        &col,
+        Config::default()
+            .collect_errors()
+            .with_time_filter()
+            .with_time_zombie(),
+    );
+}
+
+/// Zombie is mutually exclusive with the T2 predicate.
+#[test]
+#[should_panic(expected = "mutually exclusive")]
+fn timed_zombie_excludes_predicate() {
+    let prog = ssr();
+    let col = ExecutionCollector::new();
+    explore(
+        || prog.clone(),
+        &col,
+        Config::default()
+            .collect_errors()
+            .with_time_predicate()
+            .with_time_zombie(),
+    );
 }
 
 // -- 9. vacuity: every untimed terminal is feasible via check()'s FULL path -----------

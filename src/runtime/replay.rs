@@ -45,17 +45,22 @@ pub(crate) struct ThreadCell {
     /// Per-thread event budget: exceeding it yields `Label::Error` instead of looping
     /// forever.
     max_events: usize,
+    /// Per-thread receive budget (`System::set_max_recvs`): the body's `(max_recvs + 1)`-th
+    /// receive halts the thread as `Finished` instead of becoming an event. `usize::MAX`
+    /// (the default) means unbounded.
+    max_recvs: usize,
     halt: Halt,
 }
 
 impl ThreadCell {
-    pub(crate) fn new(trace: Vec<Option<Val>>, max_events: usize) -> Self {
+    pub(crate) fn new(trace: Vec<Option<Val>>, max_events: usize, max_recvs: usize) -> Self {
         ThreadCell {
             trace,
             cursor: 0,
             recv_index: 0,
             op_count: 0,
             max_events,
+            max_recvs,
             halt: Halt::Running,
         }
     }
@@ -131,6 +136,17 @@ impl ThreadCell {
         // Once we have recorded the next event (or finished), further awaits just park
         // so the top-level poll unwinds; the recorded outcome takes priority.
         if self.halted() || self.over_budget() {
+            return Poll::Pending;
+        }
+        // Receive budget: the thread's `max_recvs` receives are its last events, so the
+        // next one is not an event at all - the thread has no next event and is
+        // `Finished`. `recv_index` counts the receives *reached in this poll*, replayed
+        // ones included, so the cut is a pure function of the trace (the same bound the
+        // body would impose with its own `for _ in 0..max_recvs` loop). A body past the
+        // budget has replayed its whole trace, so `cursor == trace.len()` still holds for
+        // `run_once`'s finished-thread check.
+        if self.recv_index >= self.max_recvs {
+            self.halt = Halt::Finished;
             return Poll::Pending;
         }
         let k = self.recv_index;

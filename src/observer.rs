@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::event::{EventId, Tid};
+use crate::event::{EventId, Label, Tid, Val};
 use crate::explorer::{Execution, ExecutionKind};
 use crate::graph::ExecutionGraph;
 
@@ -47,6 +47,54 @@ pub trait Observer {
     }
     /// A candidate backward revisit setting `rf(r)` to `s` was rejected.
     fn on_revisit_rejected(&self, _g: &ExecutionGraph, _r: EventId, _s: EventId) {}
+    /// A backward revisit setting `rf(r)` to `s` passed `RevisitCondition` but was pruned by the
+    /// eager-time forced-closure gate (`Config::time_predicate`, T2_PLAN §2c line 13): its
+    /// obligatory continuation is eager-infeasible. A diagnostic hook only — it does not change
+    /// any count.
+    fn on_forced_closure_pruned(&self, _g: &ExecutionGraph, _r: EventId, _s: EventId) {}
+    /// The nondet-arm existential canon oracle ([`crate::time::viable`], T2_ORACLE_SPEC §1.1)
+    /// returned `verdict` for re-pinning `ep` to `v` in `base` while testing the revisit by the
+    /// send `revisiting` (labelled `rev_label`). Fires once per oracle call — only for values
+    /// strictly below the held one, i.e. only when a non-min holder is under test (a min holder
+    /// makes no calls). Diagnostic-only: the T-DIFF harness cross-checks every verdict against
+    /// a brute-force reference (O2), and the canon logger mines these for regression seeds
+    /// (§3.3). Never affects counts.
+    #[allow(clippy::too_many_arguments)]
+    fn on_viable_verdict(
+        &self,
+        _base: &ExecutionGraph,
+        _ep: EventId,
+        _v: Val,
+        _revisiting: EventId,
+        _rev_label: &Label,
+        _verdict: bool,
+    ) {
+    }
+    /// The blocking-receive twin of [`on_viable_verdict`](Self::on_viable_verdict): the R1 canon
+    /// oracle ([`crate::time::viable_recv`], `C1_HARDENING_SPEC` §D.5) returned `verdict` for
+    /// re-pinning `rf(ep)` to `src`. Fires only for candidates strictly `≺`-below the held
+    /// source, so a min-holder makes no calls. Diagnostic-only; never affects counts.
+    #[allow(clippy::too_many_arguments)]
+    fn on_viable_recv_verdict(
+        &self,
+        _base: &ExecutionGraph,
+        _ep: EventId,
+        _src: EventId,
+        _revisiting: EventId,
+        _rev_label: &Label,
+        _verdict: bool,
+    ) {
+    }
+    /// A Visit node `Visit_P(G)` is being entered (once per `visit_step` call). Paired with
+    /// [`on_visit_exit`](Self::on_visit_exit). The dead-branch detector (T2_PLAN §5а) uses this
+    /// to count Visit nodes and, via `on_visit_exit`'s flag, those whose subtree bore no
+    /// terminal (an optimality-(b) violation under the time predicate).
+    fn on_visit_enter(&self, _g: &ExecutionGraph) {}
+    /// The Visit node entered with [`on_visit_enter`](Self::on_visit_enter) is done;
+    /// `produced_terminal` is whether its subtree reported at least one terminal. Reliable only
+    /// on the sequential path (a donated subtree records on another worker), which is where the
+    /// dead-branch detector runs.
+    fn on_visit_exit(&self, _g: &ExecutionGraph, _produced_terminal: bool) {}
     /// A terminal execution (full / blocked / error) was reached.
     fn on_execution(&self, _exec: &Execution, _kind: ExecutionKind) {}
     /// A terminal suppressed by the eager time filter (`Config::time_filter`): the graph is
@@ -487,6 +535,44 @@ impl Observer for ExecutionCollector {
     }
 }
 
+/// Dead-branch detector for the eager-time predicate search (T2_PLAN §5а): the direct test
+/// replacing the unproven optimality-(b) lemma. It counts every Visit node and those whose
+/// subtree bore **no** terminal — an optimality violation (a fruitless Visit). On a program
+/// whose `possible_future` is exact (`SeqProgram`), `forced_closure` is exact, so there must be
+/// **zero** dead branches; a coroutine runtime (`possible_future = None`) may leave residual dead
+/// branches (a performance, not correctness, matter — measure, do not hard-fail).
+///
+/// Sequential runs only: `on_visit_exit`'s `produced_terminal` is unreliable under parallelism
+/// (a donated subtree records on another worker), so use a single thread.
+#[derive(Debug, Default)]
+pub struct DeadBranchDetector {
+    visits: AtomicUsize,
+    dead: AtomicUsize,
+}
+
+impl DeadBranchDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Total Visit nodes entered.
+    pub fn visits(&self) -> usize {
+        self.visits.load(Ordering::Relaxed)
+    }
+    /// Visit nodes whose subtree produced no terminal (must be 0 when `forced_closure` is exact).
+    pub fn dead(&self) -> usize {
+        self.dead.load(Ordering::Relaxed)
+    }
+}
+
+impl Observer for DeadBranchDetector {
+    fn on_visit_exit(&self, _g: &ExecutionGraph, produced_terminal: bool) {
+        self.visits.fetch_add(1, Ordering::Relaxed);
+        if !produced_terminal {
+            self.dead.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Compose two observers: every callback fans out to both, `A` before `B`.
 impl<A: Observer, B: Observer> Observer for (A, B) {
     fn on_event_added(&self, g: &ExecutionGraph, e: EventId) {
@@ -514,6 +600,42 @@ impl<A: Observer, B: Observer> Observer for (A, B) {
     fn on_revisit_rejected(&self, g: &ExecutionGraph, r: EventId, s: EventId) {
         self.0.on_revisit_rejected(g, r, s);
         self.1.on_revisit_rejected(g, r, s);
+    }
+    fn on_forced_closure_pruned(&self, g: &ExecutionGraph, r: EventId, s: EventId) {
+        self.0.on_forced_closure_pruned(g, r, s);
+        self.1.on_forced_closure_pruned(g, r, s);
+    }
+    fn on_viable_verdict(
+        &self,
+        base: &ExecutionGraph,
+        ep: EventId,
+        v: Val,
+        revisiting: EventId,
+        rev_label: &Label,
+        verdict: bool,
+    ) {
+        self.0.on_viable_verdict(base, ep, v, revisiting, rev_label, verdict);
+        self.1.on_viable_verdict(base, ep, v, revisiting, rev_label, verdict);
+    }
+    fn on_viable_recv_verdict(
+        &self,
+        base: &ExecutionGraph,
+        ep: EventId,
+        src: EventId,
+        revisiting: EventId,
+        rev_label: &Label,
+        verdict: bool,
+    ) {
+        self.0.on_viable_recv_verdict(base, ep, src, revisiting, rev_label, verdict);
+        self.1.on_viable_recv_verdict(base, ep, src, revisiting, rev_label, verdict);
+    }
+    fn on_visit_enter(&self, g: &ExecutionGraph) {
+        self.0.on_visit_enter(g);
+        self.1.on_visit_enter(g);
+    }
+    fn on_visit_exit(&self, g: &ExecutionGraph, produced_terminal: bool) {
+        self.0.on_visit_exit(g, produced_terminal);
+        self.1.on_visit_exit(g, produced_terminal);
     }
     fn on_execution(&self, exec: &Execution, kind: ExecutionKind) {
         self.0.on_execution(exec, kind);

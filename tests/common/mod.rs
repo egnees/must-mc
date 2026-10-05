@@ -46,6 +46,12 @@ impl Program for SeqProgram {
             })
             .collect()
     }
+    /// Straight-line control flow is trace-independent, so a thread's remaining events are
+    /// exactly its remaining labels — an *exact* future for the forced-closure C1 rule.
+    fn possible_future(&self, tid: usize, trace: &[Option<Val>]) -> Option<Vec<Label>> {
+        let evs = &self.threads[tid];
+        Some(evs[trace.len().min(evs.len())..].to_vec())
+    }
 }
 
 impl SeqProgram {
@@ -927,4 +933,94 @@ pub fn leader_system(
     }
 
     sys
+}
+
+// -- Brute-force reference for the existential viable(v) oracle (T2_ORACLE_SPEC §1.8 O2) ----
+
+/// Every consistent state forward-reachable from `h0`: from each state, each thread's next
+/// event is resolved every legal way (send/error added; nondet at every value; a receive at
+/// every present send and ⊥ — reading the revisiting send included). BFS over contents,
+/// deduped by canonical key. No feasibility pruning, no drain ordering, no memo — fully
+/// independent of the `viable` search structure.
+pub fn all_states<P: Program>(h0: &ExecutionGraph, program: &P) -> Vec<ExecutionGraph> {
+    let n = program.num_threads();
+    let mut seen: BTreeMap<String, ExecutionGraph> = BTreeMap::new();
+    let mut queue: std::collections::VecDeque<ExecutionGraph> = std::collections::VecDeque::new();
+    if must::consistent(h0) {
+        seen.insert(h0.canonical_key(), h0.clone());
+        queue.push_back(h0.clone());
+    }
+    while let Some(h) = queue.pop_front() {
+        let traces = must::traces_of(&h, n);
+        let nexts = program.next(&traces);
+        for (tid, next) in nexts.iter().enumerate() {
+            let ThreadNext::Next(label) = next else {
+                continue;
+            };
+            let mut children: Vec<ExecutionGraph> = Vec::new();
+            match label {
+                Label::Send { .. } | Label::Error { .. } => {
+                    let mut c = h.clone();
+                    c.add_event(tid, label.clone());
+                    children.push(c);
+                }
+                Label::Nondet { set } => {
+                    for &v in set.iter() {
+                        let mut c = h.clone();
+                        let e = c.add_event(tid, label.clone());
+                        c.set_nd(e, v);
+                        children.push(c);
+                    }
+                }
+                Label::Recv { .. } => {
+                    let mut c = h.clone();
+                    let e = c.add_event(tid, label.clone());
+                    c.set_rf(e, None);
+                    let mut opts: Vec<Option<EventId>> = c.iter_sends().map(Some).collect();
+                    opts.push(None);
+                    for src in opts {
+                        let mut c2 = c.clone();
+                        c2.set_rf(e, src);
+                        children.push(c2);
+                    }
+                }
+            }
+            for c in children {
+                if !must::consistent(&c) {
+                    continue;
+                }
+                if let std::collections::btree_map::Entry::Vacant(slot) =
+                    seen.entry(c.canonical_key())
+                {
+                    slot.insert(c.clone());
+                    queue.push_back(c);
+                }
+            }
+        }
+    }
+    seen.into_values().collect()
+}
+
+/// Reference verdict for `must::time::viable` (§1.4 success over ALL reachable states):
+/// ∃ a state where `revisiting` is present-unread with `rev_label` and the state passes
+/// feasibility plus the visitability gate.
+#[allow(clippy::too_many_arguments)]
+pub fn brute_viable<P: Program>(
+    base: &ExecutionGraph,
+    ep: EventId,
+    v: Val,
+    program: &P,
+    priorities: &[usize],
+    revisiting: EventId,
+    rev_label: &Label,
+) -> bool {
+    let mut h0 = base.clone();
+    h0.set_nd(ep, v);
+    all_states(&h0, program).iter().any(|h| {
+        h.contains(revisiting)
+            && h.label(revisiting) == rev_label
+            && !h.is_read(revisiting)
+            && must::time::check(h).is_feasible()
+            && must::time::gate_feasible(h, program, priorities)
+    })
 }

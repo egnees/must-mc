@@ -1,11 +1,12 @@
 //! The `next_P` scheduling policy.
 //!
-//! `next_P(G)` follows three rules: it never picks an event of a blocked thread; it never
-//! adds a blocking receive when no matching message exists; and it reports a terminal
-//! verdict only when nothing can be added. Addability is recomputed on the current graph
-//! every call, so a receive is rescheduled the moment a matching send appears. There is no
-//! explicit blocking event in the graph: a thread whose next event is a blocking receive
-//! with no message is simply "blocked" at this graph, and unblocks when a send appears.
+//! `next_P(G)` obeys the paper's three assumptions: (i) it never picks an event of a
+//! blocked thread; (ii) it never adds a blocking receive when there is no matching
+//! message; (iii) it yields a terminal verdict only when nothing can be added. Because
+//! addability is recomputed on the current graph every call, a receive is automatically
+//! rescheduled the moment a matching send appears (Example 4.1). There is no explicit
+//! blocking event in the graph: a thread whose next event is a blocking receive with no
+//! message is simply "blocked" at this graph, and unblocks when a send shows up.
 
 use crate::event::{EventId, Label, Tid, Val};
 use crate::graph::ExecutionGraph;
@@ -21,8 +22,8 @@ pub enum NextStep {
     Terminal { blocked: Vec<Tid> },
 }
 
-/// Extract each thread's trace: one value per event in po, `Some(v)` for a receive that
-/// read value `v`, `None` for a send/error or a receive that read nothing.
+/// Extract `trace_G(i)` for every thread: one value per event in po, `Some(v)` for a
+/// receive that read value `v`, `None` for a send/error or a receive that read nothing.
 pub fn traces_of(g: &ExecutionGraph, num_threads: usize) -> Vec<Vec<Option<Val>>> {
     let mut traces = vec![Vec::new(); num_threads];
     for (tid, trace) in traces.iter_mut().enumerate() {
@@ -50,18 +51,23 @@ pub fn traces_of(g: &ExecutionGraph, num_threads: usize) -> Vec<Vec<Option<Val>>
 fn addable(g: &ExecutionGraph, tid: Tid, label: &Label) -> bool {
     match label {
         Label::Send { .. } | Label::Error { .. } => true,
-        // A nondet choice is always addable; only blocking receives are ever held back.
+        // A nondet choice is always addable; assumption (ii) constrains blocking receives only.
         Label::Nondet { .. } => true,
         // A non-blocking receive can always read nothing, so it is always addable.
         Label::Recv {
             blocking: false, ..
         } => true,
+        // Scanned with `is_read` per candidate rather than through `unread_sends`: the
+        // destination and predicate tests reject almost every send outright, and this runs
+        // for every blocked thread at every step, where a `Vec` per call was pure overhead.
         Label::Recv {
             blocking: true,
             pred,
-        } => g.unread_sends().iter().any(|&s| {
+        } => g.iter_sends().any(|s| {
             let lbl = g.label(s);
-            lbl.dst() == Some(tid) && lbl.payload().is_some_and(|v| pred.test_sym(v))
+            lbl.dst() == Some(tid)
+                && lbl.payload().is_some_and(|v| pred.test_sym(v))
+                && !g.is_read(s)
         }),
     }
 }
@@ -74,14 +80,22 @@ fn addable(g: &ExecutionGraph, tid: Tid, label: &Label) -> bool {
 pub fn next_step<P: Program>(program: &P, priorities: &[Tid], g: &ExecutionGraph) -> NextStep {
     let traces = traces_of(g, program.num_threads());
     let nexts = program.next(&traces);
-    pick(g, &nexts, priorities)
+    pick(g, &nexts, priorities, false)
 }
 
 /// The `next_P(G)` decision given the per-thread next events `nexts` already computed:
 /// the first addable thread in `priorities` order, else a terminal verdict. Addability is
 /// (re)checked against `g` here, not cached, so a receive unblocks the moment a matching
 /// send appears.
-pub fn pick(g: &ExecutionGraph, nexts: &[ThreadNext], priorities: &[Tid]) -> NextStep {
+///
+/// `des` selects the discrete-event scheduling order of the time-intervals extension
+/// ([`pick_des`], T2_PLAN §2b) — set by both the T2 predicate and the zombie regime
+/// (`des = time_predicate || time_zombie`, T2_ORACLE_SPEC §2.1); with it `false` this is the
+/// ordinary priority policy and every count is byte-identical to the untimed explorer.
+pub fn pick(g: &ExecutionGraph, nexts: &[ThreadNext], priorities: &[Tid], des: bool) -> NextStep {
+    if des {
+        return pick_des(g, nexts);
+    }
     for &tid in priorities {
         if let ThreadNext::Next(label) = &nexts[tid] {
             if addable(g, tid, label) {
@@ -95,13 +109,146 @@ pub fn pick(g: &ExecutionGraph, nexts: &[ThreadNext], priorities: &[Tid]) -> Nex
 
     // Nothing addable: gather the threads parked on a blocking receive. In tid order so
     // the verdict is deterministic regardless of the priority permutation.
+    NextStep::Terminal {
+        blocked: blocked_threads(nexts),
+    }
+}
+
+/// Threads parked on a blocking receive under `nexts`, in tid order (so the terminal verdict
+/// is deterministic regardless of the policy).
+fn blocked_threads(nexts: &[ThreadNext]) -> Vec<Tid> {
     let mut blocked = Vec::new();
     for (tid, next) in nexts.iter().enumerate() {
         if let ThreadNext::Next(Label::Recv { blocking: true, .. }) = next {
             blocked.push(tid);
         }
     }
-    NextStep::Terminal { blocked }
+    blocked
+}
+
+/// The discrete-event `next_P(G)` policy of the time-intervals extension (T2_PLAN §2b, Lemma 1
+/// "drain-first"). It fixes the canonical insertion order `≤_G` by the earliest time each
+/// candidate event *can* occur, so that when a blocking receive is finally woken, every
+/// earlier-in-time send is already present and the receive forks over them as **forward
+/// siblings** (which is what lets T-PRED prune eager-infeasible reads without losing
+/// completeness — T2_PLAN §5).
+///
+/// The order is a pure function of `g` (not of `priorities`): ties break by `(tid, idx)`, so
+/// `≤_G` is well defined and the whole search is priority-invariant by construction. Under the
+/// T2 predicate `g` is eager-feasible on entry (every graph reaching a Visit is gated feasible —
+/// T2_PLAN §5), so [`earliest_times`](crate::time::earliest_times) returns `Some`. Under the
+/// zombie regime (T2_ORACLE_SPEC §2.1) infeasible graphs ARE visited; `earliest_times = None`
+/// then drops every LB to 0 and phase B's keys to the ∞ case, which keeps the policy a
+/// deterministic *total* function of `g` — the only property `next_P` needs (§4.3 (i)–(iii)).
+///
+/// Two phases:
+/// * **A (drain):** among addable threads whose next is *not* a blocking receive
+///   (send / error / nondet / non-blocking receive), pick the minimum lower-bound time `LB`.
+///   A send's `LB = Occ_lb + window.lo` (its earliest arrival); the clock-neutral events have
+///   `LB = Occ_lb`. Never wake a blocking receive while any such event remains.
+/// * **B (wake):** when no non-recv is addable, wake the addable blocking receive with the
+///   minimum `fire_lb = max(Occ_lb, min over consistent unread matching sources S of avail_lb(S))`.
+///   A receive that is addable (a matching unread send exists) but has *no consistent* source —
+///   the p2p-overtaking corner — cannot fire; it sorts *after* every can-fire receive (design
+///   note below) and, if picked, is added and dies in `visit_recv`, exactly as the untimed
+///   policy would have it (matching T1: such a graph has no terminal here, not a blocked one).
+///
+/// Here `Occ_lb(tid)` is the `fire`-LB of the last blocking receive currently on thread `tid`
+/// (else 0). Candidate `LB`s are computed for the *not-yet-added* next event from the current
+/// graph's `earliest_times` plus the candidate's own window/Occ.
+///
+/// Note on non-blocking receives: they are drained in phase A by `LB = Occ_lb`, *not* deferred
+/// to the end. Deferring them (to shrink later revisits' `Deleted` sets — the naive fix for the
+/// C5 gap below) is **unsound**: a non-blocking receive that po-precedes a send strands that
+/// send, so an early-time send is absent when a blocking receive wakes and its realizable read
+/// is lost (fuzz case 260). See the report's "known limitation".
+///
+/// Design note (undetermined by the paper/notes — fixed here): the `fire_lb` of a blocking
+/// receive with an empty consistent-source set is undefined (`min` of ∅). We treat it as `+∞`
+/// so it is woken only when no can-fire receive exists; this is the choice that reproduces the
+/// untimed terminal set (a permanently-unreadable receive is added-and-dies, never a spurious
+/// blocked terminal).
+fn pick_des(g: &ExecutionGraph, nexts: &[ThreadNext]) -> NextStep {
+    // `None` only on an eager-infeasible `g`: every Visit the T2-predicate explorer reaches is
+    // gated feasible, so there `Some` and the LBs below are exact. The zombie regime visits
+    // infeasible graphs too; there the LBs fall back to 0 and the policy stays a deterministic
+    // total function of `g` — the only property `next_P` needs.
+    let earliest = crate::time::earliest_times(g);
+
+    // Occ_lb(tid): the fire-LB of the last blocking receive currently on thread `tid`, else 0.
+    // The next (not-yet-added) event of `tid` inherits this clock; a send adds its window.lo.
+    let occ_lb = |tid: Tid| -> i64 {
+        let len = g.thread_len(tid);
+        for idx in (0..len).rev() {
+            let e = EventId::new(tid, idx);
+            if g.label(e).blocking() == Some(true) {
+                return earliest.as_ref().and_then(|es| es.fire_lb(e)).unwrap_or(0);
+            }
+        }
+        0
+    };
+
+    // Phase A: minimum-LB non-(blocking-recv) addable event. Tie: (LB, tid).
+    let mut best_a: Option<(i64, Tid)> = None;
+    for (tid, next) in nexts.iter().enumerate() {
+        let ThreadNext::Next(label) = next else {
+            continue;
+        };
+        if matches!(label, Label::Recv { blocking: true, .. }) {
+            continue; // phase B
+        }
+        // Send / error / nondet / non-blocking recv are always addable.
+        debug_assert!(addable(g, tid, label));
+        let lb = match label {
+            Label::Send { window, .. } => occ_lb(tid) + window.lo() as i64,
+            _ => occ_lb(tid), // clock-neutral: nondet / error / non-blocking recv
+        };
+        if best_a.is_none_or(|(blb, btid)| (lb, tid) < (blb, btid)) {
+            best_a = Some((lb, tid));
+        }
+    }
+    if let Some((_, tid)) = best_a {
+        return NextStep::Event {
+            tid,
+            label: nexts[tid].label().expect("phase-A winner has a next").clone(),
+        };
+    }
+
+    // Phase B: wake the earliest-firing addable blocking receive. Sort key
+    // `(has_no_source, fire_value, tid)`: can-fire receives (has_no_source = false) first, then
+    // by fire_lb, then tid; a no-consistent-source receive (has_no_source = true) is the ∞ case.
+    let mut best_b: Option<(bool, i64, Tid)> = None;
+    for (tid, next) in nexts.iter().enumerate() {
+        let ThreadNext::Next(label) = next else {
+            continue;
+        };
+        if label.blocking() != Some(true) || !addable(g, tid, label) {
+            continue;
+        }
+        let sources = crate::time::consistent_sources(g, tid, label);
+        let key = match sources
+            .iter()
+            .filter_map(|&s| earliest.as_ref().and_then(|es| es.avail_lb(s)))
+            .min()
+        {
+            Some(min_avail) => (false, occ_lb(tid).max(min_avail), tid),
+            None => (true, occ_lb(tid), tid), // ∞: no consistent source (add-and-die corner)
+        };
+        if best_b.is_none_or(|b| key < b) {
+            best_b = Some(key);
+        }
+    }
+    if let Some((_, _, tid)) = best_b {
+        return NextStep::Event {
+            tid,
+            label: nexts[tid].label().expect("phase-B winner has a next").clone(),
+        };
+    }
+
+    // Nothing addable: a terminal (full if no blocked thread, else blocked).
+    NextStep::Terminal {
+        blocked: blocked_threads(nexts),
+    }
 }
 
 #[cfg(test)]
@@ -214,7 +361,7 @@ mod tests {
         }
     }
 
-    /// Rescheduling: with thread 2 (the receiver) first in priority but no
+    /// Rescheduling (Example 4.1): with thread 2 (the receiver) first in priority but no
     /// message, the scheduler skips it and picks a sender; once a send exists, the
     /// receiver becomes addable on the same priority order.
     #[test]

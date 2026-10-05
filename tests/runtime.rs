@@ -318,6 +318,67 @@ fn committed_budget_error_finishes() {
     assert_finished(&sys.next(&[vec![v("x"), v("x"), v("x"), v("x")]])[0]);
 }
 
+/// The receive budget bounds an infinite event loop from outside the body: the thread's
+/// `max_recvs`-th receive is its last event, and the next one makes it `Finished` - a
+/// truncation, not an `Error` (unlike the event budget above).
+#[test]
+fn recv_budget_truncates_infinite_loop() {
+    let mut sys = System::new();
+    let tid = sys.add(|ctx| async move {
+        loop {
+            let _ = ctx.recv(|_| true).await;
+        }
+    });
+    sys.set_max_recvs(tid, 2);
+    // Receives 1 and 2 are enumerated as usual.
+    assert_recv(&sys.next(&[vec![]])[0]);
+    assert_recv(&sys.next(&[vec![v("x")]])[0]);
+    // The third would exceed the budget: the thread has no next event.
+    assert_finished(&sys.next(&[vec![v("x"), v("x")]])[0]);
+}
+
+/// The budget counts receives, not events: sends between them are unaffected, and it is
+/// the *receives reached during the replay* that count (so the bound is a function of the
+/// trace, not of how often the body was polled).
+#[test]
+fn recv_budget_counts_receives_only() {
+    let mut sys = System::new();
+    let tid = sys.add(|ctx| async move {
+        loop {
+            ctx.send(0, "m", Model::P2p);
+            let _ = ctx.recv(|_| true).await;
+        }
+    });
+    sys.set_max_recvs(tid, 1);
+    assert_send(&sys.next(&[vec![]])[0], 0, "m");
+    assert_recv(&sys.next(&[vec![S]])[0]);
+    // Budget spent: the loop's second send is still emitted (sends are not counted), and
+    // the receive after it ends the thread.
+    assert_send(&sys.next(&[vec![S, v("x")]])[0], 0, "m");
+    assert_finished(&sys.next(&[vec![S, v("x"), S]])[0]);
+}
+
+/// A thread with no declared budget is unbounded (the default), and a budget on one
+/// thread does not leak into another.
+#[test]
+fn recv_budget_is_per_thread() {
+    let mut sys = System::new();
+    let bounded = sys.add(|ctx| async move {
+        loop {
+            let _ = ctx.recv(|_| true).await;
+        }
+    });
+    sys.add(|ctx| async move {
+        loop {
+            let _ = ctx.recv(|_| true).await;
+        }
+    });
+    sys.set_max_recvs(bounded, 1);
+    let next = sys.next(&[vec![v("x")], vec![v("x")]]);
+    assert_finished(&next[0]);
+    assert_recv(&next[1]);
+}
+
 /// Awaiting a future that is not `ctx.recv` is outside the contract and is reported as
 /// an error, never a silent Finished.
 #[test]
@@ -374,4 +435,125 @@ fn ssr_program_after_reading_second_send() {
     assert_finished(&out[0]);
     assert_finished(&out[1]);
     assert_finished(&out[2]);
+}
+
+// -- `possible_future` declarations (H1) -------------------------------------------------
+//
+// The coroutine runtime cannot enumerate a value-dependent body's remaining events, so
+// `Program::possible_future` is opt-in: undeclared processes keep answering `None`
+// ("unknown", always safe) and a declaration supplies a sound over-approximation of the
+// labels *after* the thread's next event. These tests pin both halves of the contract.
+
+/// `T0: send("a" -> T1)`, `T1: recv(== "a")` — a two-event system whose whole future is
+/// trivially declarable (nothing follows either event).
+fn declared_pair() -> System {
+    let mut sys = System::new();
+    let t0 = sys.add(|c: must::Ctx| async move {
+        c.send_within(1, "a", Model::Asyn, Window::new(10, 20));
+    });
+    let t1 = sys.add(|c: must::Ctx| async move {
+        c.recv(|x: &str| x == "a").await;
+    });
+    // Nothing follows the single event of either thread.
+    sys.declare_future(t0, |_| Vec::new());
+    sys.declare_future(t1, |_| Vec::new());
+    sys
+}
+
+#[test]
+fn undeclared_future_is_unknown() {
+    let sys = declared_pair_undeclared();
+    assert!(sys.possible_future(0, &[]).is_none());
+    assert!(sys.possible_future(1, &[]).is_none());
+}
+
+fn declared_pair_undeclared() -> System {
+    let mut sys = System::new();
+    sys.add(|c: must::Ctx| async move {
+        c.send_within(1, "a", Model::Asyn, Window::new(10, 20));
+    });
+    sys.add(|c: must::Ctx| async move {
+        c.recv(|x: &str| x == "a").await;
+    });
+    sys
+}
+
+/// Position 0 of the answer is the thread's *exact* next label (the positional half of the
+/// `Program::possible_future` contract, which `force_source` condition (3b) relies on).
+#[test]
+fn declared_future_head_is_the_next_label() {
+    let sys = declared_pair();
+    let f0 = sys.possible_future(0, &[]).expect("declared");
+    assert_eq!(f0.len(), 1, "one label: the next send, nothing after it");
+    assert_send(&ThreadNext::Next(f0[0].clone()), 1, "a");
+
+    let f1 = sys.possible_future(1, &[]).expect("declared");
+    assert_eq!(f1.len(), 1);
+    assert!(f1[0].is_recv(), "T1's next event is its receive");
+}
+
+/// A finished thread's exact future is empty, whatever the declaration says.
+#[test]
+fn declared_future_of_a_finished_thread_is_empty() {
+    let mut sys = declared_pair();
+    // Declare a (deliberately over-broad) alphabet for T0 and check it is *not* returned
+    // once the thread is finished.
+    sys.declare_alphabet(0, [Label::send(Model::Asyn, 1, "a")]);
+    assert_eq!(sys.possible_future(0, &[S]), Some(Vec::new()));
+}
+
+/// The payoff: with the future declared, `forced_closure` may force a blocking receive whose
+/// source is statically unavoidable — something it can never do for an undeclared `System`
+/// (`possible_future = None` ⇒ `force_source` bails, T2_PLAN §4 / C1 rule).
+#[test]
+fn declared_future_lets_the_closure_force_a_blocking_receive() {
+    use must::time::forced_closure;
+    use must::ExecutionGraph;
+
+    let send = Label::send_within(Model::Asyn, 1, "a", Window::new(10, 20));
+    let recv_id = must::event::EventId::new(1, 0);
+
+    let mut g0 = ExecutionGraph::new();
+    g0.add_event(0, send.clone());
+
+    let declared = forced_closure(&g0, &declared_pair(), &[0, 1]);
+    assert!(
+        declared.contains(recv_id),
+        "with a declared future the unavoidable receive is forced onto the closure"
+    );
+    assert_eq!(declared.reads_from(recv_id), Some(must::event::EventId::new(0, 0)));
+
+    let undeclared = forced_closure(&g0, &declared_pair_undeclared(), &[0, 1]);
+    assert!(
+        !undeclared.contains(recv_id),
+        "an undeclared future must keep the C1-safe behaviour: no forced blocking receive"
+    );
+}
+
+/// A declaration that *does* list a competing future receive must block the force again —
+/// the over-approximation is what makes `force_source` conservative, so a coarser
+/// declaration may only force less, never more.
+#[test]
+fn coarser_declaration_forces_less() {
+    use must::time::forced_closure;
+    use must::ExecutionGraph;
+
+    let mut sys = System::new();
+    sys.add(|c: must::Ctx| async move {
+        c.send_within(1, "a", Model::Asyn, Window::new(10, 20));
+    });
+    sys.add(|c: must::Ctx| async move {
+        c.recv(|x: &str| x == "a").await;
+    });
+    sys.declare_future(0, |_| Vec::new());
+    // Over-broad but sound: "T1 may run another receive accepting anything later".
+    sys.declare_alphabet(1, [Label::recv(must::event::Pred::any())]);
+
+    let mut g0 = ExecutionGraph::new();
+    g0.add_event(0, Label::send_within(Model::Asyn, 1, "a", Window::new(10, 20)));
+    let closure = forced_closure(&g0, &sys, &[0, 1]);
+    assert!(
+        !closure.contains(must::event::EventId::new(1, 0)),
+        "a second possible consumer in the declared future blocks the force (condition 3b)"
+    );
 }

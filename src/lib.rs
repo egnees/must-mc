@@ -87,7 +87,8 @@ pub use event::{Event, EventId, Label, Model, Pred, Tid, Val, Window};
 pub use explorer::{explore, Config, Execution, ExecutionKind};
 pub use graph::ExecutionGraph;
 pub use observer::{
-    CountingObserver, ExecutionCollector, NullObserver, Observer, RecordingObserver, Step, StepKind,
+    CountingObserver, DeadBranchDetector, ExecutionCollector, NullObserver, Observer,
+    RecordingObserver, Step, StepKind,
 };
 pub use program::{Program, ThreadNext};
 pub use runtime::{Ctx, NondetFuture, RecvFuture, RecvTimeoutFuture, System, DEFAULT_MAX_EVENTS};

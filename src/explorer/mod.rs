@@ -60,6 +60,93 @@ pub struct Config {
     /// explorable — a consistent, time-realizable terminal can be reachable only by a
     /// backward revisit *out of* that error graph (revisit completeness, engine_plan §3 B1).
     pub time_filter: bool,
+    /// Enable the full **eager-time predicate** exploration (time-intervals extension, T2 — see
+    /// `T2_PLAN.md`). Unlike [`time_filter`](Self::time_filter) (a post-hoc filter on terminals),
+    /// this drives four coupled changes so the explorer *never enters* the eager-infeasible
+    /// superset in the first place:
+    ///
+    /// * **T-DES** ([`crate::scheduler::pick`]): a discrete-event scheduling order by lower-bound
+    ///   time, replacing the priority order — this fixes the canonical `≤_G` (Lemma 1);
+    /// * **T-PRED** ([`Explorer::visit_recv`]): an rf-fork is taken only when the resulting
+    ///   prefix is eager-time-feasible (`time::check(..).is_feasible()`), not merely consistent;
+    /// * **T-CANON** ([`crate::explorer::revisit::get_cons_tiebreaker`]): the canonical source of
+    ///   a blocking receive is the earliest-arriving one (`avail`-LB), not the `(tid,idx)`-min;
+    /// * **T-GATE** ([`Explorer::visit_send`] line 9, [`crate::explorer::revisit`] line 13): a
+    ///   forward send / backward revisit is gated on `time::forced_closure_feasible`, which
+    ///   rejects a child whose *obligatory* continuation is eager-infeasible (the refuted-L3
+    ///   replacement).
+    ///
+    /// Like [`time_filter`](Self::time_filter) it requires [`collect_errors`](Self::collect_errors)
+    /// (same revisit-completeness reason) and is **mutually exclusive** with it (they are two
+    /// different regimes for the same extension); `explore` panics on either violation. Default
+    /// `false`; with the flag off, every count is byte-identical to the untimed explorer.
+    pub time_predicate: bool,
+    /// **Diagnostic ladder level** of the predicate regime (`C1_HARDENING_SPEC` §D.4): which of
+    /// T2's pruners are switched on. Read *only* when [`time_predicate`](Self::time_predicate)
+    /// is set; ignored otherwise.
+    ///
+    /// | level | T-DES | T-CANON + PASS oracle | T-PRED (line 7) | T-GATE (lines 9/13) | terminals |
+    /// |---|---|---|---|---|---|
+    /// | 1 | ✓ | — (untimed canon) | — | — | post-filter — this is [`time_zombie`](Self::time_zombie), *not* this field |
+    /// | 2 | ✓ | ✓ | — | — | post-filter |
+    /// | 3 | ✓ | ✓ | ✓ | — | post-filter |
+    /// | 4 | ✓ | ✓ | ✓ | ✓ | none needed (feasible by construction) |
+    ///
+    /// Levels 2 and 3 still record only *eager-realizable* terminals — they route the rest to
+    /// [`Observer::on_execution_filtered`](crate::Observer::on_execution_filtered) exactly as
+    /// [`time_filter`](Self::time_filter)/[`time_zombie`](Self::time_zombie) do — because without
+    /// T-PRED/T-GATE the walk reaches graphs no schedule realizes. At level 4 that filter should
+    /// be vacuous, and a debug build asserts that it is; it is applied all the same, so that a
+    /// broken invariant costs a missing execution rather than a *reported* one no schedule
+    /// realizes.
+    ///
+    /// The point of the ladder is *localisation*, not a shipping mode: diffing the realizable key
+    /// sets of two adjacent levels pins any completeness loss on exactly one mechanism (see
+    /// `tests/ladder.rs`). Default `4` — i.e. plain [`with_time_predicate`](Self::with_time_predicate)
+    /// is byte-for-byte the level-4 configuration and nothing about the shipping regime changes.
+    pub time_predicate_level: u8,
+    /// **T2⁰ / the `L2′` rung** (`T2_COMPLETENESS_VI_2` §0.1 Т-RED′, recipe VI-1 §8 R-7): force
+    /// lines **18, 19 and 22** of `RevisitCondition` — all three *canon* arms (non-blocking
+    /// receive, nondet value, blocking-receive source) — to `true`, leaving everything else
+    /// (T-DES, T-PRED, both T-GATEs, and arm 21, which carries termination) as configured.
+    ///
+    /// Arm 18 is in that list and **must** be: once `pass_nb` made it an existential rule rather
+    /// than the structural "reads ⊥", an active arm 18 can reject a revisit that zombie performs,
+    /// so T2⁰ stops majorising the zombie tree. Т-RED as originally stated over {19, 22} is
+    /// refuted for exactly that reason; Т-RED′ over {18, 19, 22} is the proved form (the VI-1
+    /// §3.1 proof transfers verbatim — no step used arm 18's structurality, it was simply not
+    /// listed).
+    ///
+    /// Т-RED′ proves that the resulting tree is the zombie tree plus extra revisits minus exactly
+    /// the subtrees T-PRED and the two gates cut. Completeness of T2⁰ is therefore *equivalent* to
+    /// global C1 alone, with the canon factored out — which turns
+    /// `realizable(T2) ⊆ realizable(T2⁰) ⊆ realizable(zombie)` into the cheapest possible machine
+    /// disjunction: a strict `⊊` on the left blames the canon (arms 18/19/22), a strict `⊊` on the
+    /// right blames the pruning (global C1).
+    ///
+    /// It is a *diagnostic*, never a shipping regime: `true` is weaker than any canon rule, so the
+    /// same graph is reached by many paths and duplicates are expected (optimality-(a) is given up
+    /// on purpose; completeness and termination are not affected — `RevisitCondition` is a
+    /// duplicate-elimination device, not a termination device). Default `false`.
+    pub time_canon_free: bool,
+    /// The **zombie** regime of the time extension (T2_ORACLE_SPEC Part 2): the untimed
+    /// Algorithm 1 — untimed canon, no T-PRED, no T-GATE — run under the *DES insertion order*
+    /// ([`crate::scheduler::pick`] with the des bit set) with the post-hoc realizability filter
+    /// on terminals (exactly [`time_filter`](Self::time_filter)'s `record` routing).
+    ///
+    /// Correct by construction: Theorem 4.1 holds verbatim for any deterministic `next_P`
+    /// policy, and the terminal filter is the proven T1 lemma. Against T1 it prunes *nothing* —
+    /// it differs only in `≤_G` (DES order instead of priority order). Its role:
+    /// 1. isolate `pick_des` as a valid `next_P` (zombie counts == T1-filter counts is a test of
+    ///    the policy alone, decoupled from the T2 machinery);
+    /// 2. arbitration under the same `≤_G`: zombie's canonical sources/stamps are directly
+    ///    comparable with the oracle-T2 run on forward segments;
+    /// 3. the fallback if the T2 oracle is intractable.
+    ///
+    /// Requires [`collect_errors`](Self::collect_errors) (same revisit-completeness reason as
+    /// `time_filter`) and is mutually exclusive with both `time_filter` and `time_predicate`;
+    /// `explore` panics on a violation. Default `false`.
+    pub time_zombie: bool,
 }
 
 impl Default for Config {
@@ -70,6 +157,10 @@ impl Default for Config {
             max_executions: None,
             threads: 1,
             time_filter: false,
+            time_predicate: false,
+            time_predicate_level: 4,
+            time_canon_free: false,
+            time_zombie: false,
         }
     }
 }
@@ -94,6 +185,55 @@ impl Config {
     /// Must be combined with [`collect_errors`](Self::collect_errors), or `explore` panics.
     pub fn with_time_filter(mut self) -> Self {
         self.time_filter = true;
+        self
+    }
+    /// Enable the full eager-time predicate exploration (see
+    /// [`time_predicate`](Self::time_predicate)). Must be combined with
+    /// [`collect_errors`](Self::collect_errors) and must **not** be combined with
+    /// [`with_time_filter`](Self::with_time_filter), or `explore` panics.
+    pub fn with_time_predicate(mut self) -> Self {
+        self.time_predicate = true;
+        self
+    }
+    /// One rung of the **diagnostic ladder** (`C1_HARDENING_SPEC` §D.4): the predicate regime with
+    /// T2's pruners switched on one at a time — see
+    /// [`time_predicate_level`](Self::time_predicate_level) for the table.
+    ///
+    /// * `1` — delegates to [`with_time_zombie`](Self::with_time_zombie) (it *is* the L1 row:
+    ///   T-DES + untimed canon + no T-PRED/T-GATE + the terminal post-filter), so the validated
+    ///   correct-by-construction reference is reused rather than re-implemented;
+    /// * `2..=4` — the predicate regime at that level; `4` is exactly
+    ///   [`with_time_predicate`](Self::with_time_predicate).
+    ///
+    /// Panics on `l == 0` or `l > 4`. Carries the same `collect_errors` / mutual-exclusion
+    /// requirements as the regime it selects.
+    pub fn with_time_predicate_level(self, l: u8) -> Self {
+        assert!(
+            (1..=4).contains(&l),
+            "with_time_predicate_level: level {l} is outside 1..=4"
+        );
+        if l == 1 {
+            return self.with_time_zombie();
+        }
+        let mut cfg = self.with_time_predicate();
+        cfg.time_predicate_level = l;
+        cfg
+    }
+    /// Force all three canon arms (18, 19, 22) of `RevisitCondition` to `true` (see
+    /// [`time_canon_free`](Self::time_canon_free)). Combined with
+    /// [`with_time_predicate_level(4)`](Self::with_time_predicate_level) this is the **`L2′` rung**
+    /// = Т-RED′'s `T2⁰` (`T2_COMPLETENESS_VI_2` §0.1).
+    pub fn with_canon_free(mut self) -> Self {
+        self.time_canon_free = true;
+        self
+    }
+    /// Enable the zombie regime (see [`time_zombie`](Self::time_zombie)): untimed Algorithm 1
+    /// under the DES insertion order with the post-hoc terminal filter. Must be combined with
+    /// [`collect_errors`](Self::collect_errors) and must **not** be combined with
+    /// [`with_time_filter`](Self::with_time_filter) or
+    /// [`with_time_predicate`](Self::with_time_predicate), or `explore` panics.
+    pub fn with_time_zombie(mut self) -> Self {
+        self.time_zombie = true;
         self
     }
 }
@@ -123,6 +263,31 @@ where
         "Config::with_time_filter() requires collect_errors(): time-infeasible error \
          prefixes must stay explorable (revisit completeness)"
     );
+    // T2 (T2_PLAN §5): `with_time_predicate` needs the whole error subtree explorable for the
+    // same revisit-completeness reason as `with_time_filter`.
+    assert!(
+        !(config.time_predicate && config.stop_on_error),
+        "Config::with_time_predicate() requires collect_errors(): eager-infeasible error \
+         prefixes must stay explorable (revisit completeness)"
+    );
+    // The filter (post-hoc on terminals) and the predicate (drives the search) are two distinct
+    // regimes for the time extension; running both at once is meaningless and unsupported.
+    assert!(
+        !(config.time_filter && config.time_predicate),
+        "Config::with_time_filter() and with_time_predicate() are mutually exclusive"
+    );
+    // Zombie (T2_ORACLE_SPEC Part 2): the same revisit-completeness requirement as the filter
+    // (its `record` routing IS the filter's), and a third mutually-exclusive regime.
+    assert!(
+        !(config.time_zombie && config.stop_on_error),
+        "Config::with_time_zombie() requires collect_errors(): time-infeasible error \
+         prefixes must stay explorable (revisit completeness)"
+    );
+    assert!(
+        !(config.time_zombie && (config.time_filter || config.time_predicate)),
+        "Config::with_time_zombie() is mutually exclusive with with_time_filter() and \
+         with_time_predicate()"
+    );
 
     if config.threads > 1 {
         parallel::explore_parallel(make_program, observer, config);
@@ -149,7 +314,13 @@ where
         stop_on_error: config.stop_on_error,
         max_executions: config.max_executions,
         time_filter: config.time_filter,
+        time_predicate: config.time_predicate,
+        time_level: config.time_predicate_level,
+        canon_free: config.time_canon_free,
+        time_zombie: config.time_zombie,
+        viable_memo: crate::time::ViableMemo::new(),
         terminal_count: 0,
+        terminals_recorded: 0,
         stop: false,
         fork: None,
     };
@@ -190,8 +361,45 @@ pub(crate) struct Explorer<'a, P: Program, O: Observer> {
     /// [`record`](Self::record); `eager_feasible` is a pure function of the graph, so this
     /// carries no cross-branch state and is safe to copy into every parallel worker.
     time_filter: bool,
+    /// Drive the full eager-time predicate search ([`Config::time_predicate`]). Threaded into
+    /// [`pick`](crate::scheduler::pick) (T-DES), [`visit_recv`](Self::visit_recv) (T-PRED),
+    /// [`visit_send`](Self::visit_send)/[`backward_revisits`](Self::backward_revisits) (T-GATE)
+    /// and [`get_cons_tiebreaker`](crate::explorer::revisit::get_cons_tiebreaker) (T-CANON). Pure
+    /// per-graph, so it too is safe to copy into every parallel worker.
+    pub(crate) time_predicate: bool,
+    /// Ladder level ([`Config::time_predicate_level`], `C1_HARDENING_SPEC` §D.4). Meaningful only
+    /// while `time_predicate` is set; `4` (the default) is the shipping regime, where every
+    /// `time_level >= k` test below is trivially true and the walk is byte-identical to the
+    /// pre-ladder explorer. Consulted in exactly three places — T-PRED in
+    /// [`visit_recv`](Self::visit_recv) (`>= 3`), T-GATE in [`visit_send`](Self::visit_send) and
+    /// [`backward_revisits`](Self::backward_revisits) (`>= 4`), and the `record` debug-assert
+    /// that level 4 never needs the terminal filter — which is the whole ladder.
+    ///
+    /// Deliberately *not* consulted by the canon (T-CANON's `(avail_lb, tid, idx)` order and the
+    /// `viable`/`viable_recv` PASS oracle): the canon is one mechanism, switched on as a unit at
+    /// level 2, and the oracle's own internal gate is part of it. The "T-GATE" column of §D.4 is
+    /// the explorer's line-9/13 gate only.
+    pub(crate) time_level: u8,
+    /// `L2′` / Т-RED′'s `T2⁰` ([`Config::time_canon_free`]): arms 18, 19 and 22 of
+    /// [`revisit_condition`](crate::explorer::revisit) are `true`. Read there and nowhere else.
+    pub(crate) canon_free: bool,
+    /// The zombie regime ([`Config::time_zombie`]): DES insertion order + the T1 terminal
+    /// filter, everything else untimed. Read in [`visit_step`](Self::visit_step) (the des bit of
+    /// [`pick`](crate::scheduler::pick)) and [`record`](Self::record) only.
+    pub(crate) time_zombie: bool,
+    /// Memo of the existential canon oracle ([`crate::time::viable`], T2_ORACLE_SPEC §1.3),
+    /// used by the nondet arm of `RevisitCondition` under `time_predicate`. Per worker (this
+    /// struct is per worker), so the memo is effectively sharded across a parallel run; a
+    /// cached verdict is a pure function of its key, so sharding only costs duplicate work,
+    /// never correctness.
+    pub(crate) viable_memo: crate::time::ViableMemo,
     /// This worker's own full+blocked count, for the sequential `max_executions` cap.
     pub(crate) terminal_count: usize,
+    /// Running total of terminals *reported* (`on_execution`, i.e. full+blocked+error, never a
+    /// filtered one). The dead-branch detector (T2_PLAN §5а) snapshots this around each
+    /// [`visit_step`](Self::visit_step) to tell whether that Visit's subtree bore any terminal.
+    /// Reliable only on the sequential path (a donated subtree records on another worker).
+    pub(crate) terminals_recorded: usize,
     /// Set once the run should unwind: an `exit`-on-error or the execution cap.
     pub(crate) stop: bool,
     /// `Some` under a parallel run: later sibling branches are shed to the shared work
@@ -202,8 +410,9 @@ pub(crate) struct Explorer<'a, P: Program, O: Observer> {
 
 impl<P: Program, O: Observer> Explorer<'_, P, O> {
     /// `Visit_P(G)` (Algorithm 1, lines 2-14), building the per-thread `(traces, nexts)`
-    /// state from scratch. `g` is consistent on entry (it arrived through
-    /// `branch_if_consistent`, or is the empty graph). Used wherever the parent's state does
+    /// state from scratch. `g` is consistent on entry (its caller tested it — line 7's
+    /// `consistent_after_recv`, line 13's `consistent` — or it is the empty graph). Used
+    /// wherever the parent's state does
     /// not carry over: the root, a subtree taken from the work queue, and after a backward
     /// revisit restructures the graph.
     pub(crate) fn visit(&mut self, g: &ExecutionGraph) {
@@ -236,7 +445,16 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                 && *nexts == self.program.next(traces),
             "threaded traces/nexts drifted from a fresh recompute"
         );
-        match pick(g, nexts, &self.priorities) {
+        // Dead-branch detector (T2_PLAN §5а): a `visit_step` call *is* one logical Visit_P(G)
+        // node (every logical Visit reaches exactly one `visit_step`, via `visit` or
+        // `branch_memo`). Snapshot the running terminal count so `on_visit_exit` can report
+        // whether this Visit's whole subtree bore a terminal — `record` (which recurses on the
+        // same `self`) bumps `terminals_recorded`, so the delta is the subtree's terminal count.
+        self.observer.on_visit_enter(g);
+        let terminals_before = self.terminals_recorded;
+        // The des bit: both the predicate (T-DES) and the zombie regime run under the DES
+        // insertion order; zombie changes nothing else about the walk.
+        match pick(g, nexts, &self.priorities, self.time_predicate || self.time_zombie) {
             // line 4: next_P(G) = nothing - a terminal execution.
             NextStep::Terminal { blocked } => {
                 // In collect-errors mode a branch that ran through an error reaches its
@@ -265,6 +483,8 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                 Label::Send { .. } => self.visit_send(g, tid, label, traces, nexts),
             },
         }
+        self.observer
+            .on_visit_exit(g, self.terminals_recorded > terminals_before);
     }
 
     /// Append `entry` to thread `tid`'s trace, recompute just that thread's next event, run
@@ -355,19 +575,6 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         self.visit_step(g, traces, nexts);
     }
 
-    /// [`branch`](Self::branch) gated on consistency: if `g` is consistent, explore it as
-    /// a sibling (carrying the `first` flag); otherwise report it inconsistent.
-    fn branch_if_consistent(&mut self, first: &mut bool, g: &ExecutionGraph) {
-        if self.stopping() {
-            return;
-        }
-        if consistent(g) {
-            self.branch(first, g);
-        } else {
-            self.observer.on_inconsistent(g);
-        }
-    }
-
     /// line 5: an `error` event.
     ///
     /// With `stop_on_error` (default) this is the paper's `exit`: record the erroneous
@@ -420,6 +627,12 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         let mut sources: Vec<Option<EventId>> = base.iter_sends().map(Some).collect();
         sources.push(None); // bottom
 
+        // Which sends are read by the *other* receives is the same for every source `e` is
+        // about to try, so the scan happens once here instead of inside each rf-choice's
+        // consistency check.
+        let mut read = crate::graph::PooledMarks::take();
+        crate::consistency::mark_read_sources(&base, Some(e), &mut read);
+
         // `branch` never mutates the graph it is handed (it clones internally for its own
         // children, and once when donating to the queue), so one `base` is reused across
         // sources, re-pointing `e`'s rf in place for each.
@@ -433,12 +646,30 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             // `e` is the freshly added maximal receive, so only clauses mentioning it can
             // break: the incremental `consistent_after_recv` suffices. Filter here, before
             // the `(traces, nexts)` update, so a rejected source costs no recompute.
+            let cons = crate::consistency::consistent_after_recv_with(&base, e, &read);
             debug_assert_eq!(
-                crate::consistency::consistent_after_recv(&base, e),
+                cons,
                 consistent(&base),
                 "incremental recv-consistency must agree with the full check"
             );
-            if !crate::consistency::consistent_after_recv(&base, e) {
+            // T-PRED (T2_PLAN §2a, §5): under the eager-time predicate an rf-fork is taken only
+            // when the resulting *prefix* is eager-time-feasible, not merely consistent —
+            // `time::check` is a RAW feasibility test of `base` (NOT forced_closure; that gate is
+            // only sound on forward sends / revisits, T2_PLAN §5). This is what keeps the search
+            // out of the eager-infeasible superset; it is completeness-safe only in concert with
+            // T-DES (Lemma 1: the earlier-time siblings are already present when `e` is woken).
+            // `check` is called only on a `consistent` base (short-circuit), so a blocking recv
+            // reading ⊥ — which is inconsistent — never reaches the time system.
+            //
+            // Ladder (§D.4): T-PRED is the level-3 rung, so levels 2 (canon only) and below run
+            // the plain consistency test here. Dropping a *pruner* can only add children, never
+            // remove one (M2, §0.2), so a lower rung explores a superset of level 4's tree.
+            let ok = if self.time_predicate && self.time_level >= 3 {
+                cons && crate::time::check(&base).is_feasible()
+            } else {
+                cons
+            };
+            if !ok {
                 self.observer.on_inconsistent(&base);
                 continue;
             }
@@ -515,15 +746,39 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         // cannot be the `u` of clause (b), never appears in clause (c), and has no outgoing
         // edge in the mbox graph). So branch unconditionally rather than re-checking the
         // whole graph; the debug assertion guards the proof.
+        //
+        // T-GATE (T2_PLAN §2c, line 9): under the eager-time predicate the added early-time
+        // send can make the *obligatory* continuation eager-infeasible even though `g_add`
+        // itself is (still untimed-consistent and) feasible — the refuted-L3 case. So the
+        // forward branch is taken only when `forced_closure(g_add)` is feasible: the closure
+        // adds every event the policy is forced to add with no genuine rf-fork, and if *that* is
+        // infeasible the whole forward subtree is fruitless. The revisit loop below runs
+        // regardless (a revisit can delete the very events that broke the closure).
         if !self.stopping() {
-            debug_assert!(
-                consistent(&g_add),
-                "line-9 maximal unread send must be consistent"
-            );
-            // A send contributes no read value to its thread's trace.
-            self.with_child_memo(tid, None, traces, nexts, |this, traces, nexts| {
-                this.branch_memo(&mut first, &g_add, traces, nexts);
-            });
+            //
+            // Ladder (§D.4): T-GATE is the level-4 rung; below it the forward branch is taken
+            // unconditionally, exactly as untimed. The `consistent` debug-assert stays valid on
+            // every rung — it is a property of a ≤_G-maximal unread send, not of the regime.
+            let forward_ok = if self.time_predicate && self.time_level >= 4 {
+                crate::time::gate_feasible_cached(
+                    &g_add,
+                    self.program,
+                    &self.priorities,
+                    &mut self.viable_memo,
+                )
+            } else {
+                debug_assert!(
+                    consistent(&g_add),
+                    "line-9 maximal unread send must be consistent"
+                );
+                true
+            };
+            if forward_ok {
+                // A send contributes no read value to its thread's trace.
+                self.with_child_memo(tid, None, traces, nexts, |this, traces, nexts| {
+                    this.branch_memo(&mut first, &g_add, traces, nexts);
+                });
+            }
         }
         if self.stopping() {
             return;
@@ -544,11 +799,36 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     /// timed program.
     fn record(&mut self, graph: ExecutionGraph, kind: ExecutionKind) -> bool {
         let exec = Execution::new(graph);
-        if self.time_filter && !crate::time::eager_feasible(exec.graph()) {
-            self.observer.on_execution_filtered(&exec, kind);
-            return false;
+        if self.time_filter || self.time_zombie || self.time_predicate {
+            // The v1 model guard is a precondition of the time extension, not an invariant of
+            // any regime, so it runs on every timed terminal regardless of level or profile.
+            crate::time::assert_supported_models(exec.graph());
+            if !crate::time::eager_feasible(exec.graph()) {
+                // T-GATE / record (T2_PLAN §2c): under the predicate at level 4 every terminal
+                // reached is eager-feasible by construction (T-PRED gates receives, T-GATE gates
+                // sends / revisits), so landing here at all is a bug in that invariant. Debug
+                // builds say so loudly; release builds still must not *print* the terminal,
+                // because a model checker reporting an unrealizable counterexample is worse than
+                // one reporting too few - so it takes the filtered path either way, where
+                // `on_execution_filtered` keeps it visible rather than silently dropped.
+                debug_assert!(
+                    !(self.time_predicate && self.time_level >= 4),
+                    "T2 terminal must be eager-feasible (predicate invariant)"
+                );
+                // Ladder levels 2-3 (§D.4): with T-PRED and/or T-GATE off the walk *does* reach
+                // unrealizable terminals, so they are routed through the same post-filter the
+                // zombie regime uses — which is what makes `realizable(L2) == realizable(L4)` a
+                // meaningful set equality rather than a comparison of differently-shaped outputs.
+                // Zombie routes terminals exactly as the T1 filter does (T2_ORACLE_SPEC §2.1): an
+                // unrealizable terminal is filtered, counted in neither `terminal_count` nor
+                // `max_executions`.
+                self.observer.on_execution_filtered(&exec, kind);
+                return false;
+            }
         }
         self.observer.on_execution(&exec, kind);
+        // Counts every reported terminal (full/blocked/error) for the dead-branch detector.
+        self.terminals_recorded += 1;
         if matches!(kind, ExecutionKind::Full | ExecutionKind::Blocked) {
             self.terminal_count += 1;
         }

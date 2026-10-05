@@ -472,7 +472,128 @@ fn check_program(case: usize, prog: &SeqProgram) -> ProgStats {
         }
     }
 
+    // -- G1-accept: the full T2 predicate search on the same program (T2_PLAN §5б). ----------
+    //
+    // The predicate order is a pure function of the graph (priority-independent), so one run
+    // suffices; we assert it against the same independent reference the T1 filter is checked on,
+    // plus the two T2-only invariants: no duplicate keys and — since a SeqProgram has an exact
+    // `possible_future`, so `forced_closure` is exact — **zero** dead branches (optimality-b).
+    check_program_predicate(case, prog, partition.as_ref());
+
+    // -- Zombie == T1-filter (T2_ORACLE_SPEC §2.2 point 1): the untimed algorithm under the DES
+    // order must reproduce the T1-filter partition EXACTLY — both the realizable and the
+    // filtered key sets. This isolates `pick_des` as a valid next_P policy, decoupled from the
+    // whole T2 machinery. Zombie is priority-invariant by construction (pick_des ignores
+    // priorities), so one run suffices; it is diffed against the T1 sets of the first
+    // permutation (themselves asserted priority-invariant above).
+    if let Some((rf_full, rf_term, rf_filt, _)) = &reference {
+        check_program_zombie(case, prog, rf_full, rf_term, rf_filt);
+    }
+
     stats
+}
+
+/// Run `prog` under `Config::with_time_zombie` and assert its partition equals the T1-filter's.
+fn check_program_zombie(
+    case: usize,
+    prog: &SeqProgram,
+    rf_full: &KeySet,
+    rf_term: &KeySet,
+    rf_filt: &KeySet,
+) {
+    let col = ExecutionCollector::new();
+    explore(
+        || prog.clone(),
+        &col,
+        Config::default().collect_errors().with_time_zombie(),
+    );
+
+    let full: BTreeSet<String> = col.full_keys().into_iter().collect();
+    let term_vec = col.terminal_keys();
+    let term: BTreeSet<String> = term_vec.iter().cloned().collect();
+    let filt_vec = col.filtered_keys();
+    let filt: BTreeSet<String> = filt_vec.iter().cloned().collect();
+
+    // No duplicates (Theorem 4.1 verbatim under the DES policy).
+    assert_eq!(
+        term_vec.len(),
+        term.len(),
+        "case {case}: zombie produced duplicate realizable terminals\n{:#?}",
+        prog.threads
+    );
+    assert_eq!(
+        filt_vec.len(),
+        filt.len(),
+        "case {case}: zombie produced duplicate filtered terminals\n{:#?}",
+        prog.threads
+    );
+
+    // Exact partition match against T1-filter.
+    assert_eq!(
+        &full, rf_full,
+        "case {case}: zombie full keys differ from T1-filter\n{:#?}",
+        prog.threads
+    );
+    assert_eq!(
+        &term, rf_term,
+        "case {case}: zombie realizable terminal keys differ from T1-filter\n{:#?}",
+        prog.threads
+    );
+    assert_eq!(
+        &filt, rf_filt,
+        "case {case}: zombie filtered keys differ from T1-filter\n{:#?}",
+        prog.threads
+    );
+}
+
+/// Run `prog` under `Config::with_time_predicate` and assert the G1-accept invariants.
+fn check_program_predicate(case: usize, prog: &SeqProgram, partition: Option<&TimePartition>) {
+    let obs = (
+        ExecutionCollector::new(),
+        must::DeadBranchDetector::new(),
+    );
+    explore(
+        || prog.clone(),
+        &obs,
+        Config::default().collect_errors().with_time_predicate(),
+    );
+    let (col, dead) = &obs;
+
+    // (2) optimality-(a): no duplicate realizable terminals.
+    let term_vec = col.terminal_keys();
+    let term: BTreeSet<String> = term_vec.iter().cloned().collect();
+    assert_eq!(
+        term_vec.len(),
+        term.len(),
+        "case {case}: T2 produced duplicate realizable terminals\n{:#?}",
+        prog.threads
+    );
+
+    // (3) optimality-(b): no dead Visit nodes (exact forced_closure on a SeqProgram).
+    assert_eq!(
+        dead.dead(),
+        0,
+        "case {case}: T2 has {} dead Visit nodes (of {}) — a forced-closure over-/under-gate\n{:#?}",
+        dead.dead(),
+        dead.visits(),
+        prog.threads
+    );
+
+    // (1) completeness + no-loss: the T2 realizable set equals the independent reference
+    // (full+blocked feasible terminals), whenever the reference stayed within budget.
+    if let Some((rf_full, rf_term, _rf_infeas)) = partition {
+        let full: BTreeSet<String> = col.full_keys().into_iter().collect();
+        assert_eq!(
+            &full, rf_full,
+            "case {case}: T2 realizable full keys disagree with the time reference\n{:#?}",
+            prog.threads
+        );
+        assert_eq!(
+            &term, rf_term,
+            "case {case}: T2 realizable terminal keys disagree with the time reference\n{:#?}",
+            prog.threads
+        );
+    }
 }
 
 /// Aggregate statistics of a corpus run.
