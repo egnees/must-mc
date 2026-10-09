@@ -23,8 +23,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::event::{EventId, Label, Tid, Val};
+use crate::explorer::receive_tail::ReceiveTailCertificate;
 use crate::explorer::{Execution, ExecutionKind};
 use crate::graph::ExecutionGraph;
+use crate::program::TraceLabel;
 
 /// Outcome of one certificate-pruning attempt. Only `Pruned` changes exploration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,6 +268,60 @@ pub trait Observer {
     fn on_frozen_time(&self, _g: &ExecutionGraph, _event: &FrozenTimeEvent) {}
     /// A terminal execution (full / blocked / error) was reached.
     fn on_execution(&self, _exec: &Execution, _kind: ExecutionKind) {}
+    /// Whether untimed terminals may be reported as borrowed graph and labels.
+    /// Opt in when [`on_execution_view`](Self::on_execution_view) avoids creating an
+    /// owned snapshot. Timed exploration continues to call `on_execution`.
+    fn accepts_execution_view(&self) -> bool {
+        false
+    }
+    /// A terminal execution borrowed for the duration of this callback.
+    ///
+    /// The default adapter preserves legacy `on_execution` callbacks by creating an
+    /// owned snapshot. Tuple observers may use this adapter for a legacy member when
+    /// another member opts into borrowed execution views.
+    fn on_execution_view(
+        &self,
+        graph: &ExecutionGraph,
+        labels: &[TraceLabel],
+        kind: ExecutionKind,
+    ) {
+        self.on_execution(
+            &Execution::new(graph.clone()).with_labels(labels.to_vec()),
+            kind,
+        );
+    }
+
+    /// Request that exploration stop after a terminal execution or send cutoff.
+    ///
+    /// Queried after [`on_execution`](Self::on_execution) or
+    /// [`on_execution_view`](Self::on_execution_view) or [`on_send_limit`](Self::on_send_limit),
+    /// not after individual events or
+    /// filtered terminals. Once requested, the stop applies to every worker; workers
+    /// already in flight may report additional terminals. It does not change execution
+    /// kinds or add an error event. Stopping leaves the search intentionally incomplete:
+    /// an observer may establish failure with a counterexample, but cannot claim that
+    /// the unexplored executions satisfy its property.
+    fn should_stop(&self) -> bool {
+        false
+    }
+    /// Request a bounded receive-tail proof for this prefix. Merely requesting
+    /// a proof does not permit pruning; every observer must accept its result.
+    fn receive_tail_candidate(&self, _graph: &ExecutionGraph, _labels: &[TraceLabel]) -> bool {
+        false
+    }
+    /// Accept omission of every terminal represented by this certified suffix.
+    ///
+    /// The certificate proves only that the suffix cannot send, fail or change
+    /// annotations. Return true only after establishing the observer's property
+    /// for every represented graph, or when those callbacks are intentionally
+    /// irrelevant. The conservative default preserves ordinary enumeration.
+    fn accept_receive_tail(&self, _certificate: &ReceiveTailCertificate<'_>) -> bool {
+        false
+    }
+    /// A certified suffix was accepted by all observers and omitted. This is
+    /// neither a Full/Blocked terminal nor a resource cutoff. Terminal counters
+    /// and `max_executions` do not count these families.
+    fn on_receive_tail_pruned(&self, _certificate: &ReceiveTailCertificate<'_>) {}
     /// Construction stopped before another send would exceed `Config::max_sends`.
     /// `g` is the prefix before that send, not a completed execution or a proven
     /// counterexample. Any such callback makes the search incomplete; even executions
@@ -314,6 +370,19 @@ pub(crate) fn default_shards() -> usize {
 pub struct NullObserver;
 
 impl Observer for NullObserver {
+    fn accept_receive_tail(&self, _certificate: &ReceiveTailCertificate<'_>) -> bool {
+        true
+    }
+    fn accepts_execution_view(&self) -> bool {
+        true
+    }
+    fn on_execution_view(
+        &self,
+        _graph: &ExecutionGraph,
+        _labels: &[TraceLabel],
+        _kind: ExecutionKind,
+    ) {
+    }
     fn allows_buffered_events(&self) -> bool {
         true
     }
@@ -334,6 +403,7 @@ impl Observer for NullObserver {
 #[derive(Debug, Default)]
 struct EventShard {
     events_added: AtomicUsize,
+    receive_tails: AtomicUsize,
     full: AtomicUsize,
     blocked: AtomicUsize,
     errors: AtomicUsize,
@@ -385,6 +455,11 @@ impl EventCountingObserver {
     pub fn events_added(&self) -> usize {
         self.total(|s| &s.events_added)
     }
+    /// Certified receive-only families omitted by an opting-in property observer.
+    /// Kept separate from the actual Full/Blocked terminal counts.
+    pub fn receive_tails(&self) -> usize {
+        self.total(|s| &s.receive_tails)
+    }
     pub fn full(&self) -> usize {
         self.total(|s| &s.full)
     }
@@ -400,6 +475,12 @@ impl EventCountingObserver {
 }
 
 impl Observer for EventCountingObserver {
+    fn accept_receive_tail(&self, _certificate: &ReceiveTailCertificate<'_>) -> bool {
+        true
+    }
+    fn on_receive_tail_pruned(&self, _certificate: &ReceiveTailCertificate<'_>) {
+        self.shard().receive_tails.fetch_add(1, Ordering::Relaxed);
+    }
     fn allows_buffered_events(&self) -> bool {
         self.buffered_events
     }
@@ -420,7 +501,18 @@ impl Observer for EventCountingObserver {
     fn on_event_added(&self, _g: &ExecutionGraph, _e: EventId) {
         self.shard().events_added.fetch_add(1, Ordering::Relaxed);
     }
-    fn on_execution(&self, _exec: &Execution, kind: ExecutionKind) {
+    fn accepts_execution_view(&self) -> bool {
+        true
+    }
+    fn on_execution(&self, exec: &Execution, kind: ExecutionKind) {
+        self.on_execution_view(exec.graph(), exec.labels(), kind);
+    }
+    fn on_execution_view(
+        &self,
+        _graph: &ExecutionGraph,
+        _labels: &[TraceLabel],
+        kind: ExecutionKind,
+    ) {
         let shard = self.shard();
         match kind {
             ExecutionKind::Full => &shard.full,
@@ -795,7 +887,18 @@ impl Observer for CountingObserver {
             .revisits_rejected
             .fetch_add(1, Ordering::Relaxed);
     }
-    fn on_execution(&self, _exec: &Execution, kind: ExecutionKind) {
+    fn accepts_execution_view(&self) -> bool {
+        true
+    }
+    fn on_execution(&self, exec: &Execution, kind: ExecutionKind) {
+        self.on_execution_view(exec.graph(), exec.labels(), kind);
+    }
+    fn on_execution_view(
+        &self,
+        _graph: &ExecutionGraph,
+        _labels: &[TraceLabel],
+        kind: ExecutionKind,
+    ) {
         let shard = self.shard();
         match kind {
             ExecutionKind::Full => &shard.full,
@@ -1235,6 +1338,39 @@ impl<A: Observer, B: Observer> Observer for (A, B) {
     fn on_execution(&self, exec: &Execution, kind: ExecutionKind) {
         self.0.on_execution(exec, kind);
         self.1.on_execution(exec, kind);
+    }
+    fn accepts_execution_view(&self) -> bool {
+        self.0.accepts_execution_view() || self.1.accepts_execution_view()
+    }
+    fn on_execution_view(
+        &self,
+        graph: &ExecutionGraph,
+        labels: &[TraceLabel],
+        kind: ExecutionKind,
+    ) {
+        if self.accepts_execution_view() {
+            self.0.on_execution_view(graph, labels, kind);
+            self.1.on_execution_view(graph, labels, kind);
+        } else {
+            // A legacy-only subtree inside a mixed tuple shares one owned snapshot.
+            self.on_execution(
+                &Execution::new(graph.clone()).with_labels(labels.to_vec()),
+                kind,
+            );
+        }
+    }
+    fn should_stop(&self) -> bool {
+        self.0.should_stop() || self.1.should_stop()
+    }
+    fn receive_tail_candidate(&self, graph: &ExecutionGraph, labels: &[TraceLabel]) -> bool {
+        self.0.receive_tail_candidate(graph, labels) || self.1.receive_tail_candidate(graph, labels)
+    }
+    fn accept_receive_tail(&self, certificate: &ReceiveTailCertificate<'_>) -> bool {
+        self.0.accept_receive_tail(certificate) && self.1.accept_receive_tail(certificate)
+    }
+    fn on_receive_tail_pruned(&self, certificate: &ReceiveTailCertificate<'_>) {
+        self.0.on_receive_tail_pruned(certificate);
+        self.1.on_receive_tail_pruned(certificate);
     }
     fn on_send_limit(&self, g: &ExecutionGraph, limit: usize) {
         self.0.on_send_limit(g, limit);

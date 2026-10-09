@@ -139,6 +139,43 @@ fn cut_branch_does_not_stop_siblings_or_other_workers() {
 }
 
 #[test]
+fn observer_can_stop_immediately_at_first_send_cutoff() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Default)]
+    struct StopAtCut(AtomicBool);
+    impl Observer for StopAtCut {
+        fn on_send_limit(&self, _: &ExecutionGraph, _: usize) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+        fn should_stop(&self) -> bool {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+    for threads in [1, 12] {
+        let observer = (CountingObserver::new(), StopAtCut::default());
+        explore(
+            || {
+                let mut system = System::new();
+                system.add(|ctx: Ctx| async move {
+                    let choice = ctx.nondet(["a-cut", "b-full", "c-cut"]).await;
+                    if choice.ends_with("cut") {
+                        ctx.send(0, "over budget", Model::Asyn);
+                    }
+                });
+                system
+            },
+            &observer,
+            Config::default().with_max_sends(0).with_threads(threads),
+        );
+        assert_eq!(observer.0.send_limit_hits(), 1, "threads={threads}");
+        assert_eq!(observer.0.full(), 0, "threads={threads}");
+        assert_eq!(observer.0.blocked(), 0, "threads={threads}");
+        assert_eq!(observer.0.errors(), 0, "threads={threads}");
+    }
+}
+
+#[test]
 fn feasible_timed_prefix_reports_cut_instead_of_a_filtered_terminal() {
     for certified in [false, true] {
         let observer = CountingObserver::new();

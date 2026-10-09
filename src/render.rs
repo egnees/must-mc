@@ -134,9 +134,14 @@ fn fmt_id(e: EventId) -> String {
 /// Render a completed execution with local labels inline in the thread columns,
 /// followed by rf edges and the list of pending (unread) sends.
 pub fn render_execution(exec: &Execution) -> String {
-    let mut out = render_annotated_graph(exec.graph(), exec.labels());
+    render_execution_view(exec.graph(), exec.labels())
+}
+
+/// Render a borrowed terminal graph and its ordered local annotations.
+pub fn render_execution_view(graph: &ExecutionGraph, labels: &[TraceLabel]) -> String {
+    let mut out = render_annotated_graph(graph, labels);
     out.push_str("pending sends:");
-    let pending = exec.pending_sends();
+    let pending = graph.unread_sends();
     if pending.is_empty() {
         out.push_str(" (none)");
     }

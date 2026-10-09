@@ -167,6 +167,7 @@ where
             let stop_on_terminal_error = config.stop_on_terminal_error;
             let max_executions = config.max_executions;
             let max_sends = config.max_sends;
+            let receive_tail = config.receive_tail;
             let time_filter = config.time_filter;
             let time_predicate = config.time_predicate;
             let time_level = config.time_predicate_level;
@@ -185,6 +186,8 @@ where
                     prefix_namespace: program
                         .prefix_namespace()
                         .filter(|&namespace| namespace != 0),
+                    terminal_tokens: Vec::new(),
+                    terminal_labels: Vec::new(),
                     observer,
                     buffer_added_events: observer.allows_buffered_events(),
                     buffered_events_added: 0,
@@ -193,6 +196,7 @@ where
                     stop_on_terminal_error,
                     max_executions,
                     max_sends,
+                    receive_tail,
                     time_filter,
                     mailbox_time,
                     time_predicate,

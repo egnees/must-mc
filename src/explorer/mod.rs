@@ -9,6 +9,7 @@ mod execution;
 pub mod frozen;
 pub mod ownership;
 mod parallel;
+pub mod receive_tail;
 mod repair_owner;
 pub mod revisit;
 pub mod source_order;
@@ -397,6 +398,11 @@ pub struct Config {
     /// does not bound loops that make progress without sending, or temporary
     /// graphs built by internal consistency and timing lookahead.
     pub max_sends: Option<usize>,
+    /// Optional property-directed omission of certified receive-only suffixes.
+    /// Disabled by default, preserving graph enumeration and paper oracle counts.
+    /// Only untimed Asyn is eligible, and all observers must explicitly accept a
+    /// proved family. Omitted families are reported separately from terminals.
+    pub receive_tail: Option<receive_tail::ReceiveTailBudget>,
     /// Worker threads for the exploration. `1` (the default) runs the ordinary sequential
     /// search on the calling thread; `> 1` fans the independent subtrees out across that
     /// many workers. The set of executions is identical either way (only their order, and
@@ -534,6 +540,7 @@ impl Default for Config {
             stop_on_terminal_error: false,
             max_executions: None,
             max_sends: None,
+            receive_tail: None,
             threads: 1,
             time_filter: false,
             mailbox_time: false,
@@ -578,6 +585,11 @@ impl Config {
     /// the search incomplete; see [`max_sends`](Self::max_sends).
     pub fn with_max_sends(mut self, max_sends: usize) -> Self {
         self.max_sends = Some(max_sends);
+        self
+    }
+    /// Enable bounded receive-tail proofs for an explicitly accepting observer.
+    pub fn with_receive_tail(mut self, budget: receive_tail::ReceiveTailBudget) -> Self {
+        self.receive_tail = Some(budget);
         self
     }
     /// Explore across `threads` worker threads (clamped to at least one).
@@ -769,6 +781,8 @@ where
         prefix_namespace: program
             .prefix_namespace()
             .filter(|&namespace| namespace != 0),
+        terminal_tokens: Vec::new(),
+        terminal_labels: Vec::new(),
         observer,
         buffer_added_events: observer.allows_buffered_events(),
         buffered_events_added: 0,
@@ -778,6 +792,7 @@ where
         stop_on_terminal_error: config.stop_on_terminal_error,
         max_executions: config.max_executions,
         max_sends: config.max_sends,
+        receive_tail: config.receive_tail,
         time_filter: config.time_filter,
         mailbox_time: config.mailbox_time,
         time_predicate: config.time_predicate,
@@ -822,6 +837,9 @@ fn graph_has_error(g: &ExecutionGraph) -> bool {
 pub(crate) struct Explorer<'a, P: Program, O: Observer> {
     pub(crate) program: &'a P,
     prefix_namespace: Option<u64>,
+    // Per-worker storage reused by borrowed terminal callbacks.
+    terminal_tokens: Vec<u64>,
+    terminal_labels: Vec<crate::program::TraceLabel>,
     pub(crate) observer: &'a O,
     buffer_added_events: bool,
     buffered_events_added: usize,
@@ -830,6 +848,7 @@ pub(crate) struct Explorer<'a, P: Program, O: Observer> {
     stop_on_terminal_error: bool,
     max_executions: Option<usize>,
     max_sends: Option<usize>,
+    receive_tail: Option<receive_tail::ReceiveTailBudget>,
     /// Suppress non-eager-time-realizable terminals ([`Config::time_filter`]). Read only in
     /// [`record`](Self::record); `eager_feasible` is a pure function of the graph, so this
     /// carries no cross-branch state and is safe to copy into every parallel worker.
@@ -1051,7 +1070,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                     }
                     ExecutionKind::Blocked
                 };
-                self.record(g.clone(), kind, Some(traces));
+                self.record(g, kind, Some(traces));
             }
             NextStep::Event { tid, label } => match &label {
                 // line 5: error - see `visit_error`.
@@ -1059,7 +1078,11 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                 // line 6: nondet - enumerate every value of the option set.
                 Label::Nondet { .. } => self.visit_nondet(g, tid, label, traces, nexts, read),
                 // line 7: receive - enumerate rf sources.
-                Label::Recv { .. } => self.visit_recv(g, tid, label, traces, nexts, read),
+                Label::Recv { .. } => {
+                    if !self.try_receive_tail(g, traces, nexts, read) {
+                        self.visit_recv(g, tid, label, traces, nexts, read);
+                    }
+                }
                 // lines 8-13: send - the no-revisit branch plus backward revisits.
                 Label::Send { .. } => self.visit_send(g, tid, label, traces, nexts, read),
             },
@@ -1070,6 +1093,58 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         );
         self.observer
             .on_visit_exit(g, self.terminals_recorded > terminals_before);
+    }
+
+    /// Omit only this forward subtree; ancestor send calls still run their
+    /// backward-revisit loops. The certificate excludes future sends, so no
+    /// backward-revisit construction can originate inside the omitted suffix.
+    fn try_receive_tail(
+        &mut self,
+        graph: &ExecutionGraph,
+        traces: &[Vec<Option<Val>>],
+        nexts: &[ThreadNext],
+        read: &ForwardReads,
+    ) -> bool {
+        let Some(budget) = self.receive_tail else {
+            return false;
+        };
+        if self.time_filter
+            || self.time_zombie
+            || self.time_predicate
+            || self.mailbox_time
+            || budget.max_states == 0
+            || budget.max_pending_per_thread == 0
+            || !nexts.iter().all(receive_tail::receive_or_finished)
+            || read.unread.iter().sum::<usize>() < 2
+            || read
+                .unread
+                .iter()
+                .any(|&count| count > budget.max_pending_per_thread.min(64))
+        {
+            return false;
+        }
+        self.fill_terminal_labels(graph, Some(traces));
+        if !self
+            .observer
+            .receive_tail_candidate(graph, &self.terminal_labels)
+        {
+            return false;
+        }
+        let Some(certificate) = receive_tail::certify(
+            self.program,
+            graph,
+            traces,
+            nexts,
+            &self.terminal_labels,
+            budget,
+        ) else {
+            return false;
+        };
+        if !self.observer.accept_receive_tail(&certificate) {
+            return false;
+        }
+        self.observer.on_receive_tail_pruned(&certificate);
+        true
     }
 
     /// Prune a whole construction subtree only when both layers certify it. Forward
@@ -1309,7 +1384,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         let e = g.add_event(tid, label);
         self.event_added(g, e);
         if self.stop_on_error {
-            self.record(g.clone(), ExecutionKind::Error, None);
+            self.record(g, ExecutionKind::Error, None);
             self.request_stop();
         } else {
             // The error event is now in the trace, so this thread's `next` returns
@@ -1521,6 +1596,9 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
                 // search even for a currently time-infeasible construction prefix;
                 // never route this through the terminal timing filter.
                 self.observer.on_send_limit(g, limit);
+                if self.observer.should_stop() {
+                    self.request_stop();
+                }
                 return;
             }
         }
@@ -1589,6 +1667,43 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         g.restore_append(checkpoint, e);
     }
 
+    fn fill_terminal_labels(
+        &mut self,
+        graph: &ExecutionGraph,
+        traces: Option<&[Vec<Option<Val>>]>,
+    ) {
+        self.terminal_tokens.clear();
+        self.terminal_labels.clear();
+        let mut available = self
+            .prefix_namespace
+            .is_some_and(|namespace| namespace == graph.program_prefix_namespace());
+        if available {
+            for tid in 0..self.program.num_threads() {
+                let Some(token) = graph.program_prefix(tid) else {
+                    available = false;
+                    break;
+                };
+                self.terminal_tokens.push(token);
+            }
+        }
+        if !available
+            || !self
+                .program
+                .labels_at_prefixes_into(&self.terminal_tokens, &mut self.terminal_labels)
+        {
+            // Never expose annotations from an earlier terminal or a partial
+            // unsuccessful prefix lookup, even when falling back after eviction.
+            self.terminal_labels.clear();
+            let labels = match traces {
+                Some(traces) => self.program.labels(traces),
+                None => self
+                    .program
+                    .labels(&pooled_traces_of(graph, self.program.num_threads())),
+            };
+            self.terminal_labels.extend(labels);
+        }
+    }
+
     /// Record a terminal execution and honour terminal stopping rules. Returns whether the
     /// terminal was reported (`true`) or suppressed by the eager time filter (`false`).
     ///
@@ -1600,62 +1715,72 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
     /// timed program.
     fn record(
         &mut self,
-        graph: ExecutionGraph,
+        graph: &ExecutionGraph,
         kind: ExecutionKind,
         traces: Option<&[Vec<Option<Val>>]>,
     ) -> bool {
-        let persistent_labels = self
-            .prefix_namespace
-            .filter(|&namespace| namespace == graph.program_prefix_namespace())
-            .and_then(|_| {
-                (0..self.program.num_threads())
-                    .map(|tid| graph.program_prefix(tid))
-                    .collect::<Option<Vec<_>>>()
-            })
-            .and_then(|tokens| self.program.labels_at_prefixes(&tokens));
-        let labels = persistent_labels.unwrap_or_else(|| match traces {
-            Some(traces) => self.program.labels(traces),
-            None => self
-                .program
-                .labels(&pooled_traces_of(&graph, self.program.num_threads())),
-        });
-        let exec = Execution::new(graph).with_labels(labels);
-        if self.time_filter || self.time_zombie || self.time_predicate {
-            // The v1 model guard is a precondition of the time extension, not an invariant of
-            // any regime, so it runs on every timed terminal regardless of level or profile.
-            let feasible = if self.mailbox_time {
-                // Feasibility only: the same verdict as `check_mailbox(..).is_feasible()`
-                // (which it re-runs in full on the accepted case), without building the
-                // explanation tables for the rejected one.
-                crate::time::eager_mailbox_feasible(exec.graph())
-            } else {
-                crate::time::assert_supported_models(exec.graph());
-                crate::time::eager_feasible(exec.graph())
-            };
-            if !feasible {
-                // T-GATE / record (T2_PLAN §2c): under the predicate at level 4 every terminal
-                // reached is eager-feasible by construction (T-PRED gates receives, T-GATE gates
-                // sends / revisits), so landing here at all is a bug in that invariant. Debug
-                // builds say so loudly; release builds still must not *print* the terminal,
-                // because a model checker reporting an unrealizable counterexample is worse than
-                // one reporting too few - so it takes the filtered path either way, where
-                // `on_execution_filtered` keeps it visible rather than silently dropped.
-                debug_assert!(
-                    !(self.time_predicate && self.time_level >= 4),
-                    "T2 terminal must be eager-feasible (predicate invariant)"
-                );
-                // Ladder levels 2-3 (§D.4): with T-PRED and/or T-GATE off the walk *does* reach
-                // unrealizable terminals, so they are routed through the same post-filter the
-                // zombie regime uses — which is what makes `realizable(L2) == realizable(L4)` a
-                // meaningful set equality rather than a comparison of differently-shaped outputs.
-                // Zombie routes terminals exactly as the T1 filter does (T2_ORACLE_SPEC §2.1): an
-                // unrealizable terminal is filtered, counted in neither `terminal_count` nor
-                // `max_executions`.
-                self.observer.on_execution_filtered(&exec, kind);
-                return false;
+        let timed = self.time_filter || self.time_zombie || self.time_predicate;
+        if !timed && self.observer.accepts_execution_view() {
+            self.fill_terminal_labels(graph, traces);
+            self.observer
+                .on_execution_view(graph, &self.terminal_labels, kind);
+        } else {
+            let persistent_labels = self
+                .prefix_namespace
+                .filter(|&namespace| namespace == graph.program_prefix_namespace())
+                .and_then(|_| {
+                    (0..self.program.num_threads())
+                        .map(|tid| graph.program_prefix(tid))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .and_then(|tokens| self.program.labels_at_prefixes(&tokens));
+            let labels = persistent_labels.unwrap_or_else(|| match traces {
+                Some(traces) => self.program.labels(traces),
+                None => self
+                    .program
+                    .labels(&pooled_traces_of(graph, self.program.num_threads())),
+            });
+            let exec = Execution::new(graph.clone()).with_labels(labels);
+            if timed {
+                // The v1 model guard is a precondition of the time extension, not an invariant of
+                // any regime, so it runs on every timed terminal regardless of level or profile.
+                let feasible = if self.mailbox_time {
+                    // Feasibility only: the same verdict as `check_mailbox(..).is_feasible()`
+                    // (which it re-runs in full on the accepted case), without building the
+                    // explanation tables for the rejected one.
+                    crate::time::eager_mailbox_feasible(exec.graph())
+                } else {
+                    crate::time::assert_supported_models(exec.graph());
+                    crate::time::eager_feasible(exec.graph())
+                };
+                if !feasible {
+                    // T-GATE / record (T2_PLAN §2c): under the predicate at level 4 every terminal
+                    // reached is eager-feasible by construction (T-PRED gates receives, T-GATE gates
+                    // sends / revisits), so landing here at all is a bug in that invariant. Debug
+                    // builds say so loudly; release builds still must not *print* the terminal,
+                    // because a model checker reporting an unrealizable counterexample is worse than
+                    // one reporting too few - so it takes the filtered path either way, where
+                    // `on_execution_filtered` keeps it visible rather than silently dropped.
+                    debug_assert!(
+                        !(self.time_predicate && self.time_level >= 4),
+                        "T2 terminal must be eager-feasible (predicate invariant)"
+                    );
+                    // Ladder levels 2-3 (§D.4): with T-PRED and/or T-GATE off the walk *does* reach
+                    // unrealizable terminals, so they are routed through the same post-filter the
+                    // zombie regime uses — which is what makes `realizable(L2) == realizable(L4)` a
+                    // meaningful set equality rather than a comparison of differently-shaped outputs.
+                    // Zombie routes terminals exactly as the T1 filter does (T2_ORACLE_SPEC §2.1): an
+                    // unrealizable terminal is filtered, counted in neither `terminal_count` nor
+                    // `max_executions`.
+                    self.observer.on_execution_filtered(&exec, kind);
+                    return false;
+                }
             }
+            self.observer.on_execution(&exec, kind);
         }
-        self.observer.on_execution(&exec, kind);
+        if self.observer.should_stop() {
+            self.request_stop();
+        }
         // Counts every reported terminal (full/blocked/error) for the dead-branch detector.
         self.terminals_recorded += 1;
         if matches!(kind, ExecutionKind::Full | ExecutionKind::Blocked) {
