@@ -82,6 +82,14 @@ struct Adapter {
     diagnostics: Diagnostics,
 }
 
+enum Input<'a> {
+    Message {
+        message: &'a Message,
+        sender: &'a str,
+    },
+    Local(&'a str),
+}
+
 impl Adapter {
     fn fail(&mut self, error: Diagnostic, outputs: &mut Outputs) {
         self.diagnostics.record(error.clone());
@@ -132,12 +140,7 @@ impl Adapter {
         }
     }
 
-    fn call(
-        &mut self,
-        input: Option<(&Message, &str)>,
-        local: Option<&str>,
-        outputs: &mut Outputs,
-    ) {
+    fn call(&mut self, input: Input<'_>, outputs: &mut Outputs) {
         if let Some(error) = self.error.clone() {
             self.fail(error, outputs);
             return;
@@ -146,11 +149,12 @@ impl Adapter {
             .process
             .as_mut()
             .expect("successful Python construction");
-        let result = if let Some((message, sender)) = input {
-            process.on_message_shared(message, sender, None)
-        } else {
-            let data = format!("{{\"text\":{}}}", crate::json_string(local.unwrap()));
-            process.on_local_message_shared(&Message::new("SEND", data), None)
+        let result = match input {
+            Input::Message { message, sender } => process.on_message_shared(message, sender, None),
+            Input::Local(text) => {
+                let data = format!("{{\"text\":{}}}", json_string(text));
+                process.on_local_message_shared(&Message::new("SEND", data), None)
+            }
         };
         match result {
             Ok(actions) => self.actions(actions, outputs),
@@ -160,9 +164,43 @@ impl Adapter {
 }
 
 impl Process for Adapter {
+    fn receive_predicate(&self) -> Option<crate::proc::ReceivePredicate> {
+        let snapshot = match self.process.as_ref()?.receive_predicate() {
+            Ok(None) => return None,
+            Ok(Some(snapshot)) => snapshot,
+            Err(error) => {
+                self.diagnostics.record(diagnostic(error));
+                return Some(Arc::new(|_| false));
+            }
+        };
+        let diagnostics = self.diagnostics.clone();
+        Some(Arc::new(move |payload| {
+            let Some((_, kind, data)) = decode_parts(payload) else {
+                diagnostics.record(Diagnostic {
+                    status: "error",
+                    message: "invalid Python message envelope in receive predicate".into(),
+                });
+                return false;
+            };
+            match snapshot.matches_parts(kind, data) {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    diagnostics.record(diagnostic(error));
+                    false
+                }
+            }
+        }))
+    }
+
     fn on_message(&mut self, message: &str, outputs: &mut Outputs) {
         match decode_message(message) {
-            Some((sender, message)) => self.call(Some((&message, &sender)), None, outputs),
+            Some((sender, message)) => self.call(
+                Input::Message {
+                    message: &message,
+                    sender: &sender,
+                },
+                outputs,
+            ),
             None => self.fail(
                 Diagnostic {
                     status: "error",
@@ -174,49 +212,30 @@ impl Process for Adapter {
     }
 
     fn on_local_message(&mut self, message: &str, outputs: &mut Outputs) {
-        self.call(None, Some(message), outputs);
+        self.call(Input::Local(message), outputs);
     }
-}
-
-fn hex(value: &str) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut result = String::with_capacity(value.len() * 2);
-    for byte in value.bytes() {
-        result.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        result.push(char::from(DIGITS[usize::from(byte & 15)]));
-    }
-    result
-}
-
-fn unhex(value: &str) -> Option<String> {
-    if value.len() % 2 != 0 {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(value.len() / 2);
-    for pair in value.as_bytes().chunks_exact(2) {
-        let digit = |b| match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            _ => None,
-        };
-        bytes.push(digit(pair[0])? * 16 + digit(pair[1])?);
-    }
-    String::from_utf8(bytes).ok()
 }
 
 fn encode_message(sender: usize, message: &Message) -> String {
-    format!("{sender}\n{}\n{}", hex(&message.kind), hex(&message.data))
+    format!(
+        "{sender}\n{}\n{}{}",
+        message.kind.len(),
+        message.kind,
+        message.data
+    )
+}
+
+fn decode_parts(value: &str) -> Option<(&str, &str, &str)> {
+    let (sender, rest) = value.split_once('\n')?;
+    sender.parse::<usize>().ok()?;
+    let (length, payload) = rest.split_once('\n')?;
+    let length = length.parse::<usize>().ok()?;
+    Some((sender, payload.get(..length)?, payload.get(length..)?))
 }
 
 fn decode_message(value: &str) -> Option<(String, Message)> {
-    let mut parts = value.split('\n');
-    let sender = parts.next()?.to_owned();
-    sender.parse::<usize>().ok()?;
-    let message = Message::new(unhex(parts.next()?)?, unhex(parts.next()?)?);
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((sender, message))
+    let (sender, kind, data) = decode_parts(value)?;
+    Some((sender.to_owned(), Message::new(kind, data)))
 }
 
 #[cfg(test)]
@@ -234,25 +253,100 @@ mod tests {
         assert_eq!(decoded.kind, message.kind);
         assert_eq!(decoded.data, message.data);
         assert!(decode_message("not-a-packet").is_none());
+        assert!(decode_message("2\n999\nshort").is_none());
+        assert!(decode_message("2\n1\né").is_none());
+        let multiline = Message::new("", "{\n  \"value\": 1\n}");
+        let encoded = encode_message(0, &multiline);
+        assert_eq!(
+            decode_parts(&encoded),
+            Some(("0", "", multiline.data.as_str()))
+        );
     }
 
     #[test]
-    fn python_and_rust_causal_broadcast_explore_the_same_safety_case() {
+    fn python_and_rust_causal_broadcast_explore_the_same_case() {
+        let rust: Factory = Arc::new(crate::solutions::causal::new);
+        let native_events = crate::tests::concurrent::run(rust).unwrap();
+        for workers in [1, 12] {
+            let module = PythonModule::new(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/examples/broadcast/fixtures/causal.py"
+                ),
+                "BroadcastProcess",
+                must_python::PythonOptions {
+                    workers,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let diagnostics = Diagnostics::default();
+            let python_events =
+                crate::tests::concurrent::run(factory(module, diagnostics.clone())).unwrap();
+            assert!(diagnostics.get().is_none());
+            assert_eq!(python_events, native_events);
+        }
+    }
+
+    #[test]
+    fn selective_python_receives_preserve_broadcast_properties() {
         let module = PythonModule::new(
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/examples/broadcast/fixtures/causal.py"
+                "/examples/broadcast/fixtures/causal_filtered.py"
+            ),
+            "BroadcastProcess",
+            must_python::PythonOptions {
+                workers: 12,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let diagnostics = Diagnostics::default();
+        let factory = factory(module, diagnostics.clone());
+        for (name, scenario) in crate::tests::SCENARIOS {
+            scenario(factory.clone()).unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(diagnostics.get().is_none());
+        }
+    }
+
+    #[test]
+    fn predicate_exceptions_reach_diagnostics() {
+        let module = PythonModule::new(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/examples/broadcast/fixtures/predicate_error.py"
             ),
             "BroadcastProcess",
             must_python::PythonOptions::default(),
         )
         .unwrap();
         let diagnostics = Diagnostics::default();
-        let python = factory(module, diagnostics.clone());
-        let rust: Factory = Arc::new(crate::solutions::causal::new);
-        let native_events = crate::tests::safety::concurrent::run(rust).unwrap();
-        let python_events = crate::tests::safety::concurrent::run(python).unwrap();
-        assert!(diagnostics.get().is_none());
-        assert_eq!(python_events, native_events);
+        let _ = crate::tests::concurrent::run(factory(module, diagnostics.clone()));
+        let error = diagnostics
+            .get()
+            .expect("predicate errors must not disappear as filtering");
+        assert_eq!(error.status, "error");
+        assert!(error.message.contains("broken receive predicate"));
     }
+}
+
+pub(crate) fn json_string(value: &str) -> String {
+    use std::fmt::Write;
+    let mut result = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            '\x00'..='\x1f' => {
+                write!(result, "\\u{:04x}", ch as u32).unwrap();
+            }
+            _ => result.push(ch),
+        }
+    }
+    result.push('"');
+    result
 }

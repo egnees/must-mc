@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 pub type Factory = Arc<dyn Fn(usize, usize) -> Box<dyn Process> + Send + Sync>;
+pub type ReceivePredicate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 #[derive(Default)]
 pub struct Outputs {
@@ -32,6 +33,10 @@ impl Outputs {
 }
 
 pub trait Process {
+    fn receive_predicate(&self) -> Option<ReceivePredicate> {
+        None
+    }
+
     fn on_message(&mut self, message: &str, outputs: &mut Outputs);
 
     fn on_local_message(&mut self, message: &str, outputs: &mut Outputs);
