@@ -48,7 +48,8 @@ class Message:
 
 
 class Context:
-    def __init__(self, time):
+    def __init__(self, time, predicate=None):
+        self._predicate = predicate
         self._time = time
         self._sent_messages = []
         self._sent_local_messages = []
@@ -73,6 +74,16 @@ class Context:
             raise ValueError("message type length exceeds the limit of 50 characters")
         # Serialize immediately: mutation after send must not change the sent data.
         return {"kind": msg.type, "data": json.dumps(msg._data, ensure_ascii=True, allow_nan=False)}
+
+    def set_predicate(self, predicate):
+        """Set a pure Message -> bool receive filter; None accepts all.
+
+        Rejected messages remain pending. The filter persists across callbacks
+        until replaced and is evaluated against the current process state.
+        """
+        if predicate is not None and not callable(predicate):
+            raise TypeError("receive predicate must be callable or None")
+        self._predicate = predicate
 
     def send(self, msg, to):
         if not isinstance(to, str):

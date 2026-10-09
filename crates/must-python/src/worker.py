@@ -82,8 +82,8 @@ def construct(encoded, process_seed):
     return api, cls(*args)
 
 
-def callback(api, process, event):
-    ctx = api.Context(event["time"])
+def callback(api, process, event, predicate):
+    ctx = api.Context(event["time"], predicate)
     method = event["method"]
     if method == "on_start":
         fn = getattr(process, method, None)
@@ -97,7 +97,7 @@ def callback(api, process, event):
             process.on_message(msg, event["sender"], ctx)
         else:
             process.on_local_message(msg, ctx)
-    return ctx._actions()
+    return ctx._actions(), ctx._predicate
 
 
 def request(req):
@@ -116,26 +116,53 @@ def request(req):
         state = len(states)
         states.append((None, (req["args"], process_seed), None))
         return {"ok": True, "state": state, "actions": []}
+    predicate = None
     state = req["state"]
-    history = []
-    while states[state][0] is not None:
-        parent, event, actions = states[state]
-        history.append((event, actions))
-        state = parent
-    api, process = construct(*states[state][1])
-    for event, expected in reversed(history):
-        actual = callback(api, process, event)
-        if actual != expected:
-            raise RuntimeError("nondeterministic Python replay: callback outputs changed")
+    imported = []
+    nodes = req.get("import", [])
+    if state is None:
+        args = nodes[0]["args"]
+        process_seed = constructor_seed(args)
+        api, process = construct(args, process_seed)
+        state = len(states)
+        states.append((None, (args, process_seed), None))
+        imported.append(state)
+        nodes = nodes[1:]
+    else:
+        history = []
+        root = state
+        while states[root][0] is not None:
+            parent, event, actions = states[root]
+            history.append((event, actions))
+            root = parent
+        api, process = construct(*states[root][1])
+        for event, expected in reversed(history):
+            actual, predicate = callback(api, process, event, predicate)
+            if [actual, predicate is not None] != expected:
+                raise RuntimeError("nondeterministic Python replay: callback outputs changed")
+    for node in nodes:
+        actions, predicate = callback(api, process, node["event"], predicate)
+        expected = [actions, predicate is not None]
+        if expected != node["expected"]:
+            raise RuntimeError("nondeterministic Python replay: imported callback outputs changed")
+        next_state = len(states)
+        states.append((state, node["event"], expected))
+        state = next_state
+        imported.append(state)
+    if op == "predicate":
+        msg = api.Message.from_json(req["kind"], req["data"])
+        accepted = True if predicate is None else predicate(msg)
+        if not isinstance(accepted, bool):
+            raise TypeError("receive predicate must return bool")
+        return {"ok": True, "accepted": accepted, "imported": imported}
     event = req["event"]
-    actions = callback(api, process, event)
-    # Verify serializability/size before storing a node. The caller must never
-    # observe a failed operation consuming a state id.
-    response = {"ok": True, "state": len(states), "actions": actions}
+    actions, predicate = callback(api, process, event, predicate)
+    # Publish the new callback only after validating its response.
+    response = {"ok": True, "state": len(states), "actions": actions, "has_predicate": predicate is not None, "imported": imported}
     payload = encode(response)
     if len(payload) > MAX_FRAME:
         raise MemoryError("worker response exceeds frame limit")
-    states.append((req["state"], event, actions))
+    states.append((state, event, [actions, predicate is not None]))
     return payload
 
 

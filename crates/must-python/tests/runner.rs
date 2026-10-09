@@ -308,6 +308,7 @@ class Solution(Process):
     );
     let module = fixture.options(PythonOptions {
         max_states: 2,
+        workers: 4,
         ..Default::default()
     });
     let mut p = module.create("[]").unwrap();
@@ -541,6 +542,7 @@ class Solution(Process):
     );
     let module = fixture.options(PythonOptions {
         max_states: 2,
+        workers: 12,
         ..Default::default()
     });
     let barrier = std::sync::Barrier::new(12);
@@ -562,7 +564,7 @@ class Solution(Process):
 }
 
 #[test]
-fn cache_hits_continue_while_python_miss_is_running() {
+fn cache_hits_and_other_worker_misses_continue_while_python_miss_is_running() {
     let fixture = Fixture::new(
         r#"
 from anysystem import Process
@@ -577,7 +579,10 @@ class Solution(Process):
         ctx.send_local(msg)
 "#,
     );
-    let module = fixture.module();
+    let module = fixture.options(PythonOptions {
+        workers: 2,
+        ..Default::default()
+    });
     module
         .create("[]")
         .unwrap()
@@ -600,8 +605,13 @@ class Solution(Process):
             .unwrap()
             .on_local_message(&Message::new("DELIVER", r#"{"text":"cached"}"#), None)
             .unwrap();
+        let uncached = module
+            .create("[]")
+            .unwrap()
+            .on_local_message(&Message::new("DELIVER", r#"{"text":"uncached"}"#), None);
         std::fs::write(fixture.0.join("finish"), "").unwrap();
         assert_eq!(text(&actions), "cached");
+        assert_eq!(text(&uncached.unwrap()), "uncached");
         assert_eq!(text(&slow.join().unwrap().unwrap()), "slow");
     });
 }
@@ -685,4 +695,324 @@ class Solution(Process):
             .unwrap()
     ));
     eprintln!("cached callbacks={CALLS}, action payload=16 KiB, owned={owned:?}, shared={shared:?}, ratio={:.2}", owned.as_secs_f64() / shared.as_secs_f64());
+}
+
+#[test]
+fn histories_migrate_between_interpreters_with_identical_random_and_global_state() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process, Message
+import helper, random, uuid
+class Solution(Process):
+    def __init__(self):
+        self.rng = random.Random()
+        self.values = []
+        self.messages = {Message('A', {}), Message('B', {})}
+    def on_local_message(self, msg, ctx):
+        helper.values.append(msg['text'])
+        self.values.append(msg['text'])
+        value = [self.values, helper.values, random.random(), self.rng.random(), str(uuid.uuid4()), [hash(m) for m in self.messages]]
+        ctx.send_local(Message('DELIVER', {'text': str(value)}))
+"#,
+    );
+    std::fs::write(fixture.0.join("helper.py"), "values = []\n").unwrap();
+    let single = fixture.module();
+    let pool = fixture.options(PythonOptions {
+        workers: 4,
+        ..Default::default()
+    });
+    let message = |value: &str| Message::new("X", format!(r#"{{"text":"{value}"}}"#));
+    let mut expected = single.create("[]").unwrap();
+    let mut prefix = pool.create("[]").unwrap();
+    for value in ["first", "second", "third"] {
+        assert_eq!(
+            prefix.on_local_message(&message(value), None).unwrap(),
+            expected.on_local_message(&message(value), None).unwrap()
+        );
+    }
+    let barrier = std::sync::Barrier::new(8);
+    let branches = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let mut branch = prefix.clone();
+                let barrier = &barrier;
+                let message = &message;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let actions = branch
+                        .on_local_message(&message(&i.to_string()), None)
+                        .unwrap();
+                    (branch, actions)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for (i, (mut branch, actions)) in branches.into_iter().enumerate() {
+        let mut reference = expected.clone();
+        assert_eq!(
+            actions,
+            reference
+                .on_local_message(&message(&i.to_string()), None)
+                .unwrap()
+        );
+        assert_eq!(
+            branch
+                .on_local_message(&message("back-to-main"), None)
+                .unwrap(),
+            reference
+                .on_local_message(&message("back-to-main"), None)
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn distinct_racing_misses_respect_the_shared_state_limit() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process
+class Solution(Process):
+    def on_local_message(self, msg, ctx): ctx.send_local(msg)
+"#,
+    );
+    let module = fixture.options(PythonOptions {
+        workers: 4,
+        max_states: 2,
+        ..Default::default()
+    });
+    let prefix = module.create("[]").unwrap();
+    let barrier = std::sync::Barrier::new(8);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let mut process = prefix.clone();
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    process
+                        .on_local_message(&Message::new("X", format!(r#"{{"text":"{i}"}}"#)), None)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    for error in results.into_iter().filter_map(Result::err) {
+        assert_eq!(error.kind(), ErrorKind::Resource);
+    }
+}
+
+#[test]
+fn large_history_migration_falls_back_without_limiting_valid_callbacks() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process, Message
+class Solution(Process):
+    def __init__(self): self.lengths = []
+    def on_local_message(self, msg, ctx):
+        self.lengths.append(len(msg['text']))
+        ctx.send_local(Message('DELIVER', {'text': str(self.lengths)}))
+"#,
+    );
+    let module = fixture.options(PythonOptions {
+        workers: 2,
+        ..Default::default()
+    });
+    let mut process = module.create("[]").unwrap();
+    let large = Message::new(
+        "X",
+        format!(r#"{{"text":"{}"}}"#, "x".repeat(3 * 1024 * 1024)),
+    );
+    for _ in 0..3 {
+        process.on_local_message(&large, None).unwrap();
+    }
+    let actions = std::thread::spawn(move || {
+        process.on_local_message(&Message::new("X", r#"{"text":"last"}"#), None)
+    })
+    .join()
+    .unwrap()
+    .unwrap();
+    assert_eq!(text(&actions), "[3145728, 3145728, 3145728, 4]");
+}
+
+#[test]
+fn pooled_workers_preserve_the_existing_response_frame_capacity() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process, Message
+class Solution(Process):
+    def on_local_message(self, msg, ctx):
+        ctx.send_local(Message('DELIVER', {'text': 'x' * (5 * 1024 * 1024)}))
+"#,
+    );
+    let module = fixture.options(PythonOptions {
+        workers: 2,
+        ..Default::default()
+    });
+    let mut process = module.create("[]").unwrap();
+    let actions = process
+        .on_local_message(&Message::new("X", "{}"), None)
+        .unwrap();
+    assert_eq!(text(&actions).len(), 5 * 1024 * 1024);
+}
+
+#[test]
+fn imported_history_divergence_is_rejected_and_can_be_retried() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process, Message
+import helper
+class Solution(Process):
+    def on_local_message(self, msg, ctx):
+        ctx.send_local(Message('DELIVER', {'text': str(helper.value)}))
+"#,
+    );
+    let helper = fixture.0.join("helper.py");
+    std::fs::write(&helper, "value = 1\n").unwrap();
+    let module = fixture.options(PythonOptions {
+        workers: 2,
+        ..Default::default()
+    });
+    let mut process = module.create("[]").unwrap();
+    process
+        .on_local_message(&Message::new("X", r#"{"step":1}"#), None)
+        .unwrap();
+    std::fs::write(&helper, "value = 2\n").unwrap();
+    std::thread::spawn(move || {
+        let message = Message::new("X", r#"{"step":2}"#);
+        let error = process.on_local_message(&message, None).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Execution);
+        assert!(error
+            .to_string()
+            .contains("imported callback outputs changed"));
+        std::fs::write(&helper, "value = 1\n").unwrap();
+        assert_eq!(
+            text(&process.on_local_message(&message, None).unwrap()),
+            "1"
+        );
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn receive_predicates_snapshot_branches_persist_and_reset() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process
+class Solution(Process):
+    def __init__(self):
+        self.value = 0
+    def on_local_message(self, msg, ctx):
+        self.value = msg['value']
+        if msg.type == 'SET':
+            ctx.set_predicate(lambda message: message['value'] == self.value)
+        elif msg.type == 'RESET':
+            ctx.set_predicate(None)
+"#,
+    );
+    for workers in [1, 12] {
+        let module = fixture.options(PythonOptions {
+            workers,
+            ..PythonOptions::default()
+        });
+        let mut process = module.create("[]").unwrap();
+        assert!(process.receive_predicate().unwrap().is_none());
+        process
+            .on_local_message(&Message::new("SET", r#"{"value":1}"#), None)
+            .unwrap();
+        let first = process.receive_predicate().unwrap().unwrap();
+        let mut branch = process.clone();
+        process
+            .on_local_message(&Message::new("UPDATE", r#"{"value":2}"#), None)
+            .unwrap();
+        branch
+            .on_local_message(&Message::new("UPDATE", r#"{"value":3}"#), None)
+            .unwrap();
+        let second = process.receive_predicate().unwrap().unwrap();
+        let third = branch.receive_predicate().unwrap().unwrap();
+        std::thread::scope(|scope| {
+            for (predicate, expected) in [(first, 1), (second, 2), (third, 3)] {
+                scope.spawn(move || {
+                    for value in 1..=3 {
+                        let message = Message::new("DATA", format!("{{\"value\":{value}}}"));
+                        assert_eq!(predicate.matches(&message).unwrap(), value == expected);
+                        assert_eq!(predicate.matches(&message).unwrap(), value == expected);
+                    }
+                });
+            }
+        });
+        process
+            .on_local_message(&Message::new("RESET", r#"{"value":4}"#), None)
+            .unwrap();
+        assert!(process.receive_predicate().unwrap().is_none());
+    }
+}
+
+#[test]
+fn receive_predicate_errors_and_queries_do_not_advance_history() {
+    for expression in ["True", "1", "1 / 0"] {
+        let fixture = Fixture::new(&format!("from anysystem import Process\nclass Solution(Process):\n    def on_start(self, ctx):\n        ctx.set_predicate(lambda msg: {expression})\n"));
+        let module = fixture.options(PythonOptions {
+            max_states: 2,
+            ..PythonOptions::default()
+        });
+        let mut process = module.create("[]").unwrap();
+        assert!(process.on_start(None).unwrap().is_empty());
+        let predicate = process.receive_predicate().unwrap().unwrap();
+        for value in 0..3 {
+            let result = predicate.matches(&Message::new("DATA", format!("{{\"value\":{value}}}")));
+            if expression == "True" {
+                assert!(result.unwrap());
+            } else {
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::Execution);
+            }
+        }
+    }
+}
+
+#[test]
+fn borrowed_predicate_queries_share_results_across_snapshots_and_threads() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process
+class Solution(Process):
+    def on_start(self, ctx):
+        ctx.set_predicate(lambda msg: msg.type == 'DATA' and msg['value'] == 7)
+"#,
+    );
+    let module = fixture.options(PythonOptions {
+        workers: 12,
+        ..PythonOptions::default()
+    });
+    let mut process = module.create("[]").unwrap();
+    process.on_start(None).unwrap();
+    std::thread::scope(|scope| {
+        for _ in 0..12 {
+            let predicate = process.receive_predicate().unwrap().unwrap();
+            scope.spawn(move || {
+                for _ in 0..20 {
+                    assert!(predicate.matches_parts("DATA", r#"{"value":7}"#).unwrap());
+                    assert!(!predicate.matches_parts("ACK", r#"{"value":7}"#).unwrap());
+                    assert!(!predicate.matches_parts("DATA", r#"{"value":8}"#).unwrap());
+                }
+            });
+        }
+    });
+    let predicate = process.receive_predicate().unwrap().unwrap();
+    assert_eq!(
+        predicate
+            .matches_parts("DATA", "not json")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Execution
+    );
+    assert!(predicate.matches_parts("DATA", r#"{"value":7}"#).unwrap());
 }

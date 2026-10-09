@@ -1,7 +1,7 @@
 //! Run AnySystem-style Python callbacks with deterministic local-history replay.
 //!
 //! Process clones are independent history cursors. A module shares one persistent
-//! interpreter and caches transitions, so repeated Must replays stay in Rust.
+//! interpreter pool and caches transitions, so repeated Must replays stay in Rust.
 //! Cache misses recreate the solution module and replay the local callback history;
 //! no Python object needs to be pickleable. Outputs of replayed callbacks are checked.
 //!
@@ -32,6 +32,8 @@ pub struct PythonOptions {
     /// Maximum number of distinct constructor/transition history nodes.
     pub max_states: usize,
     pub seed: u64,
+    /// Independent interpreters available for concurrent cache misses.
+    pub workers: usize,
 }
 
 impl Default for PythonOptions {
@@ -41,6 +43,7 @@ impl Default for PythonOptions {
             timeout: Duration::from_secs(5),
             max_states: 100_000,
             seed: 0,
+            workers: 1,
         }
     }
 }
@@ -134,7 +137,8 @@ pub struct PythonModule {
     inner: Arc<ModuleInner>,
 }
 struct ModuleInner {
-    worker: Mutex<Worker>,
+    workers: Vec<Mutex<Worker>>,
+    assignments: Mutex<Vec<(std::thread::ThreadId, usize)>>,
     cache: RwLock<Cache>,
     max_states: usize,
 }
@@ -143,7 +147,13 @@ type Transition = (usize, Arc<[Action]>);
 struct Cache {
     constructors: BTreeMap<String, usize>,
     transitions: BTreeMap<usize, Vec<(Callback, Transition)>>,
-    states: usize,
+    histories: Vec<History>,
+}
+struct History {
+    parent: Option<usize>,
+    encoded: Arc<str>,
+    owner: usize,
+    predicate: Option<Arc<PredicateCache>>,
 }
 impl Cache {
     fn transition(&self, state: usize, event: &CallbackRef<'_>) -> Option<Transition> {
@@ -161,7 +171,7 @@ impl Cache {
         edges.insert(index, (event, transition));
     }
     fn capacity(&self, max_states: usize) -> Result<(), Error> {
-        if self.states >= max_states {
+        if self.histories.len() >= max_states {
             Err(Error::new(
                 ErrorKind::Resource,
                 format!("Python state limit ({max_states}) exceeded"),
@@ -178,11 +188,23 @@ impl PythonModule {
         options: PythonOptions,
     ) -> Result<Self, Error> {
         let path = path.as_ref().canonicalize()?;
-        let mut worker = Worker::new(&path, class_name, &options)?;
-        worker.request("{\"op\":\"init\"}".to_owned())?;
+        if options.workers == 0 {
+            return Err(Error::new(
+                ErrorKind::Resource,
+                "Python workers must be positive",
+            ));
+        }
+        let mut workers = Vec::with_capacity(options.workers);
+        for index in 0..options.workers {
+            let mut worker = Worker::new(&path, class_name, &options)?;
+            worker.index = index;
+            worker.request("{\"op\":\"init\"}".to_owned())?;
+            workers.push(Mutex::new(worker));
+        }
         Ok(Self {
             inner: Arc::new(ModuleInner {
-                worker: Mutex::new(worker),
+                workers,
+                assignments: Mutex::new(Vec::new()),
                 cache: RwLock::new(Cache::default()),
                 max_states: options.max_states,
             }),
@@ -200,34 +222,132 @@ impl PythonModule {
             });
         }
         parse(args_json)?.array()?;
-        // Cache misses serialize on the interpreter. Never hold the cache lock
-        // while waiting for Python: other model-checking threads can use hits.
+        // Cache hits never wait for an interpreter.
         let mut worker = self.lock_worker()?;
-        let cached = self.read_cache()?.constructors.get(args_json).copied();
-        if let Some(state) = cached {
-            return Ok(PythonProcess {
-                module: self.clone(),
-                state,
-            });
+        {
+            let cache = self.read_cache()?;
+            if let Some(&state) = cache.constructors.get(args_json) {
+                return Ok(PythonProcess {
+                    module: self.clone(),
+                    state,
+                });
+            }
+            cache.capacity(self.inner.max_states)?;
         }
-        self.read_cache()?.capacity(self.inner.max_states)?;
         let result = worker.request(format!(
             "{{\"op\":\"create\",\"args\":{}}}",
             quote(args_json)
         ))?;
-        let state = state_id(&result)?;
+        let local_state = state_id(&result)?;
         let mut cache = self.write_cache()?;
-        cache.states += 1;
-        cache.constructors.insert(args_json.to_owned(), state);
+        let state = if let Some(&state) = cache.constructors.get(args_json) {
+            state
+        } else {
+            cache.capacity(self.inner.max_states)?;
+            let state = cache.histories.len();
+            cache.histories.push(History {
+                parent: None,
+                predicate: None,
+                owner: worker.index,
+                encoded: format!("{{\"args\":{}}}", quote(args_json)).into(),
+            });
+            cache.constructors.insert(args_json.to_owned(), state);
+            state
+        };
+        worker.states.insert(state, local_state);
         Ok(PythonProcess {
             module: self.clone(),
             state,
         })
     }
 
+    fn history_request<'a>(
+        &'a self,
+        state: usize,
+        op: &str,
+        extra: &str,
+        mut worker: std::sync::MutexGuard<'a, Worker>,
+    ) -> Result<(std::sync::MutexGuard<'a, Worker>, Json), Error> {
+        let op = quote(op);
+        let mut missing = Vec::new();
+        let mut cursor = Some(state);
+        {
+            let cache = self.read_cache()?;
+            while let Some(state) = cursor {
+                if worker.states.contains_key(&state) {
+                    break;
+                }
+                let history = &cache.histories[state];
+                missing.push((state, history.encoded.clone()));
+                cursor = history.parent;
+            }
+        }
+        missing.reverse();
+        let imported_size = missing
+            .iter()
+            .try_fold(0usize, |size, (_, node)| size.checked_add(node.len() + 1));
+        let request = if imported_size
+            .is_none_or(|size| size.saturating_add(extra.len()).saturating_add(128) > MAX_FRAME)
+        {
+            // Long histories remain usable without creating an oversized import frame.
+            let owner = self.read_cache()?.histories[state].owner;
+            drop(worker);
+            worker = self.inner.workers[owner]
+                .lock()
+                .map_err(|_| Error::new(ErrorKind::Transport, "Python worker lock poisoned"))?;
+            missing.clear();
+            let local = worker.states[&state];
+            format!("{{\"op\":{op},\"state\":{local},\"import\":[],{extra}}}")
+        } else {
+            let base = cursor.map_or_else(
+                || "null".to_owned(),
+                |state| worker.states[&state].to_string(),
+            );
+            let mut request = format!("{{\"op\":{op},\"state\":{base},\"import\":[");
+            for (index, (_, node)) in missing.iter().enumerate() {
+                if index != 0 {
+                    request.push(',');
+                }
+                request.push_str(node);
+            }
+            request.push_str(&format!("],{extra}}}"));
+            request
+        };
+        let result = worker.request(request)?;
+        let imported = result.field("imported")?.array()?;
+        if imported.len() != missing.len() {
+            return Err(Error::new(
+                ErrorKind::Transport,
+                "invalid imported history length",
+            ));
+        }
+        for ((global, _), local) in missing.iter().zip(imported) {
+            let local = local
+                .number()?
+                .parse()
+                .map_err(|_| Error::new(ErrorKind::Transport, "invalid imported state id"))?;
+            worker.states.insert(*global, local);
+        }
+        Ok((worker, result))
+    }
+
     fn lock_worker(&self) -> Result<std::sync::MutexGuard<'_, Worker>, Error> {
-        self.inner
-            .worker
+        let thread = std::thread::current().id();
+        let mut assignments = self.inner.assignments.lock().map_err(|_| {
+            Error::new(
+                ErrorKind::Transport,
+                "Python worker assignments lock poisoned",
+            )
+        })?;
+        let index = if let Some((_, index)) = assignments.iter().find(|(id, _)| *id == thread) {
+            *index
+        } else {
+            let index = assignments.len() % self.inner.workers.len();
+            assignments.push((thread, index));
+            index
+        };
+        drop(assignments);
+        self.inner.workers[index]
             .lock()
             .map_err(|_| Error::new(ErrorKind::Transport, "Python worker lock poisoned"))
     }
@@ -392,6 +512,17 @@ impl PythonProcess {
     ) -> Result<Arc<[Action]>, Error> {
         self.step(CallbackRef::new("on_timer", time, None, Some(name))?)
     }
+    pub fn receive_predicate(&self) -> Result<Option<PythonReceivePredicate>, Error> {
+        Ok(self.module.read_cache()?.histories[self.state]
+            .predicate
+            .as_ref()
+            .map(|cache| PythonReceivePredicate {
+                module: self.module.clone(),
+                state: self.state,
+                cache: cache.clone(),
+            }))
+    }
+
     fn step(&mut self, event: CallbackRef<'_>) -> Result<Arc<[Action]>, Error> {
         let previous_state = self.state;
         let cached = self.module.read_cache()?.transition(previous_state, &event);
@@ -399,32 +530,156 @@ impl PythonProcess {
             self.state = state;
             return Ok(actions);
         }
-        let mut worker = self.module.lock_worker()?;
-        let cached = self.module.read_cache()?.transition(previous_state, &event);
-        if let Some((state, actions)) = cached {
-            drop(worker);
-            self.state = state;
-            return Ok(actions);
+        let worker = self.module.lock_worker()?;
+        {
+            let cache = self.module.read_cache()?;
+            if let Some((state, actions)) = cache.transition(previous_state, &event) {
+                self.state = state;
+                return Ok(actions);
+            }
+            cache.capacity(self.module.inner.max_states)?;
         }
-        self.module
-            .read_cache()?
-            .capacity(self.module.inner.max_states)?;
         if let Some(message) = &event.message {
             parse(&message.data)?;
         }
         let owned = event.owned();
         let encoded = owned.encode()?;
-        let result = worker.request(format!(
-            "{{\"op\":\"step\",\"state\":{},\"event\":{}}}",
-            self.state, encoded
-        ))?;
-        let state = state_id(&result)?;
-        let actions: Arc<[Action]> = decode_actions(result.field("actions")?)?.into();
+        let (mut worker, result) = self.module.history_request(
+            previous_state,
+            "step",
+            &format!("\"event\":{encoded}"),
+            worker,
+        )?;
+        let local_state = state_id(&result)?;
+        let has_predicate = json_bool(result.field("has_predicate")?)?;
+        let mut actions: Arc<[Action]> = decode_actions(result.field("actions")?)?.into();
+        let expected = encode_json(result.field("actions")?);
         let mut cache = self.module.write_cache()?;
-        cache.states += 1;
-        cache.insert_transition(previous_state, owned, (state, actions.clone()));
+        let state = if let Some((state, cached_actions)) = cache.transition(previous_state, &event)
+        {
+            if cached_actions != actions
+                || cache.histories[state].predicate.is_some() != has_predicate
+            {
+                return Err(Error::new(
+                    ErrorKind::Execution,
+                    "nondeterministic Python replay: concurrent callback outputs changed",
+                ));
+            }
+            actions = cached_actions;
+            state
+        } else {
+            cache.capacity(self.module.inner.max_states)?;
+            let state = cache.histories.len();
+            cache.histories.push(History {
+                parent: Some(previous_state),
+                predicate: has_predicate.then(|| Arc::new(PredicateCache::default())),
+                owner: worker.index,
+                encoded: format!(
+                    "{{\"event\":{encoded},\"expected\":[{expected},{has_predicate}]}}"
+                )
+                .into(),
+            });
+            cache.insert_transition(previous_state, owned, (state, actions.clone()));
+            state
+        };
+        worker.states.insert(state, local_state);
         self.state = state;
         Ok(actions)
+    }
+}
+
+#[derive(Default)]
+struct PredicateCache {
+    results: RwLock<Vec<(Message, bool)>>,
+    miss: Mutex<()>,
+}
+impl PredicateCache {
+    fn lookup(&self, kind: &str, data: &str) -> Result<Option<bool>, Error> {
+        let results = self.results.read().map_err(|_| {
+            Error::new(ErrorKind::Transport, "Python predicate cache lock poisoned")
+        })?;
+        Ok(results
+            .binary_search_by(|(message, _)| {
+                (message.kind.as_str(), message.data.as_str()).cmp(&(kind, data))
+            })
+            .ok()
+            .map(|index| results[index].1))
+    }
+}
+
+/// An immutable receive predicate evaluated against its original local history.
+#[derive(Clone)]
+pub struct PythonReceivePredicate {
+    module: PythonModule,
+    state: usize,
+    cache: Arc<PredicateCache>,
+}
+impl PythonReceivePredicate {
+    pub fn matches(&self, message: &Message) -> Result<bool, Error> {
+        self.matches_parts(&message.kind, &message.data)
+    }
+
+    pub fn matches_parts(&self, kind: &str, data: &str) -> Result<bool, Error> {
+        if let Some(accepted) = self.cache.lookup(kind, data)? {
+            return Ok(accepted);
+        }
+        let _miss = self.cache.miss.lock().map_err(|_| {
+            Error::new(
+                ErrorKind::Transport,
+                "Python predicate evaluation lock poisoned",
+            )
+        })?;
+        if let Some(accepted) = self.cache.lookup(kind, data)? {
+            return Ok(accepted);
+        }
+        bounded(data)?;
+        parse(data)?;
+        let extra = format!("\"kind\":{},\"data\":{}", quote(kind), quote(data));
+        let (_worker, result) = self.module.history_request(
+            self.state,
+            "predicate",
+            &extra,
+            self.module.lock_worker()?,
+        )?;
+        let accepted = json_bool(result.field("accepted")?)?;
+        let mut results = self.cache.results.write().map_err(|_| {
+            Error::new(ErrorKind::Transport, "Python predicate cache lock poisoned")
+        })?;
+        let index = results
+            .binary_search_by(|(message, _)| {
+                (message.kind.as_str(), message.data.as_str()).cmp(&(kind, data))
+            })
+            .unwrap_err();
+        results.insert(index, (Message::new(kind, data), accepted));
+        Ok(accepted)
+    }
+}
+
+fn json_bool(value: &Json) -> Result<bool, Error> {
+    match value {
+        Json::Bool(value) => Ok(*value),
+        _ => Err(Error::new(ErrorKind::Transport, "expected worker boolean")),
+    }
+}
+
+fn encode_json(value: &Json) -> String {
+    match value {
+        Json::Null => "null".to_owned(),
+        Json::Bool(value) => value.to_string(),
+        Json::Number(value) => value.clone(),
+        Json::String(value) => quote(value),
+        Json::Array(values) => format!(
+            "[{}]",
+            values.iter().map(encode_json).collect::<Vec<_>>().join(",")
+        ),
+        Json::Object(values) => format!(
+            "{{{}}}",
+            values
+                .iter()
+                .map(|(key, value)| { format!("{}:{}", quote(key), encode_json(value)) })
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
     }
 }
 
@@ -504,6 +759,8 @@ fn decode_actions(value: &Json) -> Result<Vec<Action>, Error> {
 }
 
 struct Worker {
+    index: usize,
+    states: BTreeMap<usize, usize>,
     child: Child,
     commands: mpsc::Sender<String>,
     replies: mpsc::Receiver<Result<String, Error>>,
@@ -573,6 +830,8 @@ impl Worker {
             return Err(error.into());
         }
         Ok(Self {
+            index: 0,
+            states: BTreeMap::new(),
             child,
             commands,
             replies,
