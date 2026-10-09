@@ -32,13 +32,13 @@ import sys
 import time
 
 if "--list-tests" in sys.argv:
-    print("safety/concurrent\nsafety/causal")
+    print("concurrent\nreply\nreverse_reply\nsequential\nafter_delivery")
     sys.exit(0)
 parser = argparse.ArgumentParser()
-parser.add_argument("--python")
+parser.add_argument("solution")
 parser.add_argument("--test")
 args, _ = parser.parse_known_args()
-mode = Path(args.python).read_text().strip()
+mode = Path(args.solution).read_text().strip()
 if mode == "cwd":
     Path("working-directory.txt").write_text(str(Path.cwd()))
 if mode == "missing":
@@ -50,11 +50,11 @@ if mode == "malformed":
 if mode == "mismatch":
     args.test = "wrong-test"
 if mode == "timeout":
-    marker = str(Path(args.python).with_suffix(".alive"))
+    marker = str(Path(args.solution).with_suffix(".alive"))
     child = subprocess.Popen([sys.executable, "-c",
         "import pathlib,time; time.sleep(1); pathlib.Path(" + repr(marker)
         + ").write_text('survived'); time.sleep(60)"])
-    Path(args.python).with_suffix(".pid").write_text(str(child.pid))
+    Path(args.solution).with_suffix(".pid").write_text(str(child.pid))
     time.sleep(60)
 if mode == "verbose":
     print("x" * (3 * 1024 * 1024))
@@ -65,9 +65,11 @@ if mode in ("flood-stdout", "flood-stderr"):
         stream.write("x" * 65536)
         stream.flush()
         time.sleep(0.005)
-status = mode if mode in ("fail", "unsupported", "inconclusive", "error") else "pass"
-print(json.dumps({"solution": args.python, "test": args.test, "status": status,
-                  "seconds": 0.1, "events": 3, "detail": "fixture " + status}))
+status = mode if mode in ("fail", "unsupported", "inconclusive", "error", "send_budget") else "pass"
+print(json.dumps({"solution": args.solution, "test": args.test, "status": status,
+                  "seconds": 0.1, "events": 3, "detail": "fixture " + status,
+                  "delivery": "p2p" if mode == "wrong-delivery" else "asyn",
+                  "liveness_mode": "explicit" if mode == "wrong-mode" else "cuts"}))
 sys.exit(1 if status != "pass" or mode == "badexit" else 0)
 '''
 
@@ -100,7 +102,7 @@ class BatchTests(unittest.TestCase):
     def case(self, name, mode, *extra):
         path = self.solution(name, mode)
         return batch.run_case(
-            self.args(*extra), path, name, "safety/concurrent",
+            self.args(*extra), path, name, "concurrent",
             self.output / f"{name}.log", threading.Event(),
         )
 
@@ -142,25 +144,25 @@ class BatchTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 code = batch.main([
                     str(self.corpus), "--binary", str(self.binary), "--output", str(self.output),
-                    "--first-submission", "z", "--threads", "12", "--max-sends", "18",
+                    "--first-submission", "z", "--threads", "12",
                 ])
         self.assertEqual(code, 0)
         self.assertEqual(snapshots[0]["completed_cases"], 0)
-        self.assertEqual(snapshots[0]["pending_cases"], 6)
+        self.assertEqual(snapshots[0]["pending_cases"], 15)
         partial = snapshots[1]
         self.assertEqual(partial["completed_submissions"], 1)
         self.assertTrue(partial["submissions"]["z"]["completed"])
         self.assertFalse(partial["submissions"]["a"]["completed"])
         self.assertFalse(partial["completed"])
-        self.assertEqual(partial["pending_cases"], 4)
+        self.assertEqual(partial["pending_cases"], 10)
         self.assertTrue(snapshots[-1]["completed"])
         self.assertEqual(snapshots[-1]["pending_cases"], 0)
         records = [json.loads(line) for line in (self.output / "results.jsonl").read_text().splitlines()]
-        self.assertEqual([record["submission"] for record in records], ["z", "z", "a", "a", "b", "b"])
+        self.assertEqual([record["submission"] for record in records], ["z"] * 5 + ["a"] * 5 + ["b"] * 5)
         for record in records:
             command = record["command"]
             self.assertEqual(command[command.index("--threads") + 1], "12")
-            self.assertEqual(command[command.index("--max-sends") + 1], "18")
+            self.assertNotIn("--max-sends", command)
         self.assertEqual(list(self.output.glob(".summary-*.tmp")), [])
 
     def test_failed_atomic_replace_preserves_the_previous_summary(self):
@@ -172,6 +174,29 @@ class BatchTests(unittest.TestCase):
                 batch.write_summary(summary, {"generation": 2})
         self.assertEqual(json.loads(summary.read_text()), {"generation": 1})
         self.assertEqual(list(self.output.glob(".summary-*.tmp")), [])
+
+    def test_send_budget_is_a_completed_failure_with_distinct_statistics(self):
+        self.solution("over-budget", "send_budget")
+        self.solution("semantic-error", "fail")
+        progress = io.StringIO()
+        with contextlib.redirect_stdout(progress):
+            code = batch.main([
+                str(self.corpus), "--binary", str(self.binary), "--output", str(self.output),
+                "--test", "concurrent",
+            ])
+        self.assertEqual(code, 1)
+        summary = json.loads((self.output / "summary.json").read_text())
+        self.assertTrue(summary["completed"])
+        self.assertEqual(summary["counts"]["send_budget"], 1)
+        self.assertEqual(summary["counts"]["fail"], 1)
+        self.assertEqual(summary["counts"]["timeout"], 0)
+        self.assertEqual(summary["counts"]["inconclusive"], 0)
+        self.assertEqual(summary["passed_submissions"], 0)
+        over_budget = summary["submissions"]["over-budget"]
+        self.assertTrue(over_budget["completed"])
+        self.assertFalse(over_budget["passed"])
+        self.assertEqual(over_budget["results"][0]["status"], "send_budget")
+        self.assertIn("send_budget", progress.getvalue())
 
     @unittest.skipUnless(os.name == "posix", "launcher uses a POSIX shell")
     def test_launcher_freezes_checker_preserves_paths_and_forwards_night_bounds(self):
@@ -215,8 +240,32 @@ class BatchTests(unittest.TestCase):
         self.assertTrue(summary["completed"])
         self.assertEqual(summary["total_submissions"], 4)
         self.assertEqual(summary["submission_order"], priorities + ["extra"])
-        for option, value in [("jobs", 1), ("threads", 12), ("timeout", 90), ("max_sends", 18)]:
+        for option, value in [("jobs", 1), ("threads", 12), ("timeout", 90), ("delivery", "asyn"), ("liveness_mode", "cuts")]:
             self.assertEqual(summary["options"][option], value)
+
+    def test_listing_and_explicit_test_selection(self):
+        self.assertEqual(batch.listing_command(self.args()),
+                         [str(self.binary), "--list-tests"])
+        self.assertEqual(batch.listing_command(self.args("--test", "reply")),
+                         [str(self.binary), "--list-tests"])
+        self.solution("good")
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = batch.main([
+                str(self.corpus), "--binary", str(self.binary), "--output", str(self.output),
+                "--test", "reply",
+            ])
+        self.assertEqual(code, 0)
+        summary = json.loads((self.output / "summary.json").read_text())
+        self.assertEqual(summary["expected_cases"], 1)
+        self.assertEqual(summary["submissions"]["good"]["results"][0]["test"], "reply")
+
+    def test_case_command_uses_positional_solution(self):
+        command = batch.case_command(self.args(), self.corpus / "broadcast.py", "concurrent")
+        self.assertNotIn("--max-sends", command)
+        for option in ("--delivery", "--liveness-mode", "--suite"):
+            self.assertNotIn(option, command)
+        self.assertEqual(command[1], str(self.corpus / "broadcast.py"))
+        self.assertNotIn("--python", command)
 
     def test_result_statuses_and_nonzero_expected_failure(self):
         for status in ("pass", "fail", "unsupported", "inconclusive", "error"):
@@ -228,7 +277,7 @@ class BatchTests(unittest.TestCase):
                 self.assertIn("fixture " + status, Path(result["log"]).read_text())
 
     def test_invalid_results_are_errors_with_logs(self):
-        for mode in ("missing", "malformed", "mismatch", "badexit"):
+        for mode in ("missing", "malformed", "mismatch", "badexit", "wrong-delivery", "wrong-mode"):
             with self.subTest(mode=mode):
                 result = self.case(mode, mode)
                 self.assertEqual(result["status"], "error")
@@ -257,7 +306,9 @@ class BatchTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "process groups require POSIX")
     def test_timeout_kills_checker_and_child(self):
         started = time.monotonic()
-        result = self.case("timeout", "timeout", "--timeout", "0.4")
+        # Leave startup time for the fixture to create its child, while the
+        # deadline remains below the child's one-second survival marker.
+        result = self.case("timeout", "timeout", "--timeout", "0.8")
         self.assertEqual(result["status"], "timeout")
         self.assertLess(time.monotonic() - started, 3)
         pid = int((self.corpus / "timeout" / "broadcast.pid").read_text())
@@ -273,7 +324,7 @@ class BatchTests(unittest.TestCase):
         stopped = threading.Event()
         stopped.set()
         result = batch.run_case(
-            self.args(), path, "interrupted", "safety/concurrent",
+            self.args(), path, "interrupted", "concurrent",
             self.output / "interrupted.log", stopped,
         )
         self.assertEqual(result["status"], "inconclusive")
@@ -290,18 +341,19 @@ class BatchTests(unittest.TestCase):
             ])
         self.assertEqual(code, 1)
         records = [json.loads(line) for line in (self.output / "results.jsonl").read_text().splitlines()]
-        self.assertEqual(len(records), 10)
+        self.assertEqual(len(records), 25)
         summary = json.loads((self.output / "summary.json").read_text())
-        self.assertEqual(summary["completed_cases"], 10)
-        self.assertEqual(summary["expected_cases"], 10)
+        self.assertEqual(summary["completed_cases"], 25)
+        self.assertEqual(summary["expected_cases"], 25)
         self.assertEqual(summary["passed_submissions"], 1)
         self.assertEqual(list(summary["submissions"]), ["a", "b", "c", "d", "z"])
         self.assertEqual(summary["counts"], {
-            "pass": 2, "fail": 2, "unsupported": 2, "inconclusive": 2, "error": 2, "timeout": 0,
+            "pass": 5, "fail": 5, "unsupported": 5, "inconclusive": 5, "error": 5,
+            "send_budget": 0, "timeout": 0,
         })
         for submission in summary["submissions"].values():
             self.assertEqual([item["test"] for item in submission["results"]],
-                             ["safety/causal", "safety/concurrent"])
+                             ["after_delivery", "concurrent", "reply", "reverse_reply", "sequential"])
             for item in submission["results"]:
                 self.assertTrue(Path(item["log"]).is_file())
 
@@ -311,8 +363,8 @@ class BatchTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             code = batch.main([
                 str(self.corpus), "--binary", str(self.binary), "--output", str(self.output),
-                "--submission", "good", "--test", "safety/concurrent",
-                "--test", "safety/concurrent",
+                "--submission", "good", "--test", "concurrent",
+                "--test", "concurrent",
             ])
         self.assertEqual(code, 0)
         summary = json.loads((self.output / "summary.json").read_text())

@@ -28,7 +28,7 @@ cd -- "$output/work" || exit 2
 
 command=(python3 "$repo/scripts/test_broadcast_submissions.py" "$submissions"
     --binary "$output/broadcast" --output "$output"
-    --jobs 1 --threads 12 --timeout 90 --max-sends 18)
+    --jobs 1 --threads 12 --timeout 90)
 priority_directory=$submissions
 if [[ -d "$submissions/04-broadcast" ]]; then
     priority_directory="$submissions/04-broadcast"
