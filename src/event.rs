@@ -219,7 +219,7 @@ impl Pred {
 
     /// Whether this predicate was constructed to accept every payload.
     /// Custom predicates cannot be classified from their printable tags.
-    pub(crate) fn is_any(&self) -> bool {
+    pub fn is_any(&self) -> bool {
         self.test.is_none()
     }
 

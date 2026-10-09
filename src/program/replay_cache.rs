@@ -285,7 +285,7 @@ impl<P: Program> CachedProgram<P> {
             system,
             enabled,
             owner: CACHE_OWNERS
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .ok(),
             cache: RefCell::new(ReplayCache {
                 roots: Vec::new(),
@@ -306,6 +306,10 @@ impl<P: Program> CachedProgram<P> {
 }
 
 impl<P: Program> Program for CachedProgram<P> {
+    fn annotations_are_local(&self) -> bool {
+        self.system.annotations_are_local()
+    }
+
     #[inline]
     fn prefix_namespace(&self) -> Option<u64> {
         if !self.enabled {
@@ -347,26 +351,34 @@ impl<P: Program> Program for CachedProgram<P> {
     }
 
     fn labels_at_prefixes(&self, tokens: &[u64]) -> Option<Vec<TraceLabel>> {
+        let mut labels = Vec::new();
+        self.labels_at_prefixes_into(tokens, &mut labels)
+            .then_some(labels)
+    }
+
+    fn labels_at_prefixes_into(&self, tokens: &[u64], out: &mut Vec<TraceLabel>) -> bool {
+        out.clear();
         if !self.enabled {
-            return self.system.labels_at_prefixes(tokens);
+            let available = self.system.labels_at_prefixes_into(tokens, out);
+            if !available {
+                out.clear();
+            }
+            return available;
         }
         if tokens.len() != self.num_threads() {
-            return None;
+            return false;
         }
         let cache = self.cache.borrow();
-        let rows = tokens
-            .iter()
-            .enumerate()
-            .map(|(tid, &token)| {
-                let node = Self::prefix_node(&cache, tid, token)?;
-                cache.nodes[node].labels.as_deref()
-            })
-            .collect::<Option<Vec<_>>>()?;
-        let mut labels = Vec::with_capacity(rows.iter().map(|row| row.len()).sum());
-        for row in rows {
-            labels.extend(row.iter().cloned());
+        for (tid, &token) in tokens.iter().enumerate() {
+            let row = Self::prefix_node(&cache, tid, token)
+                .and_then(|node| cache.nodes[node].labels.as_deref());
+            let Some(row) = row else {
+                out.clear();
+                return false;
+            };
+            out.extend_from_slice(row);
         }
-        Some(labels)
+        true
     }
 
     fn num_threads(&self) -> usize {
@@ -874,6 +886,20 @@ mod tests {
                 .unwrap(),
             system.labels(&[trace.to_vec(), Vec::new(), Vec::new()])
         );
+        let tokens = [token, other_token, receiver_token];
+        let expected = system.labels_at_prefixes(&tokens).unwrap();
+        let mut reused = Vec::with_capacity(expected.len() + 16);
+        for _ in 0..3 {
+            assert!(system.labels_at_prefixes_into(&tokens, &mut reused));
+            assert_eq!(reused, expected);
+        }
+        let capacity = reused.capacity();
+        assert!(!system.labels_at_prefixes_into(&[token, other_token, u64::MAX], &mut reused));
+        assert!(reused.is_empty());
+        assert_eq!(reused.capacity(), capacity);
+        assert!(system.labels_at_prefixes_into(&tokens, &mut reused));
+        assert!(!system.labels_at_prefixes_into(&tokens[..1], &mut reused));
+        assert!(reused.is_empty());
         assert!(system.next_thread_at_prefix(1, token).is_none());
         assert!(system.persist_cursor(1, child).is_none());
         let foreign = CachedProgram::new(branching());
@@ -894,6 +920,13 @@ mod tests {
         system.next_thread(1, &[]);
         assert!(system.next_thread_at_prefix(0, token).is_none());
         assert!(system.persist_cursor(0, cursor).is_none());
+        let mut reused = vec![TraceLabel {
+            tid: 0,
+            position: 0,
+            value: "stale".into(),
+        }];
+        assert!(!system.labels_at_prefixes_into(&[token, 0, 0], &mut reused));
+        assert!(reused.is_empty());
         let (_, latest) = system.next_thread_cursor(1, &[]);
         let latest = latest.unwrap();
         assert_ne!(system.persist_cursor(1, latest).unwrap(), token);
@@ -902,6 +935,8 @@ mod tests {
         assert!(system.persist_cursor(1, wide.unwrap()).is_none());
         assert!(system.next_thread_at_prefix(1, 0).is_none());
         assert!(system.next_thread_at_prefix(1, token).is_none());
+        assert!(!system.labels_at_prefixes_into(&[0, 0, 0], &mut reused));
+        assert!(reused.is_empty());
         assert!(system.cache.borrow().cursors_enabled);
     }
 
@@ -953,7 +988,7 @@ mod tests {
         assert_eq!(cache.entries, 1);
         assert_eq!(cache.trace_cells, 0);
         assert_eq!(cache.get(1, &[]).unwrap().next, Some(latest));
-        assert!(!cache.get(0, &[]).is_some());
+        assert!(cache.get(0, &[]).is_none());
         assert!(cache.bytes <= 10_000);
     }
 }

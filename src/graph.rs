@@ -350,6 +350,22 @@ mod program_prefix_tests {
     use crate::event::Pred;
 
     #[test]
+    fn opaque_prefix_identity_is_scoped_and_validates_bounds() {
+        let mut graph = ExecutionGraph::new();
+        let first = graph.add_event(0, Label::send(Model::Asyn, 1, "first"));
+        assert_eq!(graph.program_prefix_identity(0, 0), None);
+        graph.reset_program_prefix_namespace(17);
+        assert_eq!(graph.program_prefix_identity(0, 0), Some((17, 0)));
+        assert_eq!(graph.program_prefix_identity(0, 1), None);
+        graph.set_program_prefix(first, 42);
+        assert_eq!(graph.program_prefix_identity(0, 1), Some((17, 42)));
+        assert_eq!(graph.program_prefix_identity(0, 2), None);
+        graph.reset_program_prefix_namespace(18);
+        assert_eq!(graph.program_prefix_identity(0, 1), None);
+        assert_eq!(graph.program_prefix_identity(0, 0), Some((18, 0)));
+    }
+
+    #[test]
     fn handles_follow_exact_prefixes_through_mutation_cut_clone_and_namespace_reset() {
         let mut graph = ExecutionGraph::new();
         let a = graph.add_event(0, Label::send(Model::Asyn, 1, "a"));
@@ -697,6 +713,21 @@ impl ExecutionGraph {
             None => Some(0), // The reserved empty-trace token.
             Some(event) => (event.program_prefix != 0).then_some(event.program_prefix),
         }
+    }
+
+    /// Opaque identity of an exact local program history, scoped by its replay namespace.
+    /// Available only when the program provides persistent prefix identities. It is
+    /// optimization metadata: never use its numeric value to order execution events.
+    pub fn program_prefix_identity(&self, tid: Tid, len: usize) -> Option<(u64, u64)> {
+        if self.program_prefix_namespace == 0 || len > self.thread_len(tid) {
+            return None;
+        }
+        let token = if len == 0 {
+            0
+        } else {
+            self.stored(EventId::new(tid, len - 1)).program_prefix
+        };
+        (len == 0 || token != 0).then_some((self.program_prefix_namespace, token))
     }
 
     pub(crate) fn set_program_prefix(&mut self, event: EventId, token: u64) {

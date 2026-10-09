@@ -210,6 +210,39 @@ pub trait Program {
         None
     }
 
+    /// Reconstruct the same annotations as `labels_at_prefixes`, reusing `out`.
+    /// Return `true` only for validated tokens in this program's namespace and
+    /// replace the buffer's contents in local annotation order. On unavailable,
+    /// stale or malformed tokens, return `false` and leave `out` empty.
+    /// The caller must check `prefix_namespace` before passing stored graph tokens;
+    /// the token integers alone do not identify their originating program.
+    /// The default adapts implementations of the owned-vector method.
+    fn labels_at_prefixes_into(&self, tokens: &[u64], out: &mut Vec<TraceLabel>) -> bool {
+        out.clear();
+        match self.labels_at_prefixes(tokens) {
+            Some(labels) => {
+                out.extend(labels);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether annotations factor into independent per-thread histories.
+    ///
+    /// Returning true promises that, for every thread `tid`, its subsequence of
+    /// `labels(traces)` depends only on `traces[tid]`, including positions and local
+    /// insertion order. Changing other threads' traces cannot add, remove or alter
+    /// that subsequence. Exact local prefix identities determine these annotations
+    /// independently of the other processes as well.
+    ///
+    /// The receive-tail certificate requires this stronger contract to compose
+    /// local proofs. Determinism alone is insufficient; unknown programs retain
+    /// the conservative default even if they currently produce no annotations.
+    fn annotations_are_local(&self) -> bool {
+        false
+    }
+
     /// Deterministic annotations reconstructed from each thread's committed trace,
     /// including local work before its next uncommitted event (or termination).
     /// They do not add events, affect scheduling, or participate in graph identity.

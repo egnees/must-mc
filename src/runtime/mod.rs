@@ -364,6 +364,11 @@ impl System {
 }
 
 impl Program for System {
+    fn annotations_are_local(&self) -> bool {
+        // Each factory is replayed only with its own process's committed trace.
+        true
+    }
+
     fn supports_replay_cache(&self) -> bool {
         true
     }
