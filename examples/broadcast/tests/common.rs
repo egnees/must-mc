@@ -16,6 +16,7 @@ pub(crate) fn threads() -> usize {
 
 pub(super) const NODES: usize = 3;
 pub(super) const MESSAGES: [&str; 2] = ["first", "second"];
+const SEND_BUDGET: usize = 2 * MESSAGES.len() * NODES * (NODES - 1);
 pub(super) const BROADCAST: [&str; 2] = ["broadcast:first", "broadcast:second"];
 pub(super) const DELIVERED: [&str; 2] = ["deliver:first", "deliver:second"];
 #[derive(Default)]
@@ -53,6 +54,21 @@ impl must::Observer for FirstFailure {
 
     fn allows_buffered_events(&self) -> bool {
         true
+    }
+
+    fn on_send_limit(&self, graph: &must::ExecutionGraph, limit: usize) {
+        self.fail(
+            graph,
+            &[],
+            &format!(
+                "send budget exceeded: attempted send {}, budget {} (2 × {} broadcasts × {} nodes × {})",
+                graph.num_sends() + 1,
+                limit,
+                MESSAGES.len(),
+                NODES,
+                NODES - 1,
+            ),
+        );
     }
 
     fn receive_tail_candidate(
@@ -142,6 +158,7 @@ pub(super) fn run(make_system: impl Fn() -> must::System + Sync) -> Result<usize
         &observer,
         must::Config::default()
             .with_threads(threads())
+            .with_max_sends(SEND_BUDGET)
             .with_stop_on_terminal_error()
             .with_receive_tail(must::explorer::receive_tail::ReceiveTailBudget::default()),
     );
@@ -247,6 +264,31 @@ fn deliver_local(ctx: &must::Ctx, message: &str, delivered: &mut [bool; 2], orde
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_budget_allows_exact_limit_and_receives_but_counts_self_sends() {
+        for sends in [SEND_BUDGET, SEND_BUDGET + 1] {
+            let result = run(|| {
+                let mut system = must::System::new();
+                system.add(move |ctx| async move {
+                    for index in 0..sends {
+                        ctx.send(0, index.to_string(), must::Model::Asyn);
+                    }
+                    for index in 0..sends {
+                        ctx.recv(move |value| value == index.to_string()).await;
+                    }
+                });
+                system
+            });
+            if sends == SEND_BUDGET {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.contains("send budget exceeded:"), "{error}");
+                assert!(error.contains("attempted send 25, budget 24"), "{error}");
+            }
+        }
+    }
 
     #[test]
     fn rejects_known_payload_delivered_before_its_broadcast() {

@@ -71,7 +71,9 @@ fn check(args: Args) -> Result<bool, String> {
             (Some(error), _) => (error.status, error.message, None),
             (None, Ok(events)) => ("pass", String::new(), Some(events)),
             (None, Err(error)) => {
-                let status = if error.contains("check incomplete:") {
+                let status = if error.contains("send budget exceeded:") {
+                    "send_budget"
+                } else if error.contains("check incomplete:") {
                     "inconclusive"
                 } else {
                     "fail"
@@ -79,7 +81,7 @@ fn check(args: Args) -> Result<bool, String> {
                 (status, error, None)
             }
         };
-        if status == "fail" {
+        if matches!(status, "fail" | "send_budget") {
             verdict = "fail";
         } else if status != "pass" && verdict == "pass" {
             verdict = "inconclusive";
