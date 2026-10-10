@@ -18,6 +18,18 @@ struct Args {
     json: bool,
     #[arg(long, default_value_t = 12)]
     threads: usize,
+    /// Use exact-history Python caching only (performance comparison).
+    #[arg(long)]
+    no_state_cache: bool,
+    /// Disable receive-tail certificates (performance comparison).
+    #[arg(long)]
+    no_receive_tail: bool,
+    /// Prefer ready sends during untimed Must construction (experimental).
+    #[arg(long)]
+    send_first: bool,
+    /// Print Python cache counters on stderr.
+    #[arg(long)]
+    cache_stats: bool,
 }
 
 pub(crate) fn run() -> ExitCode {
@@ -50,13 +62,16 @@ fn check(args: Args) -> Result<bool, String> {
         must_python::PythonOptions {
             max_states: usize::MAX,
             workers: args.threads.max(1),
+            semantic_state_cache: !args.no_state_cache,
             ..must_python::PythonOptions::default()
         },
     )
     .map_err(|error| format!("cannot load Python solution: {error}"))?;
     tests::common::configure(args.threads);
+    tests::common::configure_receive_tail(!args.no_receive_tail);
+    tests::common::configure_send_first(args.send_first);
     let diagnostics = python::Diagnostics::default();
-    let factory = python::factory(module, diagnostics.clone());
+    let factory = python::factory(module.clone(), diagnostics.clone());
     let started = Instant::now();
     let mut verdict = "pass";
     for (name, scenario) in tests::SCENARIOS {
@@ -103,6 +118,12 @@ fn check(args: Args) -> Result<bool, String> {
             "{} ({:.3}s)",
             verdict.to_uppercase(),
             started.elapsed().as_secs_f64()
+        );
+    }
+    if args.cache_stats {
+        eprintln!(
+            "Python cache: {:?}",
+            module.cache_stats().map_err(|error| error.to_string())?
         );
     }
     Ok(verdict == "pass")

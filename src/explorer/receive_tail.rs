@@ -33,8 +33,8 @@ impl Default for ReceiveTailBudget {
 /// Evidence bound to this exact construction prefix, not a completed execution.
 ///
 /// Every continuation consumes only these pending sends: there are no new sends,
-/// errors, nondeterministic choices or annotations. Processes with pending sends
-/// continue accepting every payload until their mailbox is drained. The observer
+/// errors, nondeterministic choices or annotations. Selective predicates are checked at every reachable local prefix; residual
+/// unread sends are permitted only at a finished or blocked process. The observer
 /// must separately prove its property for *every* represented terminal graph.
 /// Only the explorer's exhaustive bounded proof can construct this evidence.
 #[derive(Debug)]
@@ -43,6 +43,8 @@ pub struct ReceiveTailCertificate<'a> {
     labels: &'a [TraceLabel],
     pending: Vec<Vec<EventId>>,
     states_checked: usize,
+    drains_mailboxes: bool,
+    selective: bool,
 }
 
 impl ReceiveTailCertificate<'_> {
@@ -56,6 +58,16 @@ impl ReceiveTailCertificate<'_> {
     pub fn pending_sends(&self) -> &[Vec<EventId>] {
         &self.pending
     }
+    /// Whether every represented terminal consumes every pending send.
+    /// False permits finished or selectively blocked processes with residual mail.
+    pub fn drains_mailboxes(&self) -> bool {
+        self.drains_mailboxes
+    }
+    /// Whether a represented suffix contains a custom selective predicate.
+    /// Crash-cut observers must not assume all surviving mail remains accepted.
+    pub fn has_selective_receives(&self) -> bool {
+        self.selective
+    }
     pub fn states_checked(&self) -> usize {
         self.states_checked
     }
@@ -68,7 +80,9 @@ struct LocalEntry {
     identity: Option<(u64, u64)>,
     tid: usize,
     hash: u64,
-    packets: Vec<(EventId, Val)>,
+    packets: Vec<Val>,
+    drains_mailboxes: bool,
+    selective: bool,
 }
 
 struct LocalMemo {
@@ -90,73 +104,66 @@ thread_local! {
     static LOCAL_MEMO: RefCell<LocalMemo> = RefCell::new(LocalMemo::default());
 }
 
-fn memo_hash(identity: (u64, u64), tid: usize, packets: &[EventId]) -> u64 {
+fn memo_hash(identity: (u64, u64), tid: usize, packets: &[Val]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
-    for word in [identity.0, identity.1, tid as u64, packets.len() as u64]
-        .into_iter()
-        .chain(packets.iter().flat_map(|id| [id.tid as u64, id.idx as u64]))
-    {
+    for word in [identity.0, identity.1, tid as u64, packets.len() as u64] {
         hash = (hash ^ word).wrapping_mul(0x100000001b3);
+    }
+    for &value in packets {
+        // Payloads are immutable interned strings. Hash their cached content
+        // fingerprints instead of rescanning every byte on each local proof.
+        // LocalMemo::get still compares every packet, including multiplicity.
+        hash = (hash ^ crate::intern::fingerprint(value)).wrapping_mul(0x100000001b3);
     }
     hash
 }
 
 impl LocalMemo {
-    fn contains(
+    fn get(
         &self,
         identity: (u64, u64),
         tid: usize,
-        graph: &ExecutionGraph,
-        packets: &[EventId],
+        packets: &[Val],
         hash: u64,
-    ) -> bool {
+    ) -> Option<(bool, bool)> {
         let entry = &self.entries[hash as usize % LOCAL_MEMO_SLOTS];
-        entry.identity == Some(identity)
+        (entry.identity == Some(identity)
             && entry.tid == tid
             && entry.hash == hash
-            && entry.packets.len() == packets.len()
-            && entry
-                .packets
-                .iter()
-                .zip(packets)
-                .all(|(&(stored, value), &event)| {
-                    stored == event
-                        && matches!(graph.label(event), Label::Send { val, .. } if *val == value)
-                })
+            && entry.packets == packets)
+            .then_some((entry.drains_mailboxes, entry.selective))
     }
 
     fn insert(
         &mut self,
         identity: (u64, u64),
         tid: usize,
-        graph: &ExecutionGraph,
-        packets: &[EventId],
+        packets: &[Val],
         hash: u64,
+        drains: bool,
+        selective: bool,
     ) {
         let entry = &mut self.entries[hash as usize % LOCAL_MEMO_SLOTS];
         entry.identity = Some(identity);
         entry.tid = tid;
         entry.hash = hash;
         entry.packets.clear();
-        for &event in packets {
-            let Label::Send { val, .. } = graph.label(event) else {
-                unreachable!()
-            };
-            entry.packets.push((event, *val));
-        }
+        entry.packets.extend_from_slice(packets);
+        entry.drains_mailboxes = drains;
+        entry.selective = selective;
     }
 }
 
 pub(crate) fn receive_or_finished(next: &ThreadNext) -> bool {
-    match next {
-        ThreadNext::Finished => true,
-        ThreadNext::Next(Label::Recv {
-            pred,
-            blocking: true,
-            timing: ReceiveTiming::Abstract,
-        }) => pred.is_any(),
-        _ => false,
-    }
+    matches!(
+        next,
+        ThreadNext::Finished
+            | ThreadNext::Next(Label::Recv {
+                blocking: true,
+                timing: ReceiveTiming::Abstract,
+                ..
+            })
+    )
 }
 
 /// Inputs are the explorer's already consistent graph and exact program views.
@@ -220,6 +227,8 @@ pub(crate) fn certify<'a, P: Program>(
         traces: Vec::new(),
         labels,
         remaining_states: budget.max_states,
+        drains_mailboxes: true,
+        selective: false,
     };
     for (tid, row) in pending.iter().enumerate() {
         // All next events have already been validated. With no pending input,
@@ -227,16 +236,25 @@ pub(crate) fn certify<'a, P: Program>(
         if row.is_empty() {
             continue;
         }
-        if matches!(nexts[tid], ThreadNext::Finished) {
-            return None;
-        }
         let identity = graph
             .program_prefix_identity(tid, graph.thread_len(tid))
             .filter(|&(namespace, _)| program.prefix_namespace() == Some(namespace));
-        let hash = identity.map(|identity| memo_hash(identity, tid, row));
-        if identity.zip(hash).is_some_and(|(identity, hash)| {
-            LOCAL_MEMO.with(|cache| cache.borrow().contains(identity, tid, graph, row, hash))
+        let mut packets: Vec<Val> = row
+            .iter()
+            .map(|&send| {
+                let Label::Send { val, .. } = graph.label(send) else {
+                    unreachable!()
+                };
+                *val
+            })
+            .collect();
+        packets.sort_by_key(|&value| crate::intern::resolve(value));
+        let hash = identity.map(|identity| memo_hash(identity, tid, &packets));
+        if let Some((drains, selective)) = identity.zip(hash).and_then(|(identity, hash)| {
+            LOCAL_MEMO.with(|cache| cache.borrow().get(identity, tid, &packets, hash))
         }) {
+            proof.drains_mailboxes &= drains;
+            proof.selective |= selective;
             continue;
         }
         if proof.traces.is_empty() {
@@ -253,18 +271,35 @@ pub(crate) fn certify<'a, P: Program>(
                 values.push((*val, 1));
             }
         }
+        let prior_drains = proof.drains_mailboxes;
+        let prior_selective = proof.selective;
+        proof.selective = false;
+        proof.drains_mailboxes = true;
         if !proof.visit(tid, &mut values, row.len(), Some(&nexts[tid])) {
             return None;
         }
         if let Some((identity, hash)) = identity.zip(hash) {
-            LOCAL_MEMO.with(|cache| cache.borrow_mut().insert(identity, tid, graph, row, hash));
+            LOCAL_MEMO.with(|cache| {
+                cache.borrow_mut().insert(
+                    identity,
+                    tid,
+                    &packets,
+                    hash,
+                    proof.drains_mailboxes,
+                    proof.selective,
+                )
+            });
         }
+        proof.drains_mailboxes &= prior_drains;
+        proof.selective |= prior_selective;
     }
     Some(ReceiveTailCertificate {
         graph,
         labels,
         pending,
         states_checked: budget.max_states - proof.remaining_states,
+        drains_mailboxes: proof.drains_mailboxes,
+        selective: proof.selective,
     })
 }
 
@@ -273,6 +308,8 @@ struct Proof<'a, P> {
     traces: Vec<Vec<Option<Val>>>,
     labels: &'a [TraceLabel],
     remaining_states: usize,
+    drains_mailboxes: bool,
+    selective: bool,
 }
 
 impl<P: Program> Proof<'_, P> {
@@ -300,16 +337,22 @@ impl<P: Program> Proof<'_, P> {
         if !receive_or_finished(&next) {
             return false;
         }
+        if let ThreadNext::Next(Label::Recv { pred, .. }) = &next {
+            self.selective |= !pred.is_any();
+        }
         if remaining == 0 {
             return true;
         }
-        if matches!(next, ThreadNext::Finished) {
-            return false;
-        }
+        let ThreadNext::Next(Label::Recv { pred, .. }) = next else {
+            self.drains_mailboxes = false;
+            return true;
+        };
+        let mut accepted = false;
         for index in 0..values.len() {
-            if values[index].1 == 0 {
+            if values[index].1 == 0 || !pred.test_sym(values[index].0) {
                 continue;
             }
+            accepted = true;
             values[index].1 -= 1;
             self.traces[tid].push(Some(values[index].0));
             let silent = self.visit(tid, values, remaining - 1, None);
@@ -318,6 +361,9 @@ impl<P: Program> Proof<'_, P> {
             if !silent {
                 return false;
             }
+        }
+        if !accepted {
+            self.drains_mailboxes = false;
         }
         true
     }
@@ -330,33 +376,19 @@ mod memo_tests {
     use crate::scheduler::traces_of;
     use crate::{Pred, System};
 
-    fn packet_graph(first: &str, second: &str) -> (ExecutionGraph, Vec<EventId>) {
-        let mut graph = ExecutionGraph::new();
-        let packets = vec![
-            graph.add_event(0, Label::send(Model::Asyn, 1, first)),
-            graph.add_event(0, Label::send(Model::Asyn, 1, second)),
-        ];
-        (graph, packets)
-    }
-
     #[test]
     fn local_memo_compares_payloads_multiplicity_epoch_namespace_and_actor() {
-        let (graph, packets) = packet_graph("a", "a");
+        let packets = vec!["a".into(), "a".into()];
         let identity = (77, 9);
         let hash = memo_hash(identity, 1, &packets);
         let mut memo = LocalMemo::default();
-        memo.insert(identity, 1, &graph, &packets, hash);
-        assert!(memo.contains(identity, 1, &graph, &packets, hash));
-
-        let (changed, same_ids) = packet_graph("a", "b");
-        assert_eq!(packets, same_ids);
-        // Hash intentionally need not inspect payload bytes. Exact Val equality
-        // is still mandatory even when every send identity and the hash match.
-        assert!(!memo.contains(identity, 1, &changed, &same_ids, hash));
-        assert!(!memo.contains(identity, 1, &graph, &packets[..1], hash));
-        assert!(!memo.contains((77, (1 << 32) | 9), 1, &graph, &packets, hash));
-        assert!(!memo.contains((78, 9), 1, &graph, &packets, hash));
-        assert!(!memo.contains(identity, 2, &graph, &packets, hash));
+        memo.insert(identity, 1, &packets, hash, false, true);
+        assert_eq!(memo.get(identity, 1, &packets, hash), Some((false, true)));
+        assert_eq!(memo.get(identity, 1, &["a".into(), "b".into()], hash), None);
+        assert_eq!(memo.get(identity, 1, &packets[..1], hash), None);
+        assert_eq!(memo.get((77, (1 << 32) | 9), 1, &packets, hash), None);
+        assert_eq!(memo.get((78, 9), 1, &packets, hash), None);
+        assert_eq!(memo.get(identity, 2, &packets, hash), None);
     }
 
     fn system() -> System {

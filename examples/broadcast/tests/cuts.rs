@@ -5,7 +5,7 @@ use std::cell::{OnceCell, RefCell};
 #[cfg(test)]
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, Weak};
 
 use super::common::{BROADCAST, DELIVERED, MESSAGES, NODES};
 
@@ -47,12 +47,13 @@ impl fmt::Display for CutDiagnostic {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Event(must::EventId),
     Annotation(usize),
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct Step {
     tid: usize,
     kind: Kind,
@@ -65,6 +66,19 @@ struct View<'a> {
     rows: [Vec<usize>; NODES],
     event_steps: [Vec<usize>; NODES],
     readers: [Vec<Option<must::EventId>>; NODES],
+}
+
+#[derive(Default)]
+struct ViewBuffers {
+    steps: Vec<Step>,
+    rows: [Vec<usize>; NODES],
+    event_steps: [Vec<usize>; NODES],
+    readers: [Vec<Option<must::EventId>>; NODES],
+}
+
+thread_local! {
+    // Only owned scalar buffers survive analysis, never graph/label references.
+    static SELECTIVE_VIEW_BUFFERS: RefCell<ViewBuffers> = RefCell::new(ViewBuffers::default());
 }
 
 impl<'a> View<'a> {
@@ -89,10 +103,20 @@ impl<'a> View<'a> {
         Self::build(graph, labels, false)
     }
 
+    #[cfg(test)]
     fn build(
         graph: &'a must::ExecutionGraph,
         labels: &'a [must::TraceLabel],
         selective: bool,
+    ) -> Result<Self, String> {
+        Self::build_with_buffers(graph, labels, selective, ViewBuffers::default())
+    }
+
+    fn build_with_buffers(
+        graph: &'a must::ExecutionGraph,
+        labels: &'a [must::TraceLabel],
+        selective: bool,
+        mut buffers: ViewBuffers,
     ) -> Result<Self, String> {
         if graph.num_threads() > NODES + 1 || graph.thread_len(NODES) != 0 {
             return Err("crash cuts support only three processes and an inert sink".into());
@@ -111,8 +135,11 @@ impl<'a> View<'a> {
                 return Err("crash cuts require a failure-free input execution".into());
             }
         }
-        let mut readers: [Vec<Option<must::EventId>>; NODES] =
-            std::array::from_fn(|tid| vec![None; graph.thread_len(tid)]);
+        let mut readers = buffers.readers;
+        for (tid, row) in readers.iter_mut().enumerate() {
+            row.clear();
+            row.resize(graph.thread_len(tid), None);
+        }
         for tid in 0..NODES {
             for idx in 0..graph.thread_len(tid) {
                 let event = must::EventId::new(tid, idx);
@@ -151,12 +178,20 @@ impl<'a> View<'a> {
         }
         let step_counts: [usize; NODES] =
             std::array::from_fn(|tid| graph.thread_len(tid) + label_counts[tid]);
+        buffers.steps.clear();
+        buffers.steps.reserve(step_counts.iter().sum());
+        for (tid, &count) in step_counts.iter().enumerate() {
+            buffers.rows[tid].clear();
+            buffers.rows[tid].reserve(count);
+            buffers.event_steps[tid].clear();
+            buffers.event_steps[tid].reserve(graph.thread_len(tid));
+        }
         let mut view = Self {
             graph,
             labels,
-            steps: Vec::with_capacity(step_counts.iter().sum()),
-            rows: std::array::from_fn(|tid| Vec::with_capacity(step_counts[tid])),
-            event_steps: std::array::from_fn(|tid| Vec::with_capacity(graph.thread_len(tid))),
+            steps: buffers.steps,
+            rows: buffers.rows,
+            event_steps: buffers.event_steps,
             readers,
         };
         for tid in 0..NODES {
@@ -181,6 +216,15 @@ impl<'a> View<'a> {
             }
         }
         Ok(view)
+    }
+
+    fn into_buffers(self) -> ViewBuffers {
+        ViewBuffers {
+            steps: self.steps,
+            rows: self.rows,
+            event_steps: self.event_steps,
+            readers: self.readers,
+        }
     }
 
     fn event_step(&self, event: must::EventId) -> usize {
@@ -307,11 +351,7 @@ pub(super) fn analyze_graph(
                 && matches!(graph.label(event), must::Label::Send { dst, .. } if *dst < NODES)
         });
     if selective {
-        let view = View::build(graph, labels, true)?;
-        if let Some(failure) = check_creation(graph, labels) {
-            return Ok(Some(failure));
-        }
-        return Ok(SelectiveCuts::new(&view).diagnostic());
+        return analyze_selective_reused(graph, labels);
     }
     analyze_prefix_mode(graph, labels, true, true)
 }
@@ -322,8 +362,131 @@ struct SelectivePacket {
     value: must::Val,
 }
 
-struct SelectiveCuts<'a, 'g> {
-    view: &'a View<'g>,
+const POSITIVE_PREDICATE_SLOTS: usize = 1024;
+
+#[derive(Default)]
+struct PositivePredicateEntry {
+    // Weak retains the allocation identity without retaining predicate state.
+    // A dropped owner's address cannot be reused while this weak owner remains.
+    owner: Weak<must::Pred>,
+    value: Option<must::Val>,
+}
+
+struct PositivePredicates {
+    entries: [PositivePredicateEntry; POSITIVE_PREDICATE_SLOTS],
+    queries: usize,
+    hits: usize,
+    inserted: usize,
+    worker: Option<std::thread::ThreadId>,
+}
+
+impl Default for PositivePredicates {
+    fn default() -> Self {
+        Self {
+            entries: std::array::from_fn(|_| PositivePredicateEntry::default()),
+            queries: 0,
+            hits: 0,
+            inserted: 0,
+            worker: None,
+        }
+    }
+}
+
+impl PositivePredicates {
+    fn slot(pred: &Arc<must::Pred>, value: must::Val) -> usize {
+        let address = Arc::as_ptr(pred) as usize;
+        // Interned strings have stable allocation addresses. These affect only
+        // replacement/hit rate; exact symbol equality remains authoritative.
+        let payload = must::intern::resolve(value).as_ptr() as usize;
+        ((address >> 4) ^ (address >> 12) ^ payload.rotate_left(7) ^ (payload >> 4))
+            % POSITIVE_PREDICATE_SLOTS
+    }
+
+    fn contains(&mut self, pred: &Arc<must::Pred>, value: must::Val, stats: bool) -> bool {
+        let entry = &self.entries[Self::slot(pred, value)];
+        let hit = entry.owner.as_ptr() == Arc::as_ptr(pred) && entry.value == Some(value);
+        if stats {
+            self.worker
+                .get_or_insert_with(|| std::thread::current().id());
+            self.queries += 1;
+            self.hits += usize::from(hit);
+            if self.queries % (1 << 20) == 0 {
+                eprintln!(
+                    "CUTS_PREDICATE_CACHE worker={:?} queries={} hits={} inserted={}",
+                    self.worker.unwrap(),
+                    self.queries,
+                    self.hits,
+                    self.inserted
+                );
+            }
+        }
+        hit
+    }
+
+    fn insert(&mut self, pred: &Arc<must::Pred>, value: must::Val, stats: bool) {
+        let entry = &mut self.entries[Self::slot(pred, value)];
+        entry.owner = Arc::downgrade(pred);
+        entry.value = Some(value);
+        if stats {
+            self.inserted += 1;
+        }
+    }
+}
+
+impl Drop for PositivePredicates {
+    fn drop(&mut self) {
+        if self.queries != 0 {
+            eprintln!(
+                "CUTS_PREDICATE_CACHE worker={:?} queries={} hits={} inserted={} final=1",
+                self.worker.unwrap(),
+                self.queries,
+                self.hits,
+                self.inserted
+            );
+        }
+    }
+}
+
+thread_local! {
+    static POSITIVE_PREDICATES: RefCell<PositivePredicates> = RefCell::new(PositivePredicates::default());
+}
+
+fn test_predicate_cached(pred: &Arc<must::Pred>, value: must::Val, stats: bool) -> bool {
+    // Selective predicates denote immutable, pure acceptance sets. Python's
+    // adapter returns false on transport/decode errors: only true is memoized,
+    // so an error/rejection never suppresses a subsequent evaluation/diagnostic.
+    // No TLS borrow crosses predicate execution or its Python/diagnostic path.
+    if POSITIVE_PREDICATES.with(|cache| cache.borrow_mut().contains(pred, value, stats)) {
+        return true;
+    }
+    let accepted = pred.test_sym(value);
+    if accepted {
+        POSITIVE_PREDICATES.with(|cache| cache.borrow_mut().insert(pred, value, stats));
+    }
+    accepted
+}
+
+fn test_cut_predicate(pred: &Arc<must::Pred>, value: must::Val) -> bool {
+    static OPTIONS: OnceLock<(bool, bool)> = OnceLock::new();
+    // Crash-cut analysis treats each immutable predicate snapshot as a pure
+    // acceptance set, just like its per-boundary OnceCell tables. Reuse only
+    // exact-owner successful answers; never reuse tags, failures or verdicts.
+    // Default on after paired measurements; the private =0 switch preserves
+    // the original evaluation path for A/B checks. Metrics remain opt-in.
+    let &(enabled, stats) = OPTIONS.get_or_init(|| {
+        (
+            !std::env::var("MUST_CUTS_PRED_CACHE").is_ok_and(|value| value == "0"),
+            std::env::var("MUST_CUTS_PRED_STATS").is_ok_and(|value| value == "1"),
+        )
+    });
+    if !enabled || pred.is_any() {
+        return pred.test_sym(value);
+    }
+    test_predicate_cached(pred, value, stats)
+}
+
+#[derive(Default)]
+struct SelectiveWorkspace {
     bounds: Vec<usize>,
     required: [Vec<[usize; NODES]>; NODES],
     advance: [[Vec<usize>; NODES]; 2],
@@ -331,16 +494,31 @@ struct SelectiveCuts<'a, 'g> {
     enabled: [Vec<OnceCell<[usize; NODES]>>; NODES],
 }
 
+thread_local! {
+    // Storage only: every graph recomputes the tables and clears all predicate
+    // answers. Neither graph identities nor cross-graph verdicts are cached.
+    static SELECTIVE_WORKSPACE: RefCell<SelectiveWorkspace> = RefCell::new(SelectiveWorkspace::default());
+}
+
+struct SelectiveCuts<'a, 'g> {
+    view: &'a View<'g>,
+    workspace: &'a SelectiveWorkspace,
+}
+
 impl<'a, 'g> SelectiveCuts<'a, 'g> {
-    fn new(view: &'a View<'g>) -> Self {
-        let mut bounds = vec![0; view.steps.len()];
+    fn new(view: &'a View<'g>, workspace: &'a mut SelectiveWorkspace) -> Self {
+        workspace.bounds.clear();
+        workspace.bounds.resize(view.steps.len(), 0);
+        let bounds = &mut workspace.bounds;
         for row in &view.rows {
             for (position, &step) in row.iter().enumerate() {
                 bounds[step] = position + 1;
             }
         }
-        let required = std::array::from_fn(|tid| {
-            let mut row = vec![[0; NODES]; view.rows[tid].len() + 1];
+        for tid in 0..NODES {
+            let row = &mut workspace.required[tid];
+            row.clear();
+            row.resize(view.rows[tid].len() + 1, [0; NODES]);
             for (position, &step) in view.rows[tid].iter().enumerate() {
                 let mut requirements = row[position];
                 if let Kind::Event(event) = view.steps[step].kind {
@@ -351,25 +529,28 @@ impl<'a, 'g> SelectiveCuts<'a, 'g> {
                 }
                 row[position + 1] = requirements;
             }
-            row
-        });
-        let advance = std::array::from_fn(|failed| {
-            std::array::from_fn(|tid| {
-                let mut row: Vec<_> = (0..=view.rows[tid].len()).collect();
+        }
+        for failed in 0..2 {
+            for tid in 0..NODES {
+                let row = &mut workspace.advance[failed][tid];
+                row.clear();
+                row.extend(0..=view.rows[tid].len());
                 for position in (0..view.rows[tid].len()).rev() {
                     if view.progresses(view.rows[tid][position], (failed != 0).then_some(tid)) {
                         row[position] = row[position + 1];
                     }
                 }
-                row
-            })
-        });
-        let mut incoming: [[Vec<SelectivePacket>; NODES]; NODES] =
-            std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
+            }
+        }
+        for destination in &mut workspace.incoming {
+            for source in destination {
+                source.clear();
+            }
+        }
         for (send, step) in view.events() {
             if let must::Label::Send { dst, val, .. } = view.graph.label(send) {
                 if *dst < NODES {
-                    incoming[*dst][send.tid].push(SelectivePacket {
+                    workspace.incoming[*dst][send.tid].push(SelectivePacket {
                         bound: bounds[step],
                         reader: view
                             .reader(send)
@@ -379,31 +560,29 @@ impl<'a, 'g> SelectiveCuts<'a, 'g> {
                 }
             }
         }
-        let enabled =
-            std::array::from_fn(|tid| (0..view.rows[tid].len()).map(|_| OnceCell::new()).collect());
-        Self {
-            view,
-            bounds,
-            required,
-            advance,
-            incoming,
-            enabled,
+        for tid in 0..NODES {
+            let row = &mut workspace.enabled[tid];
+            row.clear();
+            row.resize_with(view.rows[tid].len(), OnceCell::new);
         }
+        Self { view, workspace }
     }
 
     fn enabling_sources(&self, tid: usize, boundary: usize) -> &[usize; NODES] {
-        self.enabled[tid][boundary].get_or_init(|| {
+        self.workspace.enabled[tid][boundary].get_or_init(|| {
             let step = self.view.rows[tid][boundary];
             let Kind::Event(receive) = self.view.steps[step].kind else {
                 return [usize::MAX; NODES];
             };
-            let Some(pred) = self.view.graph.label(receive).pred() else {
+            let must::Label::Recv { pred, .. } = self.view.graph.label(receive) else {
                 return [usize::MAX; NODES];
             };
             std::array::from_fn(|source| {
-                self.incoming[tid][source]
+                self.workspace.incoming[tid][source]
                     .iter()
-                    .find(|packet| packet.reader > boundary && pred.test_sym(packet.value))
+                    .find(|packet| {
+                        packet.reader > boundary && test_cut_predicate(pred, packet.value)
+                    })
                     .map_or(usize::MAX, |packet| packet.bound)
             })
         })
@@ -411,12 +590,14 @@ impl<'a, 'g> SelectiveCuts<'a, 'g> {
 
     fn closure(&self, faulty: Option<usize>, seed: usize) -> [usize; NODES] {
         let mut cuts = [0; NODES];
-        cuts[self.view.steps[seed].tid] = self.bounds[seed];
+        cuts[self.view.steps[seed].tid] = self.workspace.bounds[seed];
         loop {
             let before = cuts;
             for tid in 0..NODES {
-                cuts[tid] = self.advance[usize::from(faulty == Some(tid))][tid][cuts[tid]];
-                for (source, required) in self.required[tid][cuts[tid]].iter().enumerate() {
+                cuts[tid] =
+                    self.workspace.advance[usize::from(faulty == Some(tid))][tid][cuts[tid]];
+                for (source, required) in self.workspace.required[tid][cuts[tid]].iter().enumerate()
+                {
                     cuts[source] = cuts[source].max(*required);
                 }
                 if faulty != Some(tid) && cuts[tid] < self.view.rows[tid].len() {
@@ -491,13 +672,45 @@ impl<'a, 'g> SelectiveCuts<'a, 'g> {
     }
 }
 
-// Called only after the runtime certifies every permutation of these pending
-// deliveries drains without sends/errors/nondeterminism/new annotations.
+fn selective_diagnostic(view: &View<'_>) -> Option<CutDiagnostic> {
+    SELECTIVE_WORKSPACE.with(|workspace| {
+        // Predicates only query immutable Python states; no observer invocation
+        // occurs while this worker-local workspace is borrowed.
+        SelectiveCuts::new(view, &mut workspace.borrow_mut()).diagnostic()
+    })
+}
+
+fn analyze_selective_reused(
+    graph: &must::ExecutionGraph,
+    labels: &[must::TraceLabel],
+) -> Result<Option<CutDiagnostic>, String> {
+    SELECTIVE_VIEW_BUFFERS.with(|storage| {
+        let buffers = std::mem::take(&mut *storage.borrow_mut());
+        // Invalid inputs preserve the original error and discard only reusable
+        // capacity. Subsequent calls still rebuild every buffer from scratch.
+        let view = View::build_with_buffers(graph, labels, true, buffers)?;
+        let diagnostic = check_creation(graph, labels).or_else(|| selective_diagnostic(&view));
+        *storage.borrow_mut() = view.into_buffers();
+        Ok(diagnostic)
+    })
+}
+
+// Called only after all predicate-enabled local continuations are proven silent.
+// Residual mail and future selective predicates require a conservative projection.
+// precise_tail is true only when all tails drain and no future receive is selective.
 pub(super) fn prove_completed_receive_tail(
     graph: &must::ExecutionGraph,
     labels: &[must::TraceLabel],
     pending_sends: &[Vec<must::EventId>],
+    precise_tail: bool,
 ) -> bool {
+    if !precise_tail
+        || graph
+            .iter_recvs()
+            .any(|event| graph.label(event).pred().is_some_and(|pred| !pred.is_any()))
+    {
+        return prove_selective_receive_tail(graph, labels).unwrap_or(false);
+    }
     PREFIX_WORKSPACE.with(|workspace| {
         prove_tail_cached(
             &mut workspace.borrow_mut(),
@@ -508,6 +721,19 @@ pub(super) fn prove_completed_receive_tail(
         )
         .unwrap_or(false)
     })
+}
+
+// Every terminal cut of a certified silent suffix projects into this prefix
+// closure. All sends and property labels are already present. At a retained
+// receive boundary, an unread matching send from a healthy included source
+// forces advancement; retained reads require their rf sources. Prefix endpoints
+// impose no future-tail constraints, so the closure is still an overapproximation.
+// Predicates are executable semantics and cannot use the projected pass-cache key.
+fn prove_selective_receive_tail(
+    graph: &must::ExecutionGraph,
+    labels: &[must::TraceLabel],
+) -> Result<bool, String> {
+    Ok(analyze_selective_reused(graph, labels)?.is_none())
 }
 
 pub(super) fn check_creation(
@@ -1815,7 +2041,32 @@ mod tests {
     fn compare_selective_closures(graph: &must::ExecutionGraph, labels: &[must::TraceLabel]) {
         assert!(must::consistency::consistent(graph));
         let view = View::build(graph, labels, true).unwrap();
-        let solver = SelectiveCuts::new(&view);
+        SELECTIVE_VIEW_BUFFERS.with(|storage| {
+            let buffers = std::mem::take(&mut *storage.borrow_mut());
+            let reused = View::build_with_buffers(graph, labels, true, buffers).unwrap();
+            assert_eq!(reused.steps, view.steps);
+            assert_eq!(reused.rows, view.rows);
+            assert_eq!(reused.event_steps, view.event_steps);
+            assert_eq!(reused.readers, view.readers);
+            *storage.borrow_mut() = reused.into_buffers();
+        });
+        let mut workspace = SelectiveWorkspace::default();
+        let solver = SelectiveCuts::new(&view, &mut workspace);
+        // The same TLS buffers see full graphs, shorter prefixes and changed
+        // predicates across calls. Reuse must agree with fresh storage at every
+        // seed and failure choice, before the independent prefix enumeration.
+        SELECTIVE_WORKSPACE.with(|reused| {
+            let mut reused = reused.borrow_mut();
+            let reused_solver = SelectiveCuts::new(&view, &mut reused);
+            for faulty in std::iter::once(None).chain((0..NODES).map(Some)) {
+                for seed in 0..view.steps.len() {
+                    assert_eq!(
+                        reused_solver.closure(faulty, seed),
+                        solver.closure(faulty, seed)
+                    );
+                }
+            }
+        });
         for faulty in std::iter::once(None).chain((0..NODES).map(Some)) {
             for seed in 0..view.steps.len() {
                 let least = solver.closure(faulty, seed);
@@ -1835,6 +2086,109 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn positive_predicate_cache_preserves_identity_values_and_rejected_evaluations() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let pred = Arc::new(must::Pred::new("same tag", move |value| {
+            count.fetch_add(1, Ordering::Relaxed);
+            value == "accepted"
+        }));
+        for _ in 0..3 {
+            assert!(test_predicate_cached(&pred, "accepted".into(), false));
+            assert!(!test_predicate_cached(&pred, "rejected".into(), false));
+        }
+        // One accepted evaluation is reused; false/error-like results are not.
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        let other = Arc::new(must::Pred::new("same tag", |_| false));
+        assert!(!test_predicate_cached(&other, "accepted".into(), false));
+        let weak = Arc::downgrade(&pred);
+        drop(pred);
+        assert!(weak.upgrade().is_none());
+        // Different live owners cannot inherit answers from stale weak owners,
+        // including when a direct-mapped slot collides deliberately.
+        let mut cache = PositivePredicates::default();
+        let value = "accepted".into();
+        let index = PositivePredicates::slot(&other, value);
+        cache.entries[index] = PositivePredicateEntry {
+            owner: weak,
+            value: Some(value),
+        };
+        assert!(!cache.contains(&other, value, false));
+        cache.entries[index] = PositivePredicateEntry {
+            owner: Arc::downgrade(&other),
+            value: Some("different value".into()),
+        };
+        assert!(!cache.contains(&other, value, false));
+        assert!(test_predicate_cached(
+            &Arc::new(must::Pred::any()),
+            value,
+            false
+        ));
+    }
+
+    #[test]
+    fn positive_predicate_cache_releases_borrows_before_nested_predicate_queries() {
+        let inner = Arc::new(must::Pred::eq("nested"));
+        let outer = Arc::new(must::Pred::new("nested predicate", move |value| {
+            test_predicate_cached(&inner, value.into(), false)
+        }));
+        assert!(test_predicate_cached(&outer, "nested".into(), false));
+        assert!(!test_predicate_cached(&outer, "rejected".into(), false));
+    }
+
+    #[test]
+    fn positive_predicate_cache_retries_failures_and_does_not_retain_predicate_body() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let pred = Arc::new(must::Pred::new("transient failure", move |_| {
+            count.fetch_add(1, Ordering::Relaxed) != 0
+        }));
+        assert!(!test_predicate_cached(&pred, "payload".into(), false));
+        assert!(test_predicate_cached(&pred, "payload".into(), false));
+        assert!(test_predicate_cached(&pred, "payload".into(), false));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        let body = Arc::new("captured predicate state");
+        let weak_body = Arc::downgrade(&body);
+        let pred = Arc::new(must::Pred::new("captured state", move |_| !body.is_empty()));
+        assert!(test_predicate_cached(&pred, "payload".into(), false));
+        drop(pred);
+        assert!(weak_body.upgrade().is_none());
+    }
+
+    #[test]
+    fn selective_view_rebuilds_after_empty_and_invalid_inputs() {
+        let mut graph = must::ExecutionGraph::new();
+        let send = graph.add_event(0, must::Label::send(must::Model::Asyn, 1, "accepted"));
+        let receive = graph.add_event(1, must::Label::recv(must::Pred::any()));
+        graph.set_rf(receive, Some(send));
+        for bad_kind in 0..3 {
+            compare_selective_closures(&graph, &[]);
+            let mut invalid = must::ExecutionGraph::new();
+            match bad_kind {
+                0 => {
+                    invalid.add_event(0, must::Label::error("unsupported"));
+                }
+                1 => {
+                    invalid.add_event(1, must::Label::recv(must::Pred::any()));
+                }
+                _ => {
+                    invalid.add_event(0, must::Label::send(must::Model::P2p, 1, "unsupported"));
+                }
+            }
+            let expected = View::build(&invalid, &[], true).err().unwrap();
+            assert_eq!(
+                analyze_selective_reused(&invalid, &[]).err().unwrap(),
+                expected
+            );
+            compare_selective_closures(&must::ExecutionGraph::new(), &[]);
+            compare_selective_closures(&graph, &[]);
         }
     }
 
@@ -1872,8 +2226,20 @@ mod tests {
                 label(2, 0, BOUNDARY),
             ];
             compare_selective_closures(&graph, &labels);
+            // Remove only the silent final Any receipt. Predicates before the
+            // delivery can change, and losing process 2's unlock can block them.
+            // Prefix certification must retain this crash counterexample.
+            let keep = graph
+                .all_events()
+                .into_iter()
+                .filter(|&event| event != last)
+                .collect();
+            let prefix = graph.restrict(&keep);
+            compare_selective_closures(&prefix, &labels);
+            assert!(!prove_selective_receive_tail(&prefix, &labels).unwrap());
             let view = View::build(&graph, &labels, true).unwrap();
-            let solver = SelectiveCuts::new(&view);
+            let mut workspace = SelectiveWorkspace::default();
+            let solver = SelectiveCuts::new(&view, &mut workspace);
             let seed = view.rows[0]
                 .iter()
                 .copied()
@@ -1907,7 +2273,8 @@ mod tests {
         );
         graph.set_rf(receive, Some(accepted));
         let view = View::build(&graph, &[], true).unwrap();
-        let solver = SelectiveCuts::new(&view);
+        let mut workspace = SelectiveWorkspace::default();
+        let solver = SelectiveCuts::new(&view, &mut workspace);
         for _ in 0..3 {
             for faulty in std::iter::once(None).chain((0..NODES).map(Some)) {
                 for seed in 0..view.steps.len() {
@@ -2492,6 +2859,8 @@ mod tests {
             .is_none());
         let ordinary_key = workspace.key.clone();
         assert!(!prove_tail_cached(&mut workspace, &graph, &labels, &pending, false).unwrap());
+        // Leaving these messages blocked cannot hide the missing delivery.
+        assert!(!prove_selective_receive_tail(&graph, &labels).unwrap());
         assert_ne!(ordinary_key, workspace.key);
         assert_eq!(workspace.pass_cache.hits, 0);
         assert_eq!(workspace.pass_cache.certificates, 1);
@@ -2525,5 +2894,36 @@ mod tests {
         let mut read = pending;
         read[1].push(must::EventId::new(0, 0));
         assert!(prove_tail_cached(&mut workspace, &prefix, &labels, &read, false).is_err());
+    }
+    #[test]
+    fn selective_tail_prefix_proof_covers_each_silent_terminal_order() {
+        let (full, labels) = flood_with_receive_tail();
+        let caps = [3, 4, 3];
+        let keep = full
+            .all_events()
+            .into_iter()
+            .filter(|event| event.idx < caps[event.tid])
+            .collect();
+        let prefix = full.restrict(&keep);
+        let pending = pending_by_destination(&prefix);
+        assert!(prove_selective_receive_tail(&prefix, &labels).unwrap());
+        compare_selective_closures(&prefix, &labels);
+        for reverse in [false, true] {
+            let mut completed = prefix.clone();
+            for (destination, sends) in pending.iter().enumerate() {
+                let mut sends = sends.clone();
+                if reverse {
+                    sends.reverse();
+                }
+                for send in sends {
+                    let value = completed.label(send).val().unwrap();
+                    let receive =
+                        completed.add_event(destination, must::Label::recv(must::Pred::eq(value)));
+                    completed.set_rf(receive, Some(send));
+                }
+            }
+            compare_selective_closures(&completed, &labels);
+            assert!(analyze_graph(&completed, &labels).unwrap().is_none());
+        }
     }
 }

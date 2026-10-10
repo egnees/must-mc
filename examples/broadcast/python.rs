@@ -175,14 +175,14 @@ impl Process for Adapter {
         };
         let diagnostics = self.diagnostics.clone();
         Some(Arc::new(move |payload| {
-            let Some((_, kind, data)) = decode_parts(payload) else {
+            let Some((sender, kind, data)) = decode_parts(payload) else {
                 diagnostics.record(Diagnostic {
                     status: "error",
                     message: "invalid Python message envelope in receive predicate".into(),
                 });
                 return false;
             };
-            match snapshot.matches_parts(kind, data) {
+            match snapshot.matches_parts_from(kind, data, sender) {
                 Ok(accepted) => accepted,
                 Err(error) => {
                     diagnostics.record(diagnostic(error));
@@ -328,6 +328,34 @@ mod tests {
             .expect("predicate errors must not disappear as filtering");
         assert_eq!(error.status, "error");
         assert!(error.message.contains("broken receive predicate"));
+    }
+
+    #[test]
+    fn repeated_python_state_does_not_hide_a_message_producing_cycle() {
+        for semantic_state_cache in [false, true] {
+            let module = PythonModule::new(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/examples/broadcast/fixtures/cyclic.py"
+                ),
+                "BroadcastProcess",
+                must_python::PythonOptions {
+                    semantic_state_cache,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let diagnostics = Diagnostics::default();
+            let error = crate::tests::concurrent::run(factory(module.clone(), diagnostics.clone()))
+                .expect_err("each repeated transition must emit another send");
+            assert!(error.contains("attempted send 25, budget 24"), "{error}");
+            assert!(diagnostics.get().is_none());
+            if semantic_state_cache {
+                let stats = module.cache_stats().unwrap();
+                assert!(stats.semantic_merges > 0);
+                assert!(stats.transition_hits > 0);
+            }
+        }
     }
 }
 

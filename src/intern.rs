@@ -35,6 +35,7 @@ pub struct Sym(u32);
 struct Global {
     fwd: HashMap<&'static str, u32>,
     strs: Vec<&'static str>,
+    fingerprints: Vec<u64>,
 }
 
 static GLOBAL: OnceLock<Mutex<Global>> = OnceLock::new();
@@ -44,6 +45,7 @@ fn global() -> &'static Mutex<Global> {
         Mutex::new(Global {
             fwd: HashMap::new(),
             strs: Vec::new(),
+            fingerprints: Vec::new(),
         })
     })
 }
@@ -58,6 +60,7 @@ thread_local! {
 struct Local {
     fwd: HashMap<String, Sym>,
     strs: Vec<&'static str>,
+    fingerprints: Vec<u64>,
 }
 
 /// Intern `s`, returning its stable [`Sym`]. Thread-local on the warm path (no lock, no
@@ -77,6 +80,7 @@ pub fn intern(s: &str) -> Sym {
                     let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
                     let id = g.strs.len() as u32;
                     g.strs.push(leaked);
+                    g.fingerprints.push(content_fingerprint(leaked));
                     g.fwd.insert(leaked, id);
                     Sym(id)
                 }
@@ -85,7 +89,7 @@ pub fn intern(s: &str) -> Sym {
         let mut l = l.borrow_mut();
         l.fwd.insert(s.to_owned(), sym);
         if l.strs.len() <= sym.0 as usize {
-            refresh_strs(&mut l.strs);
+            refresh(&mut l);
         }
         sym
     })
@@ -98,18 +102,40 @@ pub fn resolve(sym: Sym) -> &'static str {
             return s;
         }
         let mut l = l.borrow_mut();
-        refresh_strs(&mut l.strs);
+        refresh(&mut l);
         l.strs[sym.0 as usize]
     })
 }
 
-/// Extend a thread-local `strs` cache to match the global table (append-only, so we only
-/// copy the new tail).
-fn refresh_strs(local: &mut Vec<&'static str>) {
+/// Extend both thread-local arrays to match the append-only global table.
+fn refresh(local: &mut Local) {
     let g = global().lock().unwrap();
-    if local.len() < g.strs.len() {
-        local.extend_from_slice(&g.strs[local.len()..]);
+    if local.strs.len() < g.strs.len() {
+        let old_len = local.strs.len();
+        local.strs.extend_from_slice(&g.strs[old_len..]);
+        local
+            .fingerprints
+            .extend_from_slice(&g.fingerprints[old_len..]);
     }
+}
+
+fn content_fingerprint(value: &str) -> u64 {
+    value.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+/// Deterministic payload hash for bounded memo lookup, never an equality or
+/// ordering key. Callers must compare the actual symbols after a hash match.
+pub(crate) fn fingerprint(sym: Sym) -> u64 {
+    LOCAL.with(|local| {
+        if let Some(&hash) = local.borrow().fingerprints.get(sym.0 as usize) {
+            return hash;
+        }
+        let mut local = local.borrow_mut();
+        refresh(&mut local);
+        local.fingerprints[sym.0 as usize]
+    })
 }
 
 impl From<&str> for Sym {
@@ -133,6 +159,23 @@ impl From<&String> for Sym {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprints_match_payload_bytes_across_thread_local_refreshes() {
+        let first = intern("fingerprint:α\0payload");
+        assert_eq!(fingerprint(first), content_fingerprint(resolve(first)));
+        let (second, expected) = std::thread::spawn(move || {
+            // A worker can receive an existing symbol before interning it.
+            assert_eq!(fingerprint(first), content_fingerprint(resolve(first)));
+            let second = intern("fingerprint:new payload");
+            assert_eq!(fingerprint(second), content_fingerprint(resolve(second)));
+            (second, fingerprint(second))
+        })
+        .join()
+        .unwrap();
+        assert_eq!(fingerprint(second), expected);
+        assert_eq!(fingerprint(second), content_fingerprint(resolve(second)));
+    }
 
     #[test]
     fn same_string_same_sym_roundtrips() {

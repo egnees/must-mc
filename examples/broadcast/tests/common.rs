@@ -3,6 +3,18 @@ use std::sync::OnceLock;
 use crate::proc::{Factory, Output, Outputs, Process};
 
 static THREADS: OnceLock<usize> = OnceLock::new();
+static RECEIVE_TAIL: OnceLock<bool> = OnceLock::new();
+static SEND_FIRST: OnceLock<bool> = OnceLock::new();
+
+pub fn configure_send_first(enabled: bool) {
+    SEND_FIRST.set(enabled).expect("configure send-first once");
+}
+
+pub fn configure_receive_tail(enabled: bool) {
+    RECEIVE_TAIL
+        .set(enabled)
+        .expect("configure receive-tail once");
+}
 
 pub fn configure(threads: usize) {
     THREADS
@@ -111,6 +123,7 @@ impl must::Observer for FirstFailure {
             certificate.graph(),
             certificate.labels(),
             certificate.pending_sends(),
+            certificate.drains_mailboxes() && !certificate.has_selective_receives(),
         )
     }
 
@@ -153,15 +166,18 @@ pub(super) fn run(make_system: impl Fn() -> must::System + Sync) -> Result<usize
         must::EventCountingObserver::with_shards(threads()).with_buffered_events(),
         FirstFailure::default(),
     );
-    must::explore(
-        make_system,
-        &observer,
-        must::Config::default()
-            .with_threads(threads())
-            .with_max_sends(SEND_BUDGET)
-            .with_stop_on_terminal_error()
-            .with_receive_tail(must::explorer::receive_tail::ReceiveTailBudget::default()),
-    );
+    let mut config = must::Config::default()
+        .with_threads(threads())
+        .with_max_sends(SEND_BUDGET)
+        .with_stop_on_terminal_error();
+    if SEND_FIRST.get().copied().unwrap_or(false) {
+        config = config.with_send_first();
+    }
+    if RECEIVE_TAIL.get().copied().unwrap_or(true) {
+        config =
+            config.with_receive_tail(must::explorer::receive_tail::ReceiveTailBudget::default());
+    }
+    must::explore(make_system, &observer, config);
     if let Some(error) = observer.1.trace.into_inner() {
         return Err(error);
     }

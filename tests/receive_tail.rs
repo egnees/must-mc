@@ -10,6 +10,8 @@ use must::{
 struct TailObserver {
     labels: Mutex<Vec<Vec<TraceLabel>>>,
     proofs: Mutex<Vec<(usize, usize)>>,
+    drains: Mutex<Vec<bool>>,
+    selective: Mutex<Vec<bool>>,
 }
 
 impl Observer for TailObserver {
@@ -28,6 +30,14 @@ impl Observer for TailObserver {
     }
 
     fn on_receive_tail_pruned(&self, certificate: &ReceiveTailCertificate<'_>) {
+        self.selective
+            .lock()
+            .unwrap()
+            .push(certificate.has_selective_receives());
+        self.drains
+            .lock()
+            .unwrap()
+            .push(certificate.drains_mailboxes());
         self.proofs.lock().unwrap().push((
             certificate.pending_sends().iter().map(Vec::len).sum(),
             certificate.states_checked(),
@@ -254,4 +264,119 @@ fn fifo_and_timed_modes_do_not_use_asyn_tail_proofs() {
         assert_eq!(observer.0.receive_tails(), 0);
         assert!(observer.0.full() > 0);
     }
+}
+
+#[test]
+fn selective_tail_follows_matching_inputs_and_can_leave_rejected_duplicates() {
+    for accept_all in [false, true] {
+        let observer = (EventCountingObserver::new(), TailObserver::default());
+        explore(
+            || {
+                let mut system = System::new();
+                system.add(|ctx| async move {
+                    ctx.send(1, "a", Model::Asyn);
+                    ctx.send(1, "b", Model::Asyn);
+                    ctx.send(1, "duplicate", Model::Asyn);
+                });
+                system.add(move |ctx| async move {
+                    loop {
+                        ctx.recv(move |value| accept_all || value != "duplicate")
+                            .await;
+                    }
+                });
+                system
+            },
+            &observer,
+            enabled(1),
+        );
+        assert_eq!(observer.0.receive_tails(), 1);
+        assert_eq!(observer.0.errors(), 0);
+        assert_eq!(observer.0.terminal(), 0);
+        assert_eq!(&*observer.1.drains.lock().unwrap(), &[accept_all]);
+        assert_eq!(&*observer.1.selective.lock().unwrap(), &[true]);
+    }
+}
+
+#[test]
+fn finished_receivers_with_residual_mail_report_non_draining_certificates() {
+    for receipts in [0, 1] {
+        let observer = (EventCountingObserver::new(), TailObserver::default());
+        explore(
+            || {
+                let mut system = System::new();
+                system.add(|ctx| async move {
+                    ctx.send(1, "a", Model::Asyn);
+                    ctx.send(1, "b", Model::Asyn);
+                    ctx.send(1, "c", Model::Asyn);
+                    // Keep an addable receive even if process 1 starts Finished;
+                    // an entirely terminal graph needs no tail certificate.
+                    ctx.send(2, "live", Model::Asyn);
+                });
+                system.add(move |ctx| async move {
+                    for _ in 0..receipts {
+                        ctx.recv_any().await;
+                    }
+                });
+                system.add(|ctx| async move {
+                    ctx.recv_any().await;
+                });
+                system
+            },
+            &observer,
+            enabled(1),
+        );
+        assert_eq!(observer.0.receive_tails(), 1);
+        assert_eq!(observer.0.errors(), 0);
+        assert_eq!(&*observer.1.drains.lock().unwrap(), &[false]);
+        assert_eq!(&*observer.1.selective.lock().unwrap(), &[false]);
+        assert_eq!(observer.1.proofs.lock().unwrap()[0].0, 4);
+    }
+}
+
+#[test]
+fn changing_selective_predicate_does_not_hide_a_late_failure() {
+    fn program() -> System {
+        let mut system = System::new();
+        system.add(|ctx| async move {
+            ctx.send(1, "a", Model::Asyn);
+            ctx.send(1, "b", Model::Asyn);
+            ctx.send(1, "rejected", Model::Asyn);
+        });
+        system.add(|ctx| async move {
+            ctx.recv(|value| value == "a").await;
+            ctx.recv(|value| value == "b").await;
+            ctx.assert_that(false, "predicate changes must be replayed");
+        });
+        system
+    }
+    let plain = EventCountingObserver::new();
+    explore(program, &plain, Config::default());
+    let optimized = (EventCountingObserver::new(), TailObserver::default());
+    explore(program, &optimized, enabled(1));
+    assert_eq!(plain.errors(), 1);
+    assert_eq!(optimized.0.errors(), plain.errors());
+    assert_eq!(optimized.0.receive_tails(), 0);
+}
+
+#[test]
+fn future_selective_predicate_is_reported_even_when_every_mailbox_drains() {
+    let observer = (EventCountingObserver::new(), TailObserver::default());
+    explore(
+        || {
+            let mut system = System::new();
+            system.add(|ctx| async move {
+                ctx.send(1, "a", Model::Asyn);
+                ctx.send(1, "b", Model::Asyn);
+            });
+            system.add(|ctx| async move {
+                ctx.recv_any().await;
+                ctx.recv(|value| value == "a" || value == "b").await;
+            });
+            system
+        },
+        &observer,
+        enabled(1),
+    );
+    assert_eq!(&*observer.1.drains.lock().unwrap(), &[true]);
+    assert_eq!(&*observer.1.selective.lock().unwrap(), &[true]);
 }
