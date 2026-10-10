@@ -281,12 +281,15 @@ impl<P: Program> CachedProgram<P> {
         if enabled {
             system.prepare_exploration();
         }
+        // `try_update` replaces this in Rust 1.99, but our MSRV is 1.85.
+        #[allow(deprecated)]
+        let owner = CACHE_OWNERS
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .ok();
         Self {
             system,
             enabled,
-            owner: CACHE_OWNERS
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-                .ok(),
+            owner,
             cache: RefCell::new(ReplayCache {
                 roots: Vec::new(),
                 recent: RefCell::new(Vec::new()),
