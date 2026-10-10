@@ -328,13 +328,16 @@ fn check_program(case: usize, prog: &SeqProgram) -> ProgCheck {
     let mut ref_terminal: Option<BTreeSet<String>> = None;
     let mut ref_counts: Option<(usize, usize)> = None;
 
-    for perm in permutations(n) {
+    for (perm, send_first) in permutations(n)
+        .into_iter()
+        .flat_map(|perm| [false, true].map(move |policy| (perm.clone(), policy)))
+    {
         let col = ExecutionCollector::new();
-        explore(
-            || prog.clone(),
-            &col,
-            Config::default().with_priorities(perm.clone()),
-        );
+        let mut config = Config::default().with_priorities(perm.clone());
+        if send_first {
+            config = config.with_send_first();
+        }
+        explore(|| prog.clone(), &col, config);
 
         has_bottom_read |= any_bottom_read(&col);
 
@@ -346,13 +349,13 @@ fn check_program(case: usize, prog: &SeqProgram) -> ProgCheck {
         if let Some((bf_full, bf_term)) = &reference {
             assert_eq!(
                 &full_keys, bf_full,
-                "case {case} perm {perm:?}: full executions disagree with brute force\n\
+                "case {case} perm {perm:?} send_first={send_first}: full executions disagree with brute force\n\
                  program: {:#?}",
                 prog.threads
             );
             assert_eq!(
                 &terminal_set, bf_term,
-                "case {case} perm {perm:?}: terminal (full∪blocked) set disagrees with brute force\n\
+                "case {case} perm {perm:?} send_first={send_first}: terminal (full∪blocked) set disagrees with brute force\n\
                  program: {:#?}",
                 prog.threads
             );
@@ -362,7 +365,7 @@ fn check_program(case: usize, prog: &SeqProgram) -> ProgCheck {
         assert_eq!(
             terminal.len(),
             terminal_set.len(),
-            "case {case} perm {perm:?}: duplicate terminal graphs\nprogram: {:#?}",
+            "case {case} perm {perm:?} send_first={send_first}: duplicate terminal graphs\nprogram: {:#?}",
             prog.threads
         );
 
@@ -375,14 +378,14 @@ fn check_program(case: usize, prog: &SeqProgram) -> ProgCheck {
             (Some(rt), Some(rc)) => {
                 assert_eq!(
                     &terminal_set, rt,
-                    "case {case} perm {perm:?}: terminal key set differs between permutations\n\
+                    "case {case} perm {perm:?} send_first={send_first}: terminal key set differs between permutations\n\
                      program: {:#?}",
                     prog.threads
                 );
                 assert_eq!(
                     (col.full_count(), col.blocked_count()),
                     *rc,
-                    "case {case} perm {perm:?}: counts differ between permutations\n\
+                    "case {case} perm {perm:?} send_first={send_first}: counts differ between permutations\n\
                      program: {:#?}",
                     prog.threads
                 );

@@ -25,7 +25,7 @@ use crate::graph::ExecutionGraph;
 use crate::observer::Observer;
 use crate::program::replay_cache::CachedProgram;
 use crate::program::{Program, ProgramCursor, ThreadNext};
-use crate::scheduler::{pick_with_read_marks, pooled_traces_of, traces_of, NextStep};
+use crate::scheduler::{pick_with_read_marks_policy, pooled_traces_of, traces_of, NextStep};
 
 use parallel::Spawner;
 
@@ -359,6 +359,10 @@ impl Default for CertifiedTimeConfig {
 pub struct Config {
     /// Thread priority permutation for `next_P`. `None` = the default `0..N`.
     pub priorities: Option<Vec<Tid>>,
+    /// Prefer ready sends over other addable events, preserving priorities within
+    /// each class. Untimed only; defaults to false. Changes construction order,
+    /// never GetConsTiebreaker or forward/backward source enumeration (§4.3).
+    pub send_first: bool,
     /// Stable total source order for untimed canonical completion. Incompatible with T2.
     pub source_order: SourceOrder,
     /// Stop the whole exploration at the first `error` event (line 5 of Algorithm 1
@@ -536,6 +540,7 @@ impl Default for Config {
         Config {
             priorities: None,
             source_order: SourceOrder::default(),
+            send_first: false,
             stop_on_error: true,
             stop_on_terminal_error: false,
             max_executions: None,
@@ -557,6 +562,11 @@ impl Config {
     /// Run under an explicit priority permutation.
     pub fn with_priorities(mut self, priorities: Vec<Tid>) -> Self {
         self.priorities = Some(priorities);
+        self
+    }
+    /// Prefer ready sends in untimed exploration; reject timed regimes and labels.
+    pub fn with_send_first(mut self) -> Self {
+        self.send_first = true;
         self
     }
     /// Set the total source order without filtering any untimed-consistent candidates.
@@ -758,6 +768,17 @@ where
          with_time_predicate()"
     );
 
+    assert!(
+        !config.send_first
+            || !(config.time_filter
+                || config.time_zombie
+                || config.time_predicate
+                || config.mailbox_time
+                || config.time_canon_free
+                || config.certified_time.is_some()),
+        "send-first scheduling requires untimed exploration",
+    );
+
     if config.threads > 1 {
         parallel::explore_parallel(make_program, observer, config);
         return;
@@ -788,6 +809,7 @@ where
         buffered_events_added: 0,
         priorities,
         source_order: config.source_order,
+        send_first: config.send_first,
         stop_on_error: config.stop_on_error,
         stop_on_terminal_error: config.stop_on_terminal_error,
         max_executions: config.max_executions,
@@ -883,6 +905,7 @@ pub(crate) struct Explorer<'a, P: Program, O: Observer> {
     /// Immutable per-worker limits; proof checks carry no shared ownership state.
     certified_time: Option<CertifiedTimeConfig>,
     source_order: SourceOrder,
+    send_first: bool,
     /// One timing-result cache per worker; immutable anchors are derived afresh from
     /// each graph, including after donated tasks and backward cuts.
     frozen_cache: frozen::FrozenCache,
@@ -1009,6 +1032,12 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             "threaded RF marks/counters drifted from the committed graph"
         );
         for next in nexts.iter().filter_map(ThreadNext::label) {
+            if self.send_first {
+                assert!(
+                    !next.is_timed_recv() && next.window().is_none_or(|window| window.is_untimed()),
+                    "send-first scheduling requires untimed labels"
+                );
+            }
             if self.mailbox_time {
                 assert!(
                     !matches!(
@@ -1046,7 +1075,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
         }
         // The des bit: both the predicate (T-DES) and the zombie regime run under the DES
         // insertion order; zombie changes nothing else about the walk.
-        match pick_with_read_marks(
+        match pick_with_read_marks_policy(
             g,
             nexts,
             &self.priorities,
@@ -1054,6 +1083,7 @@ impl<P: Program, O: Observer> Explorer<'_, P, O> {
             self.mailbox_time,
             read,
             Some(&read.unread),
+            self.send_first,
         ) {
             // line 4: next_P(G) = nothing - a terminal execution.
             NextStep::Terminal { blocked } => {

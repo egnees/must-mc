@@ -203,6 +203,37 @@ pub(crate) fn pick_with_read_marks(
     pick_with_optional_read(g, nexts, priorities, des, mailbox_time, Some(read), unread)
 }
 
+/// Optional untimed construction order. Every ready send is addable, so this
+/// satisfies §4.3 (i)–(iii) without changing source enumeration or canonicity.
+/// A second scan is needed only when no send is ready; neither scan allocates.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pick_with_read_marks_policy(
+    g: &ExecutionGraph,
+    nexts: &[ThreadNext],
+    priorities: &[Tid],
+    des: bool,
+    mailbox_time: bool,
+    read: &crate::graph::Marks,
+    unread: Option<&[usize]>,
+    send_first: bool,
+) -> NextStep {
+    if send_first {
+        assert!(
+            !des && !mailbox_time,
+            "send-first scheduling requires untimed semantics"
+        );
+        for &tid in priorities {
+            if let ThreadNext::Next(label @ Label::Send { .. }) = &nexts[tid] {
+                return NextStep::Event {
+                    tid,
+                    label: label.clone(),
+                };
+            }
+        }
+    }
+    pick_with_read_marks(g, nexts, priorities, des, mailbox_time, read, unread)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pick_with_optional_read(
     g: &ExecutionGraph,
@@ -433,6 +464,55 @@ mod tests {
 
     fn send(dst: Tid, v: &str) -> Label {
         Label::send(Model::P2p, dst, v)
+    }
+
+    #[test]
+    fn send_first_prefers_ready_sends_and_preserves_fallback() {
+        let mut graph = ExecutionGraph::new();
+        graph.add_event(2, Label::send(Model::Asyn, 0, "available"));
+        let read = crate::graph::PooledMarks::take();
+        let nexts = vec![
+            ThreadNext::Next(Label::recv(Pred::any())),
+            ThreadNext::Next(Label::send(Model::Asyn, 0, "lower-priority")),
+            ThreadNext::Next(Label::send(Model::Asyn, 0, "last")),
+        ];
+        let pick = |nexts: &[ThreadNext], enabled| {
+            pick_with_read_marks_policy(
+                &graph,
+                nexts,
+                &[0, 1, 2],
+                false,
+                false,
+                &read,
+                None,
+                enabled,
+            )
+        };
+        assert!(matches!(
+            pick(&nexts, false),
+            NextStep::Event { tid: 0, .. }
+        ));
+        assert!(matches!(pick(&nexts, true), NextStep::Event { tid: 1, .. }));
+        for label in [
+            Label::recv_nb(Pred::any()),
+            Label::nondet(["a", "b"]),
+            Label::error("error"),
+        ] {
+            let nexts = [
+                ThreadNext::Next(Label::recv(Pred::eq("missing"))),
+                ThreadNext::Next(label),
+                ThreadNext::Finished,
+            ];
+            assert!(matches!(pick(&nexts, true), NextStep::Event { tid: 1, .. }));
+        }
+        let blocked = [
+            ThreadNext::Next(Label::recv(Pred::eq("missing"))),
+            ThreadNext::Finished,
+            ThreadNext::Finished,
+        ];
+        assert!(
+            matches!(pick(&blocked, true), NextStep::Terminal { blocked } if blocked == vec![0])
+        );
     }
 
     #[test]

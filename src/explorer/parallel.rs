@@ -176,6 +176,7 @@ where
             let mailbox_time = config.mailbox_time;
             let certified_time = config.certified_time;
             let source_order = config.source_order;
+            let send_first = config.send_first;
             let make_program = &make_program;
             scope.spawn(move || {
                 // Route this worker's tallies to its own shard of a shared observer.
@@ -205,6 +206,7 @@ where
                     time_zombie,
                     certified_time,
                     source_order,
+                    send_first,
                     frozen_cache: super::frozen::FrozenCache::default(),
                     viable_memo: crate::time::ViableMemo::new(),
                     terminal_count: 0,

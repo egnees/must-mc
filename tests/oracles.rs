@@ -28,6 +28,53 @@ use common::{
 use must::event::Model;
 use must::{explore, Config, ExecutionCollector, System};
 
+#[test]
+fn send_first_preserves_paper_counts_and_canonical_terminal_sets() {
+    for (name, program, expected) in [
+        ("s+s+r", ssr(), 2),
+        ("ns+r(8)", ns_r(8), 8),
+        ("ns+nr(5)", ns_nr(5), 120),
+        ("ns+nr-sel(8)", ns_nr_sel(8), 1),
+        ("nworkers(3)", nworkers(3), 12),
+        ("Example 2.8", example_2_8(), 1),
+    ] {
+        let baseline = ExecutionCollector::new();
+        explore(|| program.clone(), &baseline, Config::default());
+        for priorities in sample_perms(program.threads.len()) {
+            let selected = ExecutionCollector::new();
+            explore(
+                || program.clone(),
+                &selected,
+                Config::default()
+                    .with_priorities(priorities)
+                    .with_send_first(),
+            );
+            assert_eq!(selected.full_count(), expected, "{name}");
+            assert_eq!(selected.blocked_count(), 0, "{name}");
+            assert_eq!(selected.terminal_keys().len(), expected, "{name}");
+            let mut actual = selected.terminal_keys();
+            let mut reference = baseline.terminal_keys();
+            actual.sort();
+            reference.sort();
+            assert_eq!(actual, reference, "{name}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "paper's heavy ns+nr(8) oracle with send-first scheduling"]
+fn send_first_nsnr_8() {
+    let program = ns_nr(8);
+    let selected = ExecutionCollector::new();
+    explore(
+        || program.clone(),
+        &selected,
+        Config::default().with_send_first(),
+    );
+    assert_eq!(selected.full_count(), 40320);
+    assert_no_duplicates(&selected, "send-first ns+nr(8)");
+}
+
 // The oracle program builders (ssr, ns_r, ns_nr, ns_nr_sel, nworkers, example_2_8,
 // blocked_*) live in `tests/common/mod.rs` so the timed-filter tests can replay the same
 // table; this file only asserts the counts.
