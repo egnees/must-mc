@@ -967,7 +967,9 @@ fn receive_predicate_errors_and_queries_do_not_advance_history() {
         let mut process = module.create("[]").unwrap();
         assert!(process.on_start(None).unwrap().is_empty());
         let predicate = process.receive_predicate().unwrap().unwrap();
-        for value in 0..3 {
+        // Repeating the exact queries verifies failures never become cached
+        // successful answers in either the shared or thread-local cache.
+        for value in [0, 1, 2, 0, 1, 2] {
             let result = predicate.matches(&Message::new("DATA", format!("{{\"value\":{value}}}")));
             if expression == "True" {
                 assert!(result.unwrap());
@@ -1015,4 +1017,681 @@ class Solution(Process):
         ErrorKind::Execution
     );
     assert!(predicate.matches_parts("DATA", r#"{"value":7}"#).unwrap());
+}
+
+#[test]
+fn sender_predicate_cache_distinguishes_transport_source() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process
+class Solution(Process):
+    def on_start(self, ctx):
+        ctx.set_sender_predicate(lambda msg, sender: sender == '1' and msg.type == 'DATA')
+"#,
+    );
+    let module = fixture.module();
+    let mut process = module.create("[]").unwrap();
+    process.on_start(None).unwrap();
+    let predicate = process.receive_predicate().unwrap().unwrap();
+    for _ in 0..3 {
+        assert!(predicate.matches_parts_from("DATA", "{}", "1").unwrap());
+        assert!(!predicate.matches_parts_from("DATA", "{}", "2").unwrap());
+        assert!(!predicate.matches_parts_from("ACK", "{}", "1").unwrap());
+    }
+    assert_eq!(
+        predicate.matches_parts("DATA", "{}").unwrap_err().kind(),
+        ErrorKind::Execution
+    );
+}
+
+#[test]
+fn sender_predicate_typeerror_is_not_retried_as_message_only() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process
+class Solution(Process):
+    def on_start(self, ctx):
+        def broken(msg, sender):
+            raise TypeError('sender predicate broke')
+        ctx.set_sender_predicate(broken)
+"#,
+    );
+    let module = fixture.module();
+    let mut process = module.create("[]").unwrap();
+    process.on_start(None).unwrap();
+    let error = process
+        .receive_predicate()
+        .unwrap()
+        .unwrap()
+        .matches_parts_from("DATA", "{}", "1")
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Execution);
+    assert!(error.to_string().contains("sender predicate broke"));
+}
+
+#[test]
+fn audited_state_cycles_repeat_actions_and_keep_short_representatives() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process, Message
+__must_state_cache__ = 'pure-value-v1'
+class Solution(Process):
+    def __init__(self):
+        self.bit = False
+    def on_local_message(self, msg, ctx):
+        self.bit = not self.bit
+        ctx.send_local(Message('DELIVER', {'text': str(self.bit)}))
+"#,
+    );
+    let module = fixture.options(PythonOptions {
+        max_states: 2,
+        ..PythonOptions::default()
+    });
+    let mut process = module.create("[]").unwrap();
+    for turn in 0..100 {
+        assert_eq!(
+            text(
+                &process
+                    .on_local_message(&Message::new("X", "{}"), None)
+                    .unwrap()
+            ),
+            if turn % 2 == 0 { "True" } else { "False" }
+        );
+    }
+    let stats = module.cache_stats().unwrap();
+    assert_eq!(stats.states, 2);
+    assert_eq!(stats.transition_misses, 2);
+    assert_eq!(stats.semantic_merges, 1);
+    assert_eq!(stats.transition_hits, 98);
+    // A new input misses after the cycle and must replay the constructor, not
+    // follow a cyclic import history or suppress another emitted action.
+    assert_eq!(
+        text(
+            &process
+                .on_local_message(&Message::new("Y", "{}"), None)
+                .unwrap()
+        ),
+        "True"
+    );
+}
+
+#[test]
+fn audited_state_merges_commuting_receives_with_bound_sender_predicate() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process, Message
+from collections import defaultdict
+__must_state_cache__ = 'pure-value-v1'
+class Solution(Process):
+    def __init__(self):
+        self.seen = defaultdict(set)
+    def accept(self, msg, sender):
+        return sender not in self.seen.get(msg['text'], ())
+    def on_message(self, msg, sender, ctx):
+        self.seen[msg['text']].add(sender)
+        ctx.set_sender_predicate(self.accept)
+    def on_local_message(self, msg, ctx):
+        ctx.send_local(Message('DELIVER', {'text': str(len(self.seen['x']))}))
+"#,
+    );
+    let module = fixture.module();
+    let root = module.create("[]").unwrap();
+    let mut ab = root.clone();
+    let mut ba = root;
+    let msg = Message::new("X", r#"{"text":"x"}"#);
+    ab.on_message(&msg, "a", None).unwrap();
+    ab.on_message(&msg, "b", None).unwrap();
+    ba.on_message(&msg, "b", None).unwrap();
+    ba.on_message(&msg, "a", None).unwrap();
+    assert!(module.cache_stats().unwrap().semantic_merges >= 1);
+    for p in [&mut ab, &mut ba] {
+        assert!(p
+            .receive_predicate()
+            .unwrap()
+            .unwrap()
+            .matches_parts_from("X", r#"{"text":"fresh"}"#, "a")
+            .unwrap());
+        assert!(!p
+            .receive_predicate()
+            .unwrap()
+            .unwrap()
+            .matches_parts_from(&msg.kind, &msg.data, "a")
+            .unwrap());
+        assert!(p
+            .receive_predicate()
+            .unwrap()
+            .unwrap()
+            .matches_parts_from(&msg.kind, &msg.data, "c")
+            .unwrap());
+        assert_eq!(text(&p.on_local_message(&msg, None).unwrap()), "2");
+    }
+}
+
+#[test]
+fn audited_functions_with_private_globals_fall_back_without_merging_outputs() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process, Message
+__must_state_cache__ = 'pure-value-v1'
+class Solution(Process):
+    def __init__(self):
+        self.fn = None
+    def on_local_message(self, msg, ctx):
+        if msg.type == 'SET':
+            namespace = {'__name__': '_must_solution', 'value': msg['value']}
+            exec('def answer(): return value', namespace)
+            self.fn = namespace['answer']
+        else:
+            ctx.send_local(Message('DELIVER', {'text': self.fn()}))
+"#,
+    );
+    for semantic_state_cache in [false, true] {
+        let module = fixture.options(PythonOptions {
+            semantic_state_cache,
+            workers: 2,
+            ..Default::default()
+        });
+        let root = module.create("[]").unwrap();
+        let mut one = root.clone();
+        let mut two = root;
+        one.on_local_message(&Message::new("SET", r#"{"value":"one"}"#), None)
+            .unwrap();
+        two.on_local_message(&Message::new("SET", r#"{"value":"two"}"#), None)
+            .unwrap();
+        let query = Message::new("QUERY", "{}");
+        assert_eq!(text(&one.on_local_message(&query, None).unwrap()), "one");
+        assert_eq!(text(&two.on_local_message(&query, None).unwrap()), "two");
+        assert_eq!(module.cache_stats().unwrap().semantic_merges, 0);
+    }
+}
+
+#[test]
+fn audited_state_preserves_dictionary_order_and_alias_topology() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process, Message
+__must_state_cache__ = 'pure-value-v1'
+class Solution(Process):
+    def __init__(self):
+        self.values = {}
+        self.a = []
+        self.b = []
+    def on_message(self, msg, sender, ctx):
+        self.values[sender] = True
+    def on_local_message(self, msg, ctx):
+        if msg.type == 'ALIAS':
+            self.b = self.a
+        elif msg.type == 'WRITE':
+            self.a.append('x')
+        ctx.send_local(Message('DELIVER', {'text': ''.join(self.values) + '/' + ''.join(self.b)}))
+"#,
+    );
+    let module = fixture.module();
+    let root = module.create("[]").unwrap();
+    let mut ab = root.clone();
+    let mut ba = root.clone();
+    let msg = Message::new("X", "{}");
+    ab.on_message(&msg, "a", None).unwrap();
+    ab.on_message(&msg, "b", None).unwrap();
+    ba.on_message(&msg, "b", None).unwrap();
+    ba.on_message(&msg, "a", None).unwrap();
+    assert_eq!(text(&ab.on_local_message(&msg, None).unwrap()), "ab/");
+    assert_eq!(text(&ba.on_local_message(&msg, None).unwrap()), "ba/");
+    let mut aliased = root.clone();
+    let mut separate = root;
+    aliased
+        .on_local_message(&Message::new("ALIAS", "{}"), None)
+        .unwrap();
+    assert_eq!(
+        text(
+            &aliased
+                .on_local_message(&Message::new("WRITE", "{}"), None)
+                .unwrap()
+        ),
+        "/x"
+    );
+    assert_eq!(
+        text(
+            &separate
+                .on_local_message(&Message::new("WRITE", "{}"), None)
+                .unwrap()
+        ),
+        "/"
+    );
+}
+
+#[test]
+fn unsafe_python_keeps_history_cache_and_audited_unknown_objects_fall_back() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process, Message
+import random
+values = []
+class Solution(Process):
+    def __init__(self):
+        self.objects = []
+    def on_local_message(self, msg, ctx):
+        values.append(random.random())
+        self.objects.append(msg)
+        ctx.send_local(Message('DELIVER', {'text': str(len(values)) + '/' + str(len(set(self.objects)))}))
+"#,
+    );
+    let module = fixture.module();
+    let mut process = module.create("[]").unwrap();
+    let msg = Message::new("X", "{}");
+    assert_eq!(text(&process.on_local_message(&msg, None).unwrap()), "1/1");
+    assert_eq!(text(&process.on_local_message(&msg, None).unwrap()), "2/2");
+    assert_eq!(module.cache_stats().unwrap().semantic_merges, 0);
+    let unknown = Fixture::new(
+        r#"
+from anysystem import Process
+__must_state_cache__ = 'pure-value-v1'
+class Solution(Process):
+    def __init__(self):
+        self.value = object()
+    def on_message(self, msg, sender, ctx):
+        pass
+"#,
+    );
+    let module = unknown.module();
+    let mut process = module.create("[]").unwrap();
+    process.on_message(&msg, "a", None).unwrap();
+    process.on_message(&msg, "a", None).unwrap();
+    assert_eq!(module.cache_stats().unwrap().semantic_merges, 0);
+    assert_eq!(module.cache_stats().unwrap().states, 3);
+}
+
+#[test]
+fn semantic_cache_disabled_has_identical_outputs() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process, Message
+__must_state_cache__ = 'pure-value-v1'
+class Solution(Process):
+    def __init__(self):
+        self.value = 0
+    def on_local_message(self, msg, ctx):
+        self.value = (self.value + 1) % 3
+        ctx.send_local(Message('DELIVER', {'text': str(self.value)}))
+"#,
+    );
+    let enabled = fixture.module();
+    let disabled = fixture.options(PythonOptions {
+        semantic_state_cache: false,
+        ..PythonOptions::default()
+    });
+    let mut a = enabled.create("[]").unwrap();
+    let mut b = disabled.create("[]").unwrap();
+    for turn in 0..24 {
+        let msg = Message::new(if turn % 4 == 0 { "Y" } else { "X" }, "{}");
+        assert_eq!(
+            a.on_local_message(&msg, None).unwrap(),
+            b.on_local_message(&msg, None).unwrap()
+        );
+    }
+    assert!(enabled.cache_stats().unwrap().semantic_merges > 0);
+    assert_eq!(disabled.cache_stats().unwrap().semantic_merges, 0);
+}
+
+#[test]
+fn audited_helper_records_and_same_line_lambda_code_are_distinguished() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process
+__must_state_cache__ = 'pure-value-v1'
+class Record:
+    def __init__(self):
+        self.value = False
+class Solution(Process):
+    def __init__(self):
+        self.record = Record()
+    def on_local_message(self, msg, ctx):
+        self.record.value = not self.record.value
+        ctx.set_predicate((lambda msg: True) if msg.type == 'YES' else (lambda msg: False))
+"#,
+    );
+    let module = fixture.module();
+    let root = module.create("[]").unwrap();
+    let mut yes = root.clone();
+    let mut no = root;
+    let query = Message::new("X", "{}");
+    yes.on_local_message(&Message::new("YES", "{}"), None)
+        .unwrap();
+    no.on_local_message(&Message::new("NO", "{}"), None)
+        .unwrap();
+    assert!(yes
+        .receive_predicate()
+        .unwrap()
+        .unwrap()
+        .matches(&query)
+        .unwrap());
+    assert!(!no
+        .receive_predicate()
+        .unwrap()
+        .unwrap()
+        .matches(&query)
+        .unwrap());
+    yes.on_local_message(&Message::new("YES", "{}"), None)
+        .unwrap();
+    yes.on_local_message(&Message::new("YES", "{}"), None)
+        .unwrap();
+    assert!(module.cache_stats().unwrap().semantic_merges > 0);
+}
+
+#[test]
+fn audited_closure_cell_aliases_are_observable_and_preserved() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process, Message
+__must_state_cache__ = 'pure-value-v1'
+def pair():
+    counter = 0
+    def advance():
+        nonlocal counter
+        counter += 1
+    def read():
+        return counter
+    return advance, read
+class Solution(Process):
+    def __init__(self):
+        self.advance = None
+        self.read = None
+    def on_local_message(self, msg, ctx):
+        if msg.type == 'SHARED':
+            self.advance, self.read = pair()
+        elif msg.type == 'SEPARATE':
+            self.advance, _ = pair()
+            _, self.read = pair()
+        else:
+            self.advance()
+            ctx.send_local(Message('DELIVER', {'text': str(self.read())}))
+"#,
+    );
+    let module = fixture.module();
+    let root = module.create("[]").unwrap();
+    let mut shared = root.clone();
+    let mut separate = root;
+    shared
+        .on_local_message(&Message::new("SHARED", "{}"), None)
+        .unwrap();
+    separate
+        .on_local_message(&Message::new("SEPARATE", "{}"), None)
+        .unwrap();
+    let tick = Message::new("TICK", "{}");
+    assert_eq!(text(&shared.on_local_message(&tick, None).unwrap()), "1");
+    assert_eq!(text(&separate.on_local_message(&tick, None).unwrap()), "0");
+}
+
+#[test]
+fn audited_slotted_process_and_inherited_slotted_record_fall_back() {
+    for declaration in [
+        "class Solution(Process):\n    __slots__ = ('counter',)\n    def __init__(self):\n        self.counter = 0\n    def on_local_message(self, msg, ctx):\n        self.counter += 1\n        ctx.send_local(Message('DELIVER', {'text': str(self.counter)}))\n",
+        "class Base:\n    __slots__ = ('counter',)\nclass Record(Base):\n    pass\nclass Solution(Process):\n    def __init__(self):\n        self.record = Record()\n        self.record.counter = 0\n    def on_local_message(self, msg, ctx):\n        self.record.counter += 1\n        ctx.send_local(Message('DELIVER', {'text': str(self.record.counter)}))\n",
+    ] {
+        let fixture = Fixture::new(&format!(
+            "from anysystem import Process, Message\n__must_state_cache__ = 'pure-value-v1'\n{declaration}"
+        ));
+        let module = fixture.module();
+        let mut process = module.create("[]").unwrap();
+        let msg = Message::new("X", "{}");
+        for counter in 1..=4 {
+            assert_eq!(text(&process.on_local_message(&msg, None).unwrap()), counter.to_string());
+        }
+        assert_eq!(module.cache_stats().unwrap().semantic_merges, 0);
+        assert_eq!(module.cache_stats().unwrap().states, 5);
+    }
+}
+
+#[test]
+fn audited_nan_signs_remain_distinct() {
+    let fixture = Fixture::new(
+        r#"
+import math
+from anysystem import Process, Message
+__must_state_cache__ = 'pure-value-v1'
+class Solution(Process):
+    def __init__(self):
+        self.x = 0.0
+    def on_local_message(self, msg, ctx):
+        if msg.type == 'SET':
+            self.x = float(msg['value'])
+        else:
+            ctx.send_local(Message('DELIVER', {'text': str(math.copysign(1, self.x))}))
+"#,
+    );
+    let module = fixture.module();
+    let root = module.create("[]").unwrap();
+    let mut positive = root.clone();
+    let mut negative = root;
+    positive
+        .on_local_message(&Message::new("SET", r#"{"value":"nan"}"#), None)
+        .unwrap();
+    negative
+        .on_local_message(&Message::new("SET", r#"{"value":"-nan"}"#), None)
+        .unwrap();
+    let query = Message::new("QUERY", "{}");
+    assert_eq!(
+        text(&positive.on_local_message(&query, None).unwrap()),
+        "1.0"
+    );
+    assert_eq!(
+        text(&negative.on_local_message(&query, None).unwrap()),
+        "-1.0"
+    );
+}
+
+#[test]
+fn audited_local_record_classes_with_distinct_method_closures_fall_back() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process, Message
+__must_state_cache__ = 'pure-value-v1'
+def make_record(answer):
+    class Record:
+        def read(self):
+            return answer
+    return Record()
+class Solution(Process):
+    def __init__(self):
+        self.record = None
+    def on_local_message(self, msg, ctx):
+        if msg.type == 'SET':
+            self.record = make_record(msg['value'])
+        else:
+            ctx.send_local(Message('DELIVER', {'text': self.record.read()}))
+"#,
+    );
+    let module = fixture.module();
+    let root = module.create("[]").unwrap();
+    let mut first = root.clone();
+    let mut second = root;
+    first
+        .on_local_message(&Message::new("SET", r#"{"value":"first"}"#), None)
+        .unwrap();
+    second
+        .on_local_message(&Message::new("SET", r#"{"value":"second"}"#), None)
+        .unwrap();
+    let query = Message::new("QUERY", "{}");
+    assert_eq!(
+        text(&first.on_local_message(&query, None).unwrap()),
+        "first"
+    );
+    assert_eq!(
+        text(&second.on_local_message(&query, None).unwrap()),
+        "second"
+    );
+    assert_eq!(module.cache_stats().unwrap().semantic_merges, 0);
+}
+
+#[test]
+fn audited_nan_aliases_preserve_container_equality() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process, Message
+__must_state_cache__ = 'pure-value-v1'
+class Solution(Process):
+    def __init__(self):
+        self.a = self.b = 0.0
+    def on_local_message(self, msg, ctx):
+        if msg.type == 'SHARED':
+            self.a = self.b = float('nan')
+        elif msg.type == 'SEPARATE':
+            self.a = float('nan')
+            self.b = float('nan')
+        else:
+            ctx.send_local(Message('DELIVER', {'text': str([self.a] == [self.b])}))
+"#,
+    );
+    let module = fixture.module();
+    let root = module.create("[]").unwrap();
+    let mut shared = root.clone();
+    let mut separate = root;
+    shared
+        .on_local_message(&Message::new("SHARED", "{}"), None)
+        .unwrap();
+    separate
+        .on_local_message(&Message::new("SEPARATE", "{}"), None)
+        .unwrap();
+    let query = Message::new("QUERY", "{}");
+    assert_eq!(
+        text(&shared.on_local_message(&query, None).unwrap()),
+        "True"
+    );
+    assert_eq!(
+        text(&separate.on_local_message(&query, None).unwrap()),
+        "False"
+    );
+}
+
+#[test]
+fn audited_process_class_changes_fall_back() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process, Message
+__must_state_cache__ = 'pure-value-v1'
+class Solution(Process):
+    def on_local_message(self, msg, ctx):
+        if msg.type == 'SWITCH':
+            self.__class__ = Alternate
+        else:
+            ctx.send_local(Message('DELIVER', {'text': 'original'}))
+class Alternate(Process):
+    def on_local_message(self, msg, ctx):
+        ctx.send_local(Message('DELIVER', {'text': 'alternate'}))
+"#,
+    );
+    let module = fixture.module();
+    let mut process = module.create("[]").unwrap();
+    process
+        .on_local_message(&Message::new("SWITCH", "{}"), None)
+        .unwrap();
+    assert_eq!(
+        text(
+            &process
+                .on_local_message(&Message::new("QUERY", "{}"), None)
+                .unwrap()
+        ),
+        "alternate"
+    );
+    assert_eq!(module.cache_stats().unwrap().semantic_merges, 0);
+}
+
+#[test]
+#[ignore = "warm shared Python receive-predicate contention benchmark"]
+fn warmed_predicate_cache_contention() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process
+class Solution(Process):
+    def on_start(self, ctx):
+        ctx.set_sender_predicate(lambda msg, sender: msg['value'] == 7 and sender == '0')
+"#,
+    );
+    let module = fixture.module();
+    let mut process = module.create("[]").unwrap();
+    process.on_start(None).unwrap();
+    let predicate = process.receive_predicate().unwrap().unwrap();
+    assert!(predicate
+        .matches_parts_from("DATA", r#"{"value":7}"#, "0")
+        .unwrap());
+    for threads in [1, 12] {
+        let barrier = std::sync::Barrier::new(threads);
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                let predicate = &predicate;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..250_000 {
+                        std::hint::black_box(
+                            predicate
+                                .matches_parts_from("DATA", r#"{"value":7}"#, "0")
+                                .unwrap(),
+                        );
+                    }
+                });
+            }
+        });
+        eprintln!(
+            "warmed predicates: threads={threads}, queries={}, elapsed={:?}",
+            threads * 250_000,
+            start.elapsed()
+        );
+    }
+}
+
+#[test]
+fn predicate_front_keeps_opposite_module_and_snapshot_answers_separate_across_threads() {
+    let fixture = Fixture::new(
+        r#"
+from anysystem import Process
+class Solution(Process):
+    def __init__(self, answer):
+        self.answer = answer
+    def on_start(self, ctx):
+        ctx.set_sender_predicate(lambda msg, sender: self.answer if sender == '0' else not self.answer)
+    def on_local_message(self, msg, ctx):
+        self.answer = not self.answer
+        ctx.set_sender_predicate(lambda msg, sender: self.answer if sender == '0' else not self.answer)
+"#,
+    );
+    let first_module = fixture.module();
+    let second_module = fixture.module();
+    let mut first = first_module.create("[true]").unwrap();
+    let mut second = second_module.create("[false]").unwrap();
+    first.on_start(None).unwrap();
+    second.on_start(None).unwrap();
+    let original = first.receive_predicate().unwrap().unwrap();
+    first
+        .on_local_message(&Message::new("FLIP", "{}"), None)
+        .unwrap();
+    let flipped = first.receive_predicate().unwrap().unwrap();
+    let opposite_module = second.receive_predicate().unwrap().unwrap();
+    std::thread::scope(|scope| {
+        for _ in 0..12 {
+            let (original, flipped, opposite_module) = (&original, &flipped, &opposite_module);
+            scope.spawn(move || {
+                for _ in 0..100 {
+                    for sender in ["0", "1"] {
+                        let expected = sender == "0";
+                        assert_eq!(
+                            original.matches_parts_from("DATA", "{}", sender).unwrap(),
+                            expected
+                        );
+                        assert_eq!(
+                            flipped.matches_parts_from("DATA", "{}", sender).unwrap(),
+                            !expected
+                        );
+                        assert_eq!(
+                            opposite_module
+                                .matches_parts_from("DATA", "{}", sender)
+                                .unwrap(),
+                            !expected
+                        );
+                    }
+                }
+            });
+        }
+    });
 }

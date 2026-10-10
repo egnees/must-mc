@@ -47,6 +47,22 @@ class Message:
         return Message(message_type, json.loads(json_str))
 
 
+class SenderPredicate:
+    """Explicit sender-aware filter; no callable arity guessing."""
+    def __init__(self, predicate):
+        self.predicate = predicate
+
+
+def _matches_predicate(predicate, msg, sender=None):
+    if predicate is None:
+        return True
+    if isinstance(predicate, SenderPredicate):
+        if not isinstance(sender, str):
+            raise TypeError("sender-aware receive predicate requires a string sender")
+        return predicate.predicate(msg, sender)
+    return predicate(msg)
+
+
 class Context:
     def __init__(self, time, predicate=None):
         self._predicate = predicate
@@ -84,6 +100,16 @@ class Context:
         if predicate is not None and not callable(predicate):
             raise TypeError("receive predicate must be callable or None")
         self._predicate = predicate
+
+    def set_sender_predicate(self, predicate):
+        """Set a pure (Message, transport sender) -> bool receive filter.
+
+        Sender is the actual transport source, independent of payload fields.
+        Rejected messages remain pending. None clears either kind of filter.
+        """
+        if predicate is not None and not callable(predicate):
+            raise TypeError("receive predicate must be callable or None")
+        self._predicate = None if predicate is None else SenderPredicate(predicate)
 
     def send(self, msg, to):
         if not isinstance(to, str):

@@ -14,12 +14,14 @@
 mod json;
 
 use json::{parse, quote, Json};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 const MAX_FRAME: usize = 8 * 1024 * 1024;
@@ -34,6 +36,10 @@ pub struct PythonOptions {
     pub seed: u64,
     /// Independent interpreters available for concurrent cache misses.
     pub workers: usize,
+    /// Intern value states only for explicitly audited pure-value-v1 modules.
+    /// Arbitrary Python keeps the deterministic history cache. This never prunes
+    /// executions: every repeated callback still returns its actions.
+    pub semantic_state_cache: bool,
 }
 
 impl Default for PythonOptions {
@@ -44,6 +50,7 @@ impl Default for PythonOptions {
             max_states: 100_000,
             seed: 0,
             workers: 1,
+            semantic_state_cache: true,
         }
     }
 }
@@ -141,13 +148,27 @@ struct ModuleInner {
     assignments: Mutex<Vec<(std::thread::ThreadId, usize)>>,
     cache: RwLock<Cache>,
     max_states: usize,
+    transition_hits: AtomicU64,
+    transition_misses: AtomicU64,
+    semantic_merges: AtomicU64,
 }
+
+/// Cache counters shared across the interpreter pool.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PythonCacheStats {
+    pub transition_hits: u64,
+    pub transition_misses: u64,
+    pub semantic_merges: u64,
+    pub states: usize,
+}
+
 type Transition = (usize, Arc<[Action]>);
 #[derive(Default)]
 struct Cache {
     constructors: BTreeMap<String, usize>,
     transitions: BTreeMap<usize, Vec<(Callback, Transition)>>,
     histories: Vec<History>,
+    semantic_states: BTreeMap<String, usize>,
 }
 struct History {
     parent: Option<usize>,
@@ -207,7 +228,19 @@ impl PythonModule {
                 assignments: Mutex::new(Vec::new()),
                 cache: RwLock::new(Cache::default()),
                 max_states: options.max_states,
+                transition_hits: AtomicU64::new(0),
+                transition_misses: AtomicU64::new(0),
+                semantic_merges: AtomicU64::new(0),
             }),
+        })
+    }
+
+    pub fn cache_stats(&self) -> Result<PythonCacheStats, Error> {
+        Ok(PythonCacheStats {
+            transition_hits: self.inner.transition_hits.load(Ordering::Relaxed),
+            transition_misses: self.inner.transition_misses.load(Ordering::Relaxed),
+            semantic_merges: self.inner.semantic_merges.load(Ordering::Relaxed),
+            states: self.read_cache()?.histories.len(),
         })
     }
 
@@ -251,6 +284,9 @@ impl PythonModule {
                 owner: worker.index,
                 encoded: format!("{{\"args\":{}}}", quote(args_json)).into(),
             });
+            if let Some(key) = semantic_key(&result)? {
+                cache.semantic_states.insert(key.to_owned(), state);
+            }
             cache.constructors.insert(args_json.to_owned(), state);
             state
         };
@@ -527,6 +563,10 @@ impl PythonProcess {
         let previous_state = self.state;
         let cached = self.module.read_cache()?.transition(previous_state, &event);
         if let Some((state, actions)) = cached {
+            self.module
+                .inner
+                .transition_hits
+                .fetch_add(1, Ordering::Relaxed);
             self.state = state;
             return Ok(actions);
         }
@@ -534,14 +574,21 @@ impl PythonProcess {
         {
             let cache = self.module.read_cache()?;
             if let Some((state, actions)) = cache.transition(previous_state, &event) {
+                self.module
+                    .inner
+                    .transition_hits
+                    .fetch_add(1, Ordering::Relaxed);
                 self.state = state;
                 return Ok(actions);
             }
-            cache.capacity(self.module.inner.max_states)?;
         }
         if let Some(message) = &event.message {
             parse(&message.data)?;
         }
+        self.module
+            .inner
+            .transition_misses
+            .fetch_add(1, Ordering::Relaxed);
         let owned = event.owned();
         let encoded = owned.encode()?;
         let (mut worker, result) = self.module.history_request(
@@ -568,40 +615,182 @@ impl PythonProcess {
             actions = cached_actions;
             state
         } else {
-            cache.capacity(self.module.inner.max_states)?;
-            let state = cache.histories.len();
-            cache.histories.push(History {
-                parent: Some(previous_state),
-                predicate: has_predicate.then(|| Arc::new(PredicateCache::default())),
-                owner: worker.index,
-                encoded: format!(
-                    "{{\"event\":{encoded},\"expected\":[{expected},{has_predicate}]}}"
-                )
-                .into(),
-            });
+            let key = semantic_key(&result)?;
+            let existing = key.and_then(|key| cache.semantic_states.get(key).copied());
+            let state = if let Some(state) = existing {
+                if cache.histories[state].predicate.is_some() != has_predicate {
+                    return Err(Error::new(
+                        ErrorKind::Execution,
+                        "invalid semantic predicate state",
+                    ));
+                }
+                self.module
+                    .inner
+                    .semantic_merges
+                    .fetch_add(1, Ordering::Relaxed);
+                state
+            } else {
+                cache.capacity(self.module.inner.max_states)?;
+                let state = cache.histories.len();
+                cache.histories.push(History {
+                    parent: Some(previous_state),
+                    predicate: has_predicate.then(|| Arc::new(PredicateCache::default())),
+                    owner: worker.index,
+                    encoded: format!(
+                        "{{\"event\":{encoded},\"expected\":[{expected},{has_predicate}]}}"
+                    )
+                    .into(),
+                });
+                if let Some(key) = key {
+                    cache.semantic_states.insert(key.to_owned(), state);
+                }
+                state
+            };
             cache.insert_transition(previous_state, owned, (state, actions.clone()));
             state
         };
-        worker.states.insert(state, local_state);
+        // Keep the first representative history when semantic interning returns
+        // an existing state (including self-loops). Import chains remain acyclic
+        // and cache misses replay the short representative, never a cyclic path.
+        worker.states.entry(state).or_insert(local_state);
         self.state = state;
         Ok(actions)
     }
 }
 
+type PredicateQuery = (Message, Option<String>);
+type PredicateResults = Vec<(PredicateQuery, bool)>;
+
+const PREDICATE_FRONT_SLOTS: usize = 128;
+const PREDICATE_FRONT_QUERIES: usize = 64;
+const PREDICATE_FRONT_BYTES: usize = 16 * 1024;
+
+#[derive(Default)]
+struct PredicateFrontEntry {
+    // A weak owner retains allocation metadata, preventing pointer reuse (ABA)
+    // without extending the lifetime of the shared cache's potentially large
+    // result vector. Comparing pointers never dereferences a dropped owner.
+    owner: Option<Weak<PredicateCache>>,
+    results: PredicateResults,
+    bytes: usize,
+}
+
+struct PredicateFront {
+    slots: [PredicateFrontEntry; PREDICATE_FRONT_SLOTS],
+}
+impl Default for PredicateFront {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| PredicateFrontEntry::default()),
+        }
+    }
+}
+
+fn predicate_query_index(
+    results: &PredicateResults,
+    kind: &str,
+    data: &str,
+    sender: Option<&str>,
+) -> Result<usize, usize> {
+    results.binary_search_by(|(message, _)| {
+        (
+            message.0.kind.as_str(),
+            message.0.data.as_str(),
+            message.1.as_deref(),
+        )
+            .cmp(&(kind, data, sender))
+    })
+}
+
+impl PredicateFront {
+    fn slot(owner: &Arc<PredicateCache>) -> usize {
+        let address = Arc::as_ptr(owner) as usize;
+        ((address >> 4) ^ (address >> 12)) % PREDICATE_FRONT_SLOTS
+    }
+
+    fn lookup(
+        &self,
+        owner: &Arc<PredicateCache>,
+        kind: &str,
+        data: &str,
+        sender: Option<&str>,
+    ) -> Option<bool> {
+        let entry = &self.slots[Self::slot(owner)];
+        if !entry
+            .owner
+            .as_ref()
+            .is_some_and(|stored| stored.as_ptr() == Arc::as_ptr(owner))
+        {
+            return None;
+        }
+        predicate_query_index(&entry.results, kind, data, sender)
+            .ok()
+            .map(|index| entry.results[index].1)
+    }
+
+    fn insert(
+        &mut self,
+        owner: &Arc<PredicateCache>,
+        kind: &str,
+        data: &str,
+        sender: Option<&str>,
+        accepted: bool,
+    ) {
+        // Large queries still use the exact shared cache, without duplicating
+        // their payloads into every exploration worker's front cache.
+        let bytes = kind
+            .len()
+            .saturating_add(data.len())
+            .saturating_add(sender.map_or(0, str::len));
+        if bytes > PREDICATE_FRONT_BYTES {
+            return;
+        }
+        let entry = &mut self.slots[Self::slot(owner)];
+        if !entry
+            .owner
+            .as_ref()
+            .is_some_and(|stored| stored.as_ptr() == Arc::as_ptr(owner))
+        {
+            entry.owner = Some(Arc::downgrade(owner));
+            entry.results.clear();
+            entry.bytes = 0;
+        }
+        let Err(mut index) = predicate_query_index(&entry.results, kind, data, sender) else {
+            return;
+        };
+        if entry.results.len() == PREDICATE_FRONT_QUERIES
+            || entry.bytes + bytes > PREDICATE_FRONT_BYTES
+        {
+            entry.results.clear();
+            entry.bytes = 0;
+            index = 0;
+        }
+        entry.results.insert(
+            index,
+            (
+                (Message::new(kind, data), sender.map(str::to_owned)),
+                accepted,
+            ),
+        );
+        entry.bytes += bytes;
+    }
+}
+
+thread_local! {
+    static PREDICATE_FRONT: RefCell<PredicateFront> = RefCell::new(PredicateFront::default());
+}
+
 #[derive(Default)]
 struct PredicateCache {
-    results: RwLock<Vec<(Message, bool)>>,
+    results: RwLock<PredicateResults>,
     miss: Mutex<()>,
 }
 impl PredicateCache {
-    fn lookup(&self, kind: &str, data: &str) -> Result<Option<bool>, Error> {
+    fn lookup(&self, kind: &str, data: &str, sender: Option<&str>) -> Result<Option<bool>, Error> {
         let results = self.results.read().map_err(|_| {
             Error::new(ErrorKind::Transport, "Python predicate cache lock poisoned")
         })?;
-        Ok(results
-            .binary_search_by(|(message, _)| {
-                (message.kind.as_str(), message.data.as_str()).cmp(&(kind, data))
-            })
+        Ok(predicate_query_index(&results, kind, data, sender)
             .ok()
             .map(|index| results[index].1))
     }
@@ -620,7 +809,42 @@ impl PythonReceivePredicate {
     }
 
     pub fn matches_parts(&self, kind: &str, data: &str) -> Result<bool, Error> {
-        if let Some(accepted) = self.cache.lookup(kind, data)? {
+        self.matches_parts_with_sender(kind, data, None)
+    }
+
+    pub fn matches_parts_from(&self, kind: &str, data: &str, sender: &str) -> Result<bool, Error> {
+        self.matches_parts_with_sender(kind, data, Some(sender))
+    }
+
+    fn matches_parts_with_sender(
+        &self,
+        kind: &str,
+        data: &str,
+        sender: Option<&str>,
+    ) -> Result<bool, Error> {
+        if let Some(accepted) =
+            PREDICATE_FRONT.with(|front| front.borrow().lookup(&self.cache, kind, data, sender))
+        {
+            return Ok(accepted);
+        }
+        // No TLS borrow crosses the shared locks or a Python worker request.
+        // Failed evaluations never enter either front-cache success path.
+        let accepted = self.matches_parts_shared(kind, data, sender)?;
+        PREDICATE_FRONT.with(|front| {
+            front
+                .borrow_mut()
+                .insert(&self.cache, kind, data, sender, accepted)
+        });
+        Ok(accepted)
+    }
+
+    fn matches_parts_shared(
+        &self,
+        kind: &str,
+        data: &str,
+        sender: Option<&str>,
+    ) -> Result<bool, Error> {
+        if let Some(accepted) = self.cache.lookup(kind, data, sender)? {
             return Ok(accepted);
         }
         let _miss = self.cache.miss.lock().map_err(|_| {
@@ -629,12 +853,17 @@ impl PythonReceivePredicate {
                 "Python predicate evaluation lock poisoned",
             )
         })?;
-        if let Some(accepted) = self.cache.lookup(kind, data)? {
+        if let Some(accepted) = self.cache.lookup(kind, data, sender)? {
             return Ok(accepted);
         }
         bounded(data)?;
         parse(data)?;
-        let extra = format!("\"kind\":{},\"data\":{}", quote(kind), quote(data));
+        let extra = format!(
+            "\"kind\":{},\"data\":{},\"sender\":{}",
+            quote(kind),
+            quote(data),
+            sender.map_or_else(|| "null".to_owned(), quote)
+        );
         let (_worker, result) = self.module.history_request(
             self.state,
             "predicate",
@@ -645,12 +874,14 @@ impl PythonReceivePredicate {
         let mut results = self.cache.results.write().map_err(|_| {
             Error::new(ErrorKind::Transport, "Python predicate cache lock poisoned")
         })?;
-        let index = results
-            .binary_search_by(|(message, _)| {
-                (message.kind.as_str(), message.data.as_str()).cmp(&(kind, data))
-            })
-            .unwrap_err();
-        results.insert(index, (Message::new(kind, data), accepted));
+        let index = predicate_query_index(&results, kind, data, sender).unwrap_err();
+        results.insert(
+            index,
+            (
+                (Message::new(kind, data), sender.map(str::to_owned)),
+                accepted,
+            ),
+        );
         Ok(accepted)
     }
 }
@@ -693,6 +924,13 @@ fn clock(time: Option<f64>) -> Result<String, Error> {
         )),
     }
 }
+fn semantic_key(result: &Json) -> Result<Option<&str>, Error> {
+    match result.field("semantic_key")? {
+        Json::Null => Ok(None),
+        value => value.string().map(Some),
+    }
+}
+
 fn state_id(result: &Json) -> Result<usize, Error> {
     result
         .field("state")?
@@ -777,6 +1015,7 @@ impl Worker {
             .arg(class_name)
             .arg(options.seed.to_string())
             .arg(include_str!("anysystem.py"))
+            .arg(options.semantic_state_cache.to_string())
             .env("PYTHONHASHSEED", (options.seed as u32).to_string())
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .stdin(Stdio::piped())
@@ -900,5 +1139,117 @@ impl Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod predicate_front_tests {
+    use super::*;
+
+    #[test]
+    fn predicate_front_compares_identity_sender_and_every_query_field() {
+        let first = Arc::new(PredicateCache::default());
+        let second = Arc::new(PredicateCache::default());
+        let mut front = PredicateFront::default();
+        front.insert(&first, "DATA", "{}", Some("0"), true);
+        assert_eq!(front.lookup(&first, "DATA", "{}", Some("0")), Some(true));
+        assert_eq!(front.lookup(&second, "DATA", "{}", Some("0")), None);
+        assert_eq!(front.lookup(&first, "ACK", "{}", Some("0")), None);
+        assert_eq!(front.lookup(&first, "DATA", "[]", Some("0")), None);
+        assert_eq!(front.lookup(&first, "DATA", "{}", Some("1")), None);
+        assert_eq!(front.lookup(&first, "DATA", "{}", None), None);
+        front.insert(&first, "DATA", "{}", Some("1"), false);
+        front.insert(&first, "DATA", "{}", None, false);
+        assert_eq!(front.lookup(&first, "DATA", "{}", Some("1")), Some(false));
+        assert_eq!(front.lookup(&first, "DATA", "{}", None), Some(false));
+    }
+
+    #[test]
+    fn predicate_front_bounds_queries_bytes_and_replaces_colliding_owners() {
+        let first = Arc::new(PredicateCache::default());
+        let mut front = PredicateFront::default();
+        for query in 0..=PREDICATE_FRONT_QUERIES {
+            front.insert(&first, "DATA", &query.to_string(), None, true);
+        }
+        let slot = PredicateFront::slot(&first);
+        assert_eq!(front.slots[slot].results.len(), 1);
+        assert_eq!(front.lookup(&first, "DATA", "0", None), None);
+        let oversized = "x".repeat(PREDICATE_FRONT_BYTES + 1);
+        front.insert(&first, "DATA", &oversized, None, true);
+        assert_eq!(front.lookup(&first, "DATA", &oversized, None), None);
+        for _ in 0..4 {
+            let data = format!(
+                "{}{}",
+                front.slots[slot].bytes,
+                "x".repeat(PREDICATE_FRONT_BYTES / 2)
+            );
+            front.insert(&first, "DATA", &data, None, false);
+            assert!(front.slots[slot].bytes <= PREDICATE_FRONT_BYTES);
+            assert!(front.slots[slot].results.len() <= PREDICATE_FRONT_QUERIES);
+        }
+        // The weak owner prevents address reuse but does not retain the cache.
+        let address = Arc::as_ptr(&first);
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(front.slots[slot].owner.as_ref().unwrap().as_ptr(), address);
+        let mut candidates = Vec::new();
+        let replacement = loop {
+            let candidate = Arc::new(PredicateCache::default());
+            if PredicateFront::slot(&candidate) == slot {
+                break candidate;
+            }
+            candidates.push(candidate);
+            assert!(
+                candidates.len() < 100_000,
+                "allocator never filled this slot"
+            );
+        };
+        front.insert(&replacement, "DATA", "0", None, false);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(front.lookup(&replacement, "DATA", "0", None), Some(false));
+        assert_eq!(front.slots[slot].results.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "shared lock versus TLS predicate-front contention benchmark"]
+    fn predicate_front_contention() {
+        let owner = Arc::new(PredicateCache::default());
+        owner
+            .results
+            .write()
+            .unwrap()
+            .push(((Message::new("DATA", "{}"), Some("0".to_owned())), true));
+        for threads in [1, 12] {
+            for front_enabled in [false, true] {
+                let barrier = std::sync::Barrier::new(threads);
+                let started = std::time::Instant::now();
+                std::thread::scope(|scope| {
+                    for _ in 0..threads {
+                        let owner = &owner;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            PREDICATE_FRONT.with(|front| {
+                                front
+                                    .borrow_mut()
+                                    .insert(owner, "DATA", "{}", Some("0"), true)
+                            });
+                            barrier.wait();
+                            for _ in 0..250_000 {
+                                let accepted = if front_enabled {
+                                    PREDICATE_FRONT.with(|front| {
+                                        front.borrow().lookup(owner, "DATA", "{}", Some("0"))
+                                    })
+                                } else {
+                                    owner.lookup("DATA", "{}", Some("0")).unwrap()
+                                };
+                                assert!(std::hint::black_box(accepted).unwrap());
+                            }
+                        });
+                    }
+                });
+                eprintln!("predicate front: enabled={front_enabled}, threads={threads}, queries={}, elapsed={:?}", threads * 250_000, started.elapsed());
+            }
+        }
     }
 }
