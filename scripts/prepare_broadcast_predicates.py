@@ -18,10 +18,12 @@ RULES = {'afonkin_pavel_v': {'kind': 'exact-return',
                                'waiting. Early ACK stays accepted.',
                      'sha256': '060551b1ff4a4d770b7150beb6a6eda1847797ed0bd935ec570c70ad452a1599'},
  'akimov_artem_m': {'kind': 'exact-return',
-                    'predicate': "msg.type != 'BCAST' or msg['author'] not in "
+                    'predicate': "msg.type != 'BCAST' or (msg['author'] not in "
                                  "self._delivered_messages or msg['msg_id'] not in "
-                                 "self._delivered_messages[msg['author']]",
-                    'reason': 'Existing outer delivered guard skips the entire handler body.',
+                                 "self._delivered_messages[msg['author']]) and sender not in "
+                                 "self._received_messages.get(msg['author'], {}).get(msg['msg_id'], [])",
+                    'sender_aware': True,
+                    'reason': 'Delivered outer guard or existing duplicate transport-sender return; both memberships persist and no state or output changes.',
                     'sha256': '48850feb5f5585f0378e92c2f5cb3cd5c72fa5601914819fe692918ee6481770'},
  'anikeev_ilya_a': {'kind': 'exact-return',
                     'predicate': "msg.type != MessageTypes.BROADCAST or msg['id'] not in "
@@ -42,11 +44,16 @@ RULES = {'afonkin_pavel_v': {'kind': 'exact-return',
                        'predicate': "msg.type != 'ACK' or msg['text'] not in self._ignore",
                        'reason': 'Existing ACK early return; BCAST still generates ACK broadcasts.',
                        'sha256': '689da67c66411ac0be3fa3969f586b6603681085dbe04beaa137dede7c2c7161'},
- 'dervis_maksim_v': {'kind': 'exact-return',
+ 'dervis_maksim_v': {'kind': 'exact-noop',
                      'predicate': "msg.type != 'BCAST' or msg['seqno'] > "
-                                  "self._last_delivered[msg['source']]",
-                     'reason': 'is_already_delivered only reads sequence/frontier; preceding pnt '
-                               'is pass.',
+                                  "self._last_delivered[msg['source']] and not any("
+                                  "queued['source'] == msg['source'] and queued['seqno'] == msg['seqno'] "
+                                  "and sender in queued['got_from'] for queued in self._undelivered)",
+                     'sender_aware': True,
+                     'reason': 'Delivered frontier return, or duplicate recorded sender: waiting '
+                               'state is unchanged and send_local_wrapper already drained to a '
+                               'fixed point. Sender membership persists until delivery, when the '
+                               'monotonic frontier takes over rejection.',
                      'sha256': '51ea5143cf309787c6ca88798bda58138e73d50b342f37c3e0538cb45bbd1c96'},
  'drugov_maksim_i': {'kind': 'exact-return',
                      'predicate': "msg.type != 'BCAST' or msg['text'] not in self._delivered",
@@ -80,10 +87,15 @@ RULES = {'afonkin_pavel_v': {'kind': 'exact-return',
                         'reason': 'Existing early return before state mutation or output; other '
                                   'message types remain accepted.',
                         'sha256': '2965f5e0fd86d8c82411c4b40d81100155ef22dc362afe47391aad4fec2e13f3'},
- 'koptev_dmitriy_p': {'kind': 'exact-return',
-                      'predicate': "msg['sn'] > self._v[msg['author']]",
-                      'reason': 'Existing early return before state mutation or output; other '
-                                'message types remain accepted.',
+ 'koptev_dmitriy_p': {'kind': 'exact-noop',
+                      'predicate': "msg['sn'] > self._v[msg['author']] and "
+                                   "(msg.type != 'BCAST' or (msg['author'], msg['sn']) not in self._queue)",
+                      'reason': 'Existing delivered frontier return, or queued duplicate BCAST: '
+                                'add_acks(0) preserves state and suppresses relay; process_queue '
+                                'recursively drains to a fixed point after every network callback. '
+                                'Local callbacks change neither queue nor delivery frontier. Queue '
+                                'membership persists until delivery advances the monotonic frontier. '
+                                'REBCAST remains accepted before delivery and increments its counter.',
                       'sha256': '53083ff086055a12d1db88230f79db500ed15ea84147049bdc6ca0784952a5d0'},
  'krivetskiy_ilya_a': {'kind': 'exact-return',
                        'predicate': "msg.type != 'BCAST' or msg['msg_id'] not in self.delivered",
@@ -244,6 +256,73 @@ RULES = {'afonkin_pavel_v': {'kind': 'exact-return',
                                    'text.',
                          'sha256': '6a0b3990884af7d5c53a4b1b8b441685b26b331f9baa3b6e0fe171294beeed03'}}
 
+# check() drains to a fixed point after every local/network callback; on duplicate
+# inputs its inputs are unchanged, hence re-running it cannot emit new outputs.
+RULES['mazur_aleksandr_i'] = {
+    'kind': 'exact-noop',
+    'sender_aware': True,
+    'predicate': "msg.type not in ('DATA', 'ACK') or msg['id'] not in self.ask_sent or "
+                 "(msg.type == 'DATA' and msg['id'] not in self.data) or "
+                 "(msg.type == 'ACK' and sender not in self.ask_from.get(msg['id'], set()))",
+    'reason': 'Duplicate DATA after data+ask_sent or duplicate ACK after sender+ask_sent '
+              'changes no state; check has already drained to a fixed point after each callback. '
+              'All required memberships are permanent.',
+    'sha256': '523e291e78143c0d6f76a72bfc6dde4073315dd2036d7009dea86eeb65e066ca',
+}
+
+# These guards preserve the complete process state, not merely user deliveries.
+# Per-message quorum tests already ran when each permanent membership was added.
+RULES.update({
+    'ibragimov_artem_r': {
+        'kind': 'exact-noop', 'sender_aware': True,
+        'predicate': "msg.type != 'BCAST' or (msg['text'] not in self._delivered and "
+                     "sender not in self._recieved.get(msg['text'], set()))",
+        'reason': 'Delivered implies a permanent received record, disabling relay before the '
+                  'existing return. A recorded sender adds no state and cannot newly cross '
+                  'the quorum already checked when that sender was added.',
+        'sha256': 'c86fae21194ab016fdefc3f1556b9c33749b601a2a8aa3c0a19401a060e4b64b',
+    },
+    'rodionov_valeriy_v': {
+        'kind': 'exact-return',
+        'predicate': "msg.type != 'BCAST' or msg['text'] not in self._received",
+        'reason': 'BCAST only invokes _receive, whose permanent received-text guard skips '
+                  'all state and output. ACK always remains accepted and increments its counter.',
+        'sha256': '74aa5b46f3bfde8c399ec35df59f8db77c269699651fcdab19f30e8937dcf357',
+    },
+    'dralina_elizaveta_m': {
+        'kind': 'exact-noop', 'sender_aware': True,
+        'predicate': "msg.type != 'ECHO' or tuple(msg['id']) not in self._echo_sent or "
+                     "sender not in self._echo_received.get(tuple(msg['id']), set())",
+        'reason': 'Recorded sender plus echo_sent makes set.add idempotent and disables relay. '
+                  'The per-ID delivery check already ran with this unchanged quorum; all '
+                  'memberships persist and no global delivery drain runs.',
+        'sha256': '0f4539f280ebf6cd32bde00b045ab957450184ea2e6bbe100fa6b4a84c2d6a79',
+    },
+    'shilyaev_ivan_p': {
+        'kind': 'exact-noop', 'sender_aware': True,
+        'predicate': "msg.type != 'BCAST' or tuple(msg['id']) not in self._delivered or "
+                     "sender not in self._gotten.get(tuple(msg['id']), set())",
+        'reason': 'Delivered records remain buffered permanently, and recorded sender makes '
+                  'set.add idempotent. deliver returns immediately for this delivered ID, '
+                  'before its unordered pending-ID traversal. All memberships persist.',
+        'sha256': '56976046dba3f1bd74a4df7390b59224c8aa3b69a00aa3bf6b77b73e8f7133a3',
+    },
+    'zodorov_adam_a': {
+        'kind': 'exact-noop', 'sender_aware': True,
+        'predicate': "msg.type != 'BCAST' or msg['id'][0] == self._id or "
+                     "tuple(msg['id']) not in self._received or "
+                     "tuple(msg['id']) not in self._hold_back or "
+                     "sender not in self._acks.get(tuple(msg['id']), set()) or "
+                     "self._hold_back[tuple(msg['id'])]['sender_v'][msg['id'][0]] > self._v[msg['id'][0]]",
+        'reason': 'Only foreign-origin, received, already buffered stale records with a '
+                  'recorded sender: no ACK addition, relay, or holdback insertion occurs. '
+                  'The stored origin vector cannot equal the advancing frontier plus one, '
+                  'so this entry stays permanently. The global drain already reached its '
+                  'fixed point. Foreign origin excludes local callback ACK-record resets.',
+        'sha256': '200f279a5f5488aa268df694832b1b35e3dd3775764fc92ace3bd69b0a9fcab3',
+    },
+})
+
 NOT_APPLICABLE = {'agafonov_artem_a': 'Each BCAST increments the counter, including after majority.',
  'alekseev_stanislav_m': 'BCAST updates ACK sender state and runs delivery; no message-only '
                          'permanent early return.',
@@ -308,7 +387,6 @@ NOT_APPLICABLE = {'agafonov_artem_a': 'Each BCAST increments the counter, includ
  'sennov_egor_a': 'Duplicate sender branch requires immediate sender; callback still drains.',
  'shakhdullaeva_karina_d': 'Updates pending payload or echo holder state then invokes delivery.',
  'shevlyakov_fedor_s': 'Updates ACK/READY holder sets before checking readiness.',
- 'shilyaev_ivan_p': 'Adds sender before delivered-message return in helper.',
  'shirokovskikh_aleksandr_s': 'Every repeated payload increments the receive counter.',
  'smirnov_gleb_a': 'Duplicates still increment the receive counter.',
  'smirnov_matvey_m': 'Adds relay sender before forwarding/delivery checks.',
@@ -324,36 +402,155 @@ NOT_APPLICABLE = {'agafonov_artem_a': 'Each BCAST increments the counter, includ
  'trushkova_ekaterina_s': 'Adds sender to ACK set before draining pending deliveries.',
  'tsarapkin_maksim_d': 'Adds sender to message state before processing delivery.',
  'zamyatin_matvey_a': 'Records sender before dispatch; BCAST can send ACK for existing payload.',
- 'zodorov_adam_a': 'Updates ACK sets and can recreate holdback entries for old messages.'}
+}
 
-def adapted_source(source, predicate):
+# Source-specific audit: callbacks use only fields/input, scalar set membership,
+# deterministic dict/list traversal, and immutable module constants. Shilyaev is
+# deliberately absent: unordered set traversal affects observable delivery order.
+STATE_CACHE_AUDITS = {'agafonov_artem_a': '8abf252a77e67c9de3ef0951a0365a17983d0bce0e46f009939133007b292ae2',
+ 'akimov_artem_m': '48850feb5f5585f0378e92c2f5cb3cd5c72fa5601914819fe692918ee6481770',
+ 'blokhtin_nikita_a': '4e6f8fb0c70d0ed596be885d4b071a7ab748ee79b5c7071dedbc93faa3266fc9',
+ 'dervis_maksim_v': '51ea5143cf309787c6ca88798bda58138e73d50b342f37c3e0538cb45bbd1c96',
+ 'dralina_elizaveta_m': '0f4539f280ebf6cd32bde00b045ab957450184ea2e6bbe100fa6b4a84c2d6a79',
+ 'ibragimov_artem_r': 'c86fae21194ab016fdefc3f1556b9c33749b601a2a8aa3c0a19401a060e4b64b',
+ 'khamzin_ramil_d': '46b54990711f373ec8b866bb62d6b80fe43f23db47e26c0b22edc9cece5fc267',
+ 'koptev_dmitriy_p': '53083ff086055a12d1db88230f79db500ed15ea84147049bdc6ca0784952a5d0',
+ 'mazur_aleksandr_i': '523e291e78143c0d6f76a72bfc6dde4073315dd2036d7009dea86eeb65e066ca',
+ 'rodionov_valeriy_v': '74aa5b46f3bfde8c399ec35df59f8db77c269699651fcdab19f30e8937dcf357',
+ 'zodorov_adam_a': '200f279a5f5488aa268df694832b1b35e3dd3775764fc92ace3bd69b0a9fcab3'}
+
+# Opt-in observational equivalence, deliberately separate from exact state no-ops.
+# Counter relations identify c with min(c, threshold). These counters only increase,
+# are tested solely for equality to threshold, and never enter outgoing messages.
+# Above threshold a callback emits nothing, while all future threshold tests agree.
+# Shilyaev's relation ignores holder sets for delivered IDs: buffers and delivered
+# IDs persist, and deliver returns before inspecting those sets or draining others.
+# Each rejected step is an output-free stutter; every accepted step has identical
+# outputs and related successor states. For untimed Asyn crash cuts, erase silent
+# receives from original cuts; lift adapted cuts by replaying accepted callbacks
+# and draining enabled omitted silent reads at healthy endpoints, retaining faulty
+# prefixes. Finite sends, no time constraints and no FIFO restriction permit this
+# lift without changing observable labels. Tests support, rather than prove, it.
+OBSERVABLE_STUTTER_RULES = {
+    'akimov_artem_m': {
+        'sender_aware': True,
+        # A queued immutable ID already has quorum (the source tests >= N/2).
+        # Further copies cannot relay, and its drain is at a fixed point. Keep
+        # the first copy/order: once delivered, later copies are forever stale.
+        # Local SEND and nonquorum receives cannot change drain readiness.
+        'predicate': "msg.type != 'BCAST' or ((msg['author'] not in self._delivered_messages or msg['msg_id'] not in self._delivered_messages[msg['author']]) and sender not in self._received_messages.get(msg['author'], {}).get(msg['msg_id'], []) and (not self._received_messages.get(msg['author'], {}).get(msg['msg_id'], []) or msg['vector_clock'][msg['author']] > self._vector_clock[msg['author']]) and not (len(self._received_messages.get(msg['author'], {}).get(msg['msg_id'], [])) * 2 >= len(self._processes) and any(queued['author'] == msg['author'] and queued['msg_id'] == msg['msg_id'] for queued in self._messages_queue)))",
+        'sha256': STATE_CACHE_AUDITS['akimov_artem_m'],
+        'reason': 'Opt-in output equivalence: retain first-contact relay and the first queued copy/order of each immutable source-produced ID; ignore saturated queued holders, duplicate copies and permanently stale records. The global queue drain is already at a fixed point. Preserve the original delivered map exactly, including its outer-msg_id marking behavior.',
+    },
+    'zodorov_adam_a': {
+        'predicate': "msg.type != 'BCAST' or tuple(msg['id']) not in self._received or msg['v'][msg['id'][0]] > self._v[msg['id'][0]]",
+        'sha256': STATE_CACHE_AUDITS['zodorov_adam_a'],
+        'reason': 'Opt-in output equivalence for source-produced messages: an ID permanently fixes its vector and origin sequence. Received membership disables relay; stale origin vectors cannot pass the advancing frontier plus one. Ignore ACK sets and stale holdback entries only for such received IDs; future scans skip them without output.',
+    },
+    'koptev_dmitriy_p': {
+        'predicate': "msg['sn'] > self._v[msg['author']] and ((msg['author'], msg['sn']) not in self._queue or (msg.type != 'BCAST' and self._queue[(msg['author'], msg['sn'])].n_acks < 1 + len(self._processes) // 2))",
+        'sha256': STATE_CACHE_AUDITS['koptev_dmitriy_p'],
+        'reason': 'Opt-in output equivalence: normalize queued ACK counts at quorum; the sole >= quorum test and recursive fixed-point drain cannot observe further increments. Delivery frontier takes over after queue removal.',
+    },
+    'dervis_maksim_v': {
+        'sender_aware': True,
+        'predicate': "msg.type != 'BCAST' or (msg['seqno'] > self._last_delivered[msg['source']] and not any(queued['source'] == msg['source'] and queued['seqno'] == msg['seqno'] and (sender in queued['got_from'] or len(set(queued['got_from'])) >= len(self._processes) // 2 + 1) for queued in self._undelivered))",
+        'sha256': STATE_CACHE_AUDITS['dervis_maksim_v'],
+        'reason': 'Opt-in output equivalence: ignore holder identities and order once quorum is reached. Only quorum size is observed, queued duplicates never relay, and the global delivery drain is already at a fixed point. Delivery frontier takes over after removal.',
+    },
+    'agafonov_artem_a': {
+        'predicate': "msg.type != 'BCAST' or self._received_message_counter.get(tuple(msg['id']), 0) < len(self._processes) // 2 + 1",
+        'sha256': STATE_CACHE_AUDITS['agafonov_artem_a'],
+        'reason': 'Opt-in output equivalence: normalize monotone receive counts at the sole equality threshold; post-threshold callbacks emit nothing.',
+    },
+    'khamzin_ramil_d': {
+        'predicate': "msg.type != 'BCAST' or self._delivered.get(msg['text'], 0) < self._need",
+        'sha256': STATE_CACHE_AUDITS['khamzin_ramil_d'],
+        'reason': 'Opt-in output equivalence: normalize monotone text counts at the sole equality threshold; initial sighting and all pre-threshold callbacks remain accepted.',
+    },
+    'rodionov_valeriy_v': {
+        'predicate': "(msg.type != 'BCAST' or msg['text'] not in self._received) and (msg.type != 'ACK' or msg['text'] not in self._received or self._count.get(msg['text'], 0) < len(self._processes) // 2 + 1)",
+        'sha256': STATE_CACHE_AUDITS['rodionov_valeriy_v'],
+        'reason': 'Opt-in output equivalence: received membership disables ACK relay and post-threshold ACK only increments an otherwise unobserved monotone counter.',
+    },
+    'shilyaev_ivan_p': {
+        'predicate': "msg.type != 'BCAST' or tuple(msg['id']) not in self._delivered",
+        'sha256': RULES['shilyaev_ivan_p']['sha256'],
+        'reason': 'Opt-in output equivalence: ignore holder sets only for permanently delivered buffered IDs; their handler returns before any delivery traversal.',
+    },
+}
+for _rule in OBSERVABLE_STUTTER_RULES.values():
+    _rule['kind'] = 'observable-stutter'
+    _rule['assumptions'] = [
+        'Untimed Asyn delivery and observable protocol outputs',
+        'Network messages are produced by the audited source, without injected payloads',
+    ]
+
+# This source-specific fixed-point proof requires the benchmark driver's contract.
+# With three one-character IDs, set(sender) records precisely one voter. Globally
+# fresh local text means local SEND appends an unready entry with one voter, so it
+# cannot enable a delivery between network fixed points. Duplicate network sender
+# plus queued/sent text changes nothing before the already exhausted recursive drain.
+DRIVER_CONTRACT_ASSUMPTIONS = [
+    'Untimed Asyn delivery with exactly three process IDs: 0, 1, 2',
+    'Every local SEND text is globally distinct across all processes and callbacks',
+    'Network messages are produced by the audited source, without injected payloads',
+]
+DRIVER_CONTRACT_RULES = {
+    'blokhtin_nikita_a': {
+        'kind': 'driver-contract-exact-noop',
+        'sender_aware': True,
+        'predicate': "msg.type != 'BCAST' or sender not in self._got_back.get(msg['text'], set()) or (msg['text'] not in self._sent and not any(queued['text'] == msg['text'] for queued in self._queue))",
+        'sha256': STATE_CACHE_AUDITS['blokhtin_nikita_a'],
+        'reason': 'Under the explicit three-node fresh-text driver contract, a recorded sender with queued or sent text changes no state/output and the recursive drain is already at a fixed point.',
+        'assumptions': DRIVER_CONTRACT_ASSUMPTIONS,
+    },
+}
+# Shilyaev traverses an unordered pending-ID set only after marking one ID
+# delivered. At most two total IDs leaves at most one pending ID at this point,
+# so its order cannot affect outputs. Generic state caching remains unaudited.
+DRIVER_STATE_CACHE_AUDITS = {'shilyaev_ivan_p': RULES['shilyaev_ivan_p']['sha256']}
+DRIVER_STATE_CACHE_ASSUMPTIONS = [
+    'Untimed Asyn delivery with exactly three process IDs: 0, 1, 2',
+    'At most two local SEND callbacks and therefore at most two broadcast IDs globally',
+    'Network messages are produced by the audited source, without injected payloads',
+]
+
+
+def adapted_source(source, predicate, sender_aware=False, driver_contract=False):
+    arguments = "msg, sender" if sender_aware else "msg"
+    install = "set_sender_predicate" if sender_aware else "set_predicate"
+    validation = ("        if sorted(self._processes) != ['0', '1', '2'] or self._id not in self._processes:\n"
+                  "            raise ValueError('broadcast-driver-contract requires process IDs 0, 1, 2')\n"
+                  if driver_contract else '')
     suffix = f'''
 
 _MustOriginalBroadcastProcess = BroadcastProcess
 
 
 class BroadcastProcess(_MustOriginalBroadcastProcess):
-    def _must_accept(self, msg):
+    def _must_accept(self, {arguments}):
         return {predicate}
 
     def on_start(self, ctx):
+{validation}\
         result = super().on_start(ctx)
-        ctx.set_predicate(self._must_accept)
+        ctx.{install}(self._must_accept)
         return result
 
     def on_local_message(self, msg, ctx):
         result = super().on_local_message(msg, ctx)
-        ctx.set_predicate(self._must_accept)
+        ctx.{install}(self._must_accept)
         return result
 
     def on_message(self, msg, sender, ctx):
         result = super().on_message(msg, sender, ctx)
-        ctx.set_predicate(self._must_accept)
+        ctx.{install}(self._must_accept)
         return result
 
     def on_timer(self, name, ctx):
         result = super().on_timer(name, ctx)
-        ctx.set_predicate(self._must_accept)
+        ctx.{install}(self._must_accept)
         return result
 '''
     result = source + suffix
@@ -375,7 +572,8 @@ def unsupported_sources(source):
     return sorted(found)
 
 
-def prepare(directory, summary_path, output):
+def prepare(directory, summary_path, output, *, state_cache=False, include_failing=False,
+            observable_stutter=False, broadcast_driver_contract=False):
     directory, output = directory.resolve(), output.resolve()
     if directory == output or directory in output.parents or output in directory.parents:
         raise ValueError('Output must be separate from the original submissions directory')
@@ -393,27 +591,49 @@ def prepare(directory, summary_path, output):
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         entry = {'submission': name, 'source': str(path), 'sha256': digest,
                  'baseline_counts': counts, 'baseline_passed': baseline['passed']}
-        if any(counts.get(key) for key in ('fail', 'error', 'unsupported', 'inconclusive')):
+        cache_audited = state_cache and STATE_CACHE_AUDITS.get(name) == digest
+        driver_cache_audited = (state_cache and broadcast_driver_contract
+                                and DRIVER_STATE_CACHE_AUDITS.get(name) == digest)
+        cache_audited = cache_audited or driver_cache_audited
+        rule = ((DRIVER_CONTRACT_RULES.get(name) if broadcast_driver_contract else None)
+                or (OBSERVABLE_STUTTER_RULES.get(name) if observable_stutter else None)
+                or RULES.get(name))
+        if (counts.get('fail') and not include_failing) or any(
+                counts.get(key) for key in ('error', 'unsupported', 'inconclusive')):
             entry.update(status='excluded', reason='Baseline has a failure or unsupported/error result')
         elif unsupported := unsupported_sources(source):
             entry.update(status='excluded', reason='Needs nondeterminism/timer review', calls=unsupported)
-        elif name in NOT_APPLICABLE:
+        elif name in NOT_APPLICABLE and not cache_audited and not rule:
             entry.update(status='not_applicable', reason=NOT_APPLICABLE[name])
-        elif name not in RULES:
+        elif rule is None and not cache_audited:
             entry.update(status='manual_review', reason='No audited predicate; original remains unchanged')
-        elif digest != RULES[name]['sha256']:
+        elif rule and digest != rule['sha256']:
             entry.update(status='manual_review', reason='Source changed since predicate audit')
         else:
-            rule = RULES[name]
             destination = output / 'submissions' / name
             if destination.exists():
                 raise ValueError(f'Refusing to overwrite existing variant: {destination}')
             shutil.copytree(path.parent, destination, ignore=shutil.ignore_patterns('__pycache__'))
             variant = destination / 'broadcast.py'
-            variant.write_text(adapted_source(source, rule['predicate']))
-            entry.update(status='adapted', reason=rule['reason'], kind=rule['kind'],
-                         predicate=rule['predicate'], variant=str(variant),
+            transformed = (adapted_source(source, rule['predicate'], rule.get('sender_aware', False),
+                                          rule['kind'] == 'driver-contract-exact-noop' or driver_cache_audited)
+                           if rule else source)
+            if cache_audited:
+                transformed += '\n# Audited pure value callbacks; see preparation source hash whitelist.\n'
+                transformed += '__must_state_cache__ = "pure-value-v1"\n'
+            variant.write_text(transformed)
+            entry.update(status='adapted', variant=str(variant),
+                         state_cache_audited=cache_audited,
                          variant_sha256=hashlib.sha256(variant.read_bytes()).hexdigest())
+            if rule:
+                entry.update(reason=rule['reason'], kind=rule['kind'], predicate=rule['predicate'])
+                if 'assumptions' in rule:
+                    entry['assumptions'] = rule['assumptions']
+            else:
+                entry.update(reason='Source-hash audited pure value state cache; receives unchanged',
+                             kind='state-cache-only')
+            if driver_cache_audited:
+                entry['state_cache_assumptions'] = DRIVER_STATE_CACHE_ASSUMPTIONS
         entries.append(entry)
     result = {'baseline': str(summary_path.resolve()), 'corpus': str(directory),
               'counts': dict(Counter(entry['status'] for entry in entries)),
@@ -427,8 +647,19 @@ def main():
     parser.add_argument('directory', type=Path)
     parser.add_argument('--baseline', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--state-cache', action='store_true',
+                        help='Mark source-hash audited pure value state cache variants')
+    parser.add_argument('--observable-stutter', action='store_true',
+                        help='Opt in to audited output-equivalent adapters that can change private state')
+    parser.add_argument('--broadcast-driver-contract', action='store_true',
+                        help='Opt in to IDs 0/1/2 and globally distinct local SEND texts; with --state-cache, Shilyaev requires at most two SEND callbacks globally. Caller must enforce these obligations')
+    parser.add_argument('--include-failing', action='store_true',
+                        help='Also prepare known-failing baselines; does not skip any scenario')
     args = parser.parse_args()
-    result = prepare(args.directory, args.baseline, args.output)
+    result = prepare(args.directory, args.baseline, args.output,
+                     state_cache=args.state_cache, include_failing=args.include_failing,
+                     observable_stutter=args.observable_stutter,
+                     broadcast_driver_contract=args.broadcast_driver_contract)
     print(json.dumps(result['counts'], sort_keys=True))
 
 
