@@ -17,31 +17,8 @@ import time
 
 ROOT = Path(__file__).resolve().parent.parent
 STATUSES = ("pass", "fail", "unsupported", "inconclusive", "error", "send_budget", "timeout")
+TESTS = ("concurrent", "reply", "reverse_reply", "sequential", "after_delivery")
 MAX_LOG_BYTES = 2 * 1024 * 1024
-
-
-def anysystem_result(solution):
-    directory = Path(solution).parent
-    try:
-        score = (directory / "score").read_text().strip()
-    except OSError:
-        score = "unknown"
-    try:
-        log = (directory / "log").read_text(errors="replace")
-    except OSError:
-        return f"score={score}; log unavailable"
-    passed = re.search(r"Passed (\d+) from (\d+) tests", log)
-    parts = [f"score={score}"]
-    if passed:
-        parts.append(f"tests={passed[1]}/{passed[2]}")
-    for section in re.finditer(r"^--- ([^\n]+) ---\n(.*?)(?=^--- |\Z)", log,
-                               re.MULTILINE | re.DOTALL):
-        name, body = section.groups()
-        if not name.startswith("MODEL CHECKING"):
-            continue
-        verdict = re.search(r"^(PASSED|FAILED)\b", body, re.MULTILINE)
-        parts.append(f"{name}={verdict[1] if verdict else 'unknown'}")
-    return "; ".join(parts)
 
 
 def discover_submissions(directory):
@@ -130,23 +107,35 @@ def run_process(command, timeout, stopped):
     }
 
 
-def case_command(args, solution, test):
-    return [str(args.binary), str(solution), "--test", test,
-            "--threads", str(args.threads), "--json"]
+def submission_command(args, solution):
+    return [str(args.binary), str(solution)]
 
 
-def listing_command(args):
-    return [str(args.binary), "--list-tests"]
+def parse_results(output, returncode, *, partial=False):
+    results = {}
+    current = None
+    for line in output.splitlines():
+        match = re.fullmatch(r"(\w+)\s+(\d+\.\d+)s\s+(\w+)", line)
+        if match:
+            name, seconds, status = match.groups()
+            if name not in TESTS or name in results or status not in STATUSES[:-1]:
+                raise ValueError(f"unexpected test result: {line}")
+            current = {"test": name, "status": status, "seconds": float(seconds), "detail": ""}
+            results[name] = current
+        elif re.fullmatch(r"[A-Z_]+ \(\d+\.\d+s\)", line):
+            current = None
+        elif current is not None:
+            current["detail"] += ("\n" if current["detail"] else "") + line
+    missing = set(TESTS) - results.keys()
+    if missing and not partial:
+        raise ValueError("missing results: " + ", ".join(sorted(missing)))
+    if not partial and all(item["status"] == "pass" for item in results.values()) and returncode != 0:
+        raise ValueError("checker reported pass but exited unsuccessfully")
+    return results
 
 
-def run_case(args, solution, submission, test, log_path, stopped):
-    command = case_command(args, solution, test)
-    record = {
-        "submission": submission, "solution": str(solution), "test": test,
-        "status": "error", "seconds": None, "events": None, "detail": "",
-        "log": str(log_path), "command": command,
-        "delivery": "asyn", "liveness_mode": "cuts",
-    }
+def run_submission(args, solution, submission, log_path, stopped):
+    command = submission_command(args, solution)
     try:
         result = run_process(command, args.timeout, stopped)
     except OSError as error:
@@ -154,46 +143,45 @@ def run_case(args, solution, submission, test, log_path, stopped):
             "returncode": None, "wall_seconds": 0.0, "reason": None,
             "stdout": "", "stderr": str(error), "output_truncated": False,
         }
-    record.update({key: result[key] for key in (
-        "returncode", "wall_seconds", "output_truncated"
-    )})
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(
         "command: " + json.dumps(command, ensure_ascii=False)
         + "\n\n--- stdout ---\n" + result["stdout"]
         + "\n--- stderr ---\n" + result["stderr"], encoding="utf-8",
     )
+    fallback = None
+    parsed = {}
     if result["reason"]:
-        record["status"], record["detail"] = {
+        status, detail = {
             "timeout": ("timeout", f"wall-clock limit exceeded ({args.timeout:g}s)"),
             "interrupted": ("inconclusive", "batch interrupted"),
             "output-limit": ("error", "checker output exceeded 2 MiB per stream"),
         }[result["reason"]]
-        return record
-    try:
-        response = json.loads(result["stdout"])
-        if not isinstance(response, dict):
-            raise ValueError("expected one JSON object")
-        required = {"solution", "test", "status", "seconds", "events", "detail"}
-        if not required.issubset(response):
-            raise ValueError("missing result fields: " + ", ".join(sorted(required - response.keys())))
-        if response["test"] != test:
-            raise ValueError(f"unexpected test name: {response['test']!r}")
-        if response["status"] not in STATUSES[:-1]:
-            raise ValueError(f"unknown status: {response['status']!r}")
-        if "delivery" in response and response["delivery"] != "asyn":
-            raise ValueError(f"unexpected delivery model: {response['delivery']!r}")
-        if "liveness_mode" in response and response["liveness_mode"] != "cuts":
-            raise ValueError(f"unexpected liveness mode: {response['liveness_mode']!r}")
-        if response["status"] == "pass" and result["returncode"] != 0:
-            raise ValueError("checker reported pass but exited unsuccessfully")
-        record.update({key: response[key] for key in ("status", "seconds", "events", "detail")})
-        record["checker_solution"] = response["solution"]
-    except (ValueError, TypeError) as error:
-        record["detail"] = f"invalid checker result: {error}"
-        if result["stderr"]:
-            record["detail"] += "; " + result["stderr"].strip()[-2000:]
-    return record
+        fallback = {"status": status, "seconds": None, "detail": detail}
+        try:
+            parsed = parse_results(result["stdout"], result["returncode"], partial=True)
+        except ValueError:
+            pass
+    else:
+        try:
+            parsed = parse_results(result["stdout"], result["returncode"])
+        except ValueError as error:
+            detail = f"invalid checker result: {error}"
+            if result["stderr"]:
+                detail += "; " + result["stderr"].strip()[-2000:]
+            fallback = {"status": "error", "seconds": None, "detail": detail}
+    records = []
+    for test in TESTS:
+        record = {
+            "submission": submission, "solution": str(solution), "test": test,
+            "log": str(log_path), "command": command,
+        }
+        record.update({key: result[key] for key in (
+            "returncode", "wall_seconds", "output_truncated"
+        )})
+        record.update(parsed.get(test, fallback))
+        records.append(record)
+    return records
 
 
 def make_summary(records, submissions, tests, options, interrupted=False):
@@ -260,10 +248,8 @@ def parser():
     result.add_argument("--output", type=Path, default=ROOT / "target/broadcast-submissions")
     result.add_argument("--submission", action="append", help="exact relative submission folder; repeatable")
     result.add_argument("--first-submission", action="append", help="run this exact relative folder first without filtering the corpus; repeatable")
-    result.add_argument("--test", action="append", help="exact checker test name; repeatable")
     result.add_argument("--timeout", type=positive_float, default=90.0)
     result.add_argument("--jobs", type=positive_int, default=1)
-    result.add_argument("--threads", type=positive_int, default=12)
     return result
 
 
@@ -282,25 +268,14 @@ def main(argv=None):
                 raise ValueError("unknown submissions: " + ", ".join(sorted(missing)))
             submissions = {name: path for name, path in submissions.items() if name in args.submission}
         submissions = prioritize_submissions(submissions, args.first_submission)
-        listed = run_process(listing_command(args), args.timeout, stopped)
-        if listed["returncode"] != 0 or listed["reason"]:
-            raise ValueError("cannot list checker tests: " + (listed["stderr"].strip() or str(listed["reason"])))
-        available = [line.strip() for line in listed["stdout"].splitlines() if line.strip()]
-        if not available or len(available) != len(set(available)):
-            raise ValueError("checker returned an empty or duplicate test list")
-        tests = sorted(set(args.test or available))
-        missing_tests = set(tests) - set(available)
-        if missing_tests:
-            raise ValueError("unknown tests: " + ", ".join(sorted(missing_tests)))
+        tests = TESTS
     except (OSError, ValueError) as error:
         argument_parser.error(str(error))
     args.output.mkdir(parents=True, exist_ok=True)
     options = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
-    options.update(delivery="asyn", liveness_mode="cuts")
     records = []
     summary_path = args.output / "summary.json"
     write_summary(summary_path, make_summary(records, submissions, tests, options))
-    finished = dict.fromkeys(submissions, 0)
     interrupted = False
     executor = ThreadPoolExecutor(max_workers=args.jobs)
     futures = {}
@@ -308,45 +283,36 @@ def main(argv=None):
     try:
         with (args.output / "results.jsonl").open("w", encoding="utf-8") as output:
             for submission, path in submissions.items():
-                for index, test in enumerate(tests):
-                    log_path = args.output / "logs" / submission / f"{index:02d}.log"
-                    future = executor.submit(run_case, args, path, submission, test, log_path, stopped)
-                    futures[future] = (submission, test)
+                log_path = args.output / "logs" / submission / "checker.log"
+                future = executor.submit(run_submission, args, path, submission, log_path, stopped)
+                futures[future] = submission
             try:
                 completed = futures if args.jobs == 1 else as_completed(futures)
-                for future in completed:
-                    record = future.result()
-                    records.append(record)
-                    output.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+                for index, future in enumerate(completed, 1):
+                    cases = future.result()
+                    records.extend(cases)
+                    for record in cases:
+                        output.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
                     output.flush()
-                    submission = record["submission"]
-                    if finished[submission] == 0:
-                        print(f"{submission}: AnySystem {anysystem_result(record['solution'])}", flush=True)
-                    seconds = record["seconds"]
-                    timing = (f"{seconds:.3f}s" if isinstance(seconds, (int, float))
-                              else f"{record['wall_seconds']:.3f}s (wall)")
-                    print(f"[{len(records)}/{len(futures)}] {submission} / {record['test']}: "
-                          f"{record['status']} — {timing}; events={record['events']}", flush=True)
-                    finished[submission] += 1
-                    if finished[submission] == len(tests):
-                        write_summary(summary_path, make_summary(records, submissions, tests, options))
-                        cases = [item for item in records if item["submission"] == submission]
-                        counts = {status: sum(item["status"] == status for item in cases) for status in STATUSES}
-                        details = ", ".join(f"{status}={count}" for status, count in counts.items() if count)
-                        print(f"{submission}: {details}", flush=True)
+                    write_summary(summary_path, make_summary(records, submissions, tests, options))
+                    counts = {status: sum(item["status"] == status for item in cases) for status in STATUSES}
+                    details = ", ".join(f"{status}={count}" for status, count in counts.items() if count)
+                    print(f"[{index}/{len(futures)}] {cases[0]['submission']}: {details}; "
+                          f"{cases[0]['wall_seconds']:.3f}s", flush=True)
             except KeyboardInterrupt:
                 interrupted = True
                 stopped.set()
                 for future in futures:
                     future.cancel()
                 executor.shutdown(wait=True, cancel_futures=True)
-                recorded = {(record["submission"], record["test"]) for record in records}
-                for future, key in futures.items():
-                    if future.cancelled() or key in recorded:
+                recorded = {record["submission"] for record in records}
+                for future, submission in futures.items():
+                    if future.cancelled() or submission in recorded:
                         continue
-                    record = future.result()
-                    records.append(record)
-                    output.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+                    cases = future.result()
+                    records.extend(cases)
+                    for record in cases:
+                        output.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
                     output.flush()
     finally:
         stopped.set()

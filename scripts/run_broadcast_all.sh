@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run one frozen release checker across the full corpus, one case at a time.
+# Run one frozen release checker across the full corpus, one submission at a time.
 set -u
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd) || exit 2
@@ -28,17 +28,8 @@ cd -- "$output/work" || exit 2
 
 command=(python3 "$repo/scripts/test_broadcast_submissions.py" "$submissions"
     --binary "$output/broadcast" --output "$output"
-    --jobs 1 --threads 12 --timeout 90)
-priority_directory=$submissions
-if [[ -d "$submissions/04-broadcast" ]]; then
-    priority_directory="$submissions/04-broadcast"
-fi
-for name in artyukhov_dmitriy_a baydakov_kirill_a artemov_mikhail_s; do
-    if [[ -f "$priority_directory/$name/broadcast.py" ]]; then
-        command+=(--first-submission "$name")
-    fi
-done
-printf 'Starting full corpus with one checker at a time (12 threads, 90s per case).\n'
+    --jobs 1 --timeout 90)
+printf 'Starting full corpus with one checker at a time (90s per submission).\n'
 if command -v caffeinate >/dev/null 2>&1; then
     exec caffeinate -i "${command[@]}"
 fi

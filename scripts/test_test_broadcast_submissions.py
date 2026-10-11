@@ -31,13 +31,9 @@ import subprocess
 import sys
 import time
 
-if "--list-tests" in sys.argv:
-    print("concurrent\nreply\nreverse_reply\nsequential\nafter_delivery")
-    sys.exit(0)
 parser = argparse.ArgumentParser()
 parser.add_argument("solution")
-parser.add_argument("--test")
-args, _ = parser.parse_known_args()
+args = parser.parse_args()
 mode = Path(args.solution).read_text().strip()
 if mode == "cwd":
     Path("working-directory.txt").write_text(str(Path.cwd()))
@@ -45,10 +41,11 @@ if mode == "missing":
     print("startup failed", file=sys.stderr)
     sys.exit(2)
 if mode == "malformed":
-    print("not-json")
+    print("malformed result")
     sys.exit(0)
 if mode == "mismatch":
-    args.test = "wrong-test"
+    print("wrong-test 0.100s pass")
+    sys.exit(0)
 if mode == "timeout":
     marker = str(Path(args.solution).with_suffix(".alive"))
     child = subprocess.Popen([sys.executable, "-c",
@@ -66,10 +63,11 @@ if mode in ("flood-stdout", "flood-stderr"):
         stream.flush()
         time.sleep(0.005)
 status = mode if mode in ("fail", "unsupported", "inconclusive", "error", "send_budget") else "pass"
-print(json.dumps({"solution": args.solution, "test": args.test, "status": status,
-                  "seconds": 0.1, "events": 3, "detail": "fixture " + status,
-                  "delivery": "p2p" if mode == "wrong-delivery" else "asyn",
-                  "liveness_mode": "explicit" if mode == "wrong-mode" else "cuts"}))
+tests = ("concurrent", "reply", "reverse_reply", "sequential", "after_delivery")
+for name in tests:
+    print(f"{name:<18} {0.1:>8.3f}s  {status}")
+    print("fixture " + status)
+print("PASS (0.500s)" if status == "pass" else "FAIL (0.500s)")
 sys.exit(1 if status != "pass" or mode == "badexit" else 0)
 '''
 
@@ -101,10 +99,10 @@ class BatchTests(unittest.TestCase):
 
     def case(self, name, mode, *extra):
         path = self.solution(name, mode)
-        return batch.run_case(
-            self.args(*extra), path, name, "concurrent",
+        return batch.run_submission(
+            self.args(*extra), path, name,
             self.output / f"{name}.log", threading.Event(),
-        )
+        )[0]
 
     def test_discovery_accepts_parent_and_broadcast_directory(self):
         first = self.solution("a")
@@ -144,7 +142,7 @@ class BatchTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 code = batch.main([
                     str(self.corpus), "--binary", str(self.binary), "--output", str(self.output),
-                    "--first-submission", "z", "--threads", "12",
+                    "--first-submission", "z",
                 ])
         self.assertEqual(code, 0)
         self.assertEqual(snapshots[0]["completed_cases"], 0)
@@ -161,8 +159,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual([record["submission"] for record in records], ["z"] * 5 + ["a"] * 5 + ["b"] * 5)
         for record in records:
             command = record["command"]
-            self.assertEqual(command[command.index("--threads") + 1], "12")
-            self.assertNotIn("--max-sends", command)
+            self.assertEqual(command, [str(self.binary.resolve()), record["solution"]])
         self.assertEqual(list(self.output.glob(".summary-*.tmp")), [])
 
     def test_failed_atomic_replace_preserves_the_previous_summary(self):
@@ -182,13 +179,12 @@ class BatchTests(unittest.TestCase):
         with contextlib.redirect_stdout(progress):
             code = batch.main([
                 str(self.corpus), "--binary", str(self.binary), "--output", str(self.output),
-                "--test", "concurrent",
             ])
         self.assertEqual(code, 1)
         summary = json.loads((self.output / "summary.json").read_text())
         self.assertTrue(summary["completed"])
-        self.assertEqual(summary["counts"]["send_budget"], 1)
-        self.assertEqual(summary["counts"]["fail"], 1)
+        self.assertEqual(summary["counts"]["send_budget"], 5)
+        self.assertEqual(summary["counts"]["fail"], 5)
         self.assertEqual(summary["counts"]["timeout"], 0)
         self.assertEqual(summary["counts"]["inconclusive"], 0)
         self.assertEqual(summary["passed_submissions"], 0)
@@ -199,7 +195,7 @@ class BatchTests(unittest.TestCase):
         self.assertIn("send_budget", progress.getvalue())
 
     @unittest.skipUnless(os.name == "posix", "launcher uses a POSIX shell")
-    def test_launcher_freezes_checker_preserves_paths_and_forwards_night_bounds(self):
+    def test_launcher_freezes_checker_and_preserves_paths(self):
         repo = self.root / "repo with spaces"
         scripts = repo / "scripts"
         scripts.mkdir(parents=True)
@@ -239,45 +235,25 @@ class BatchTests(unittest.TestCase):
         summary = json.loads((output / "summary.json").read_text())
         self.assertTrue(summary["completed"])
         self.assertEqual(summary["total_submissions"], 4)
-        self.assertEqual(summary["submission_order"], priorities + ["extra"])
-        for option, value in [("jobs", 1), ("threads", 12), ("timeout", 90), ("delivery", "asyn"), ("liveness_mode", "cuts")]:
+        self.assertEqual(summary["submission_order"], sorted(priorities + ["extra"]))
+        for option, value in [("jobs", 1), ("timeout", 90)]:
             self.assertEqual(summary["options"][option], value)
 
-    def test_listing_and_explicit_test_selection(self):
-        self.assertEqual(batch.listing_command(self.args()),
-                         [str(self.binary), "--list-tests"])
-        self.assertEqual(batch.listing_command(self.args("--test", "reply")),
-                         [str(self.binary), "--list-tests"])
-        self.solution("good")
-        with contextlib.redirect_stdout(io.StringIO()):
-            code = batch.main([
-                str(self.corpus), "--binary", str(self.binary), "--output", str(self.output),
-                "--test", "reply",
-            ])
-        self.assertEqual(code, 0)
-        summary = json.loads((self.output / "summary.json").read_text())
-        self.assertEqual(summary["expected_cases"], 1)
-        self.assertEqual(summary["submissions"]["good"]["results"][0]["test"], "reply")
-
-    def test_case_command_uses_positional_solution(self):
-        command = batch.case_command(self.args(), self.corpus / "broadcast.py", "concurrent")
-        self.assertNotIn("--max-sends", command)
-        for option in ("--delivery", "--liveness-mode", "--suite"):
-            self.assertNotIn(option, command)
-        self.assertEqual(command[1], str(self.corpus / "broadcast.py"))
-        self.assertNotIn("--python", command)
+    def test_submission_command_uses_only_positional_solution(self):
+        solution = self.corpus / "broadcast.py"
+        self.assertEqual(batch.submission_command(self.args(), solution),
+                         [str(self.binary), str(solution)])
 
     def test_result_statuses_and_nonzero_expected_failure(self):
         for status in ("pass", "fail", "unsupported", "inconclusive", "error"):
             with self.subTest(status=status):
                 result = self.case(status, status)
                 self.assertEqual(result["status"], status)
-                self.assertEqual(result["events"], 3)
                 self.assertEqual(result["returncode"], 0 if status == "pass" else 1)
                 self.assertIn("fixture " + status, Path(result["log"]).read_text())
 
     def test_invalid_results_are_errors_with_logs(self):
-        for mode in ("missing", "malformed", "mismatch", "badexit", "wrong-delivery", "wrong-mode"):
+        for mode in ("missing", "malformed", "mismatch", "badexit"):
             with self.subTest(mode=mode):
                 result = self.case(mode, mode)
                 self.assertEqual(result["status"], "error")
@@ -323,12 +299,31 @@ class BatchTests(unittest.TestCase):
         path = self.solution("interrupted", "timeout")
         stopped = threading.Event()
         stopped.set()
-        result = batch.run_case(
-            self.args(), path, "interrupted", "concurrent",
+        result = batch.run_submission(
+            self.args(), path, "interrupted",
             self.output / "interrupted.log", stopped,
-        )
+        )[0]
         self.assertEqual(result["status"], "inconclusive")
         self.assertEqual(result["detail"], "batch interrupted")
+
+    def test_stopped_submission_keeps_completed_results(self):
+        path = self.solution("partial")
+        for reason, expected in (("timeout", "timeout"), ("interrupted", "inconclusive")):
+            with self.subTest(reason=reason):
+                result = {
+                    "returncode": -9, "wall_seconds": 0.8, "reason": reason,
+                    "stdout": "concurrent 0.100s pass\nreply 0.200s fail\nfixture failure\n",
+                    "stderr": "", "output_truncated": False,
+                }
+                with mock.patch.object(batch, "run_process", return_value=result):
+                    records = batch.run_submission(
+                        self.args(), path, "partial", self.output / "partial.log", threading.Event(),
+                    )
+                self.assertEqual([record["status"] for record in records],
+                                 ["pass", "fail", expected, expected, expected])
+                self.assertEqual(records[0]["seconds"], 0.1)
+                self.assertEqual(records[1]["detail"], "fixture failure")
+                self.assertIsNone(records[2]["seconds"])
 
     def test_complete_batch_reports_all_cases_sorted_and_keeps_errors(self):
         for name, mode in (("z", "missing"), ("a", "pass"), ("b", "fail"),
@@ -363,12 +358,11 @@ class BatchTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             code = batch.main([
                 str(self.corpus), "--binary", str(self.binary), "--output", str(self.output),
-                "--submission", "good", "--test", "concurrent",
-                "--test", "concurrent",
+                "--submission", "good",
             ])
         self.assertEqual(code, 0)
         summary = json.loads((self.output / "summary.json").read_text())
-        self.assertEqual(summary["expected_cases"], 1)
+        self.assertEqual(summary["expected_cases"], 5)
         self.assertEqual(summary["total_submissions"], 1)
 
 
