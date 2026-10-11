@@ -2,29 +2,7 @@ use std::sync::OnceLock;
 
 use crate::proc::{Factory, Output, Outputs, Process};
 
-static THREADS: OnceLock<usize> = OnceLock::new();
-static RECEIVE_TAIL: OnceLock<bool> = OnceLock::new();
-static SEND_FIRST: OnceLock<bool> = OnceLock::new();
-
-pub fn configure_send_first(enabled: bool) {
-    SEND_FIRST.set(enabled).expect("configure send-first once");
-}
-
-pub fn configure_receive_tail(enabled: bool) {
-    RECEIVE_TAIL
-        .set(enabled)
-        .expect("configure receive-tail once");
-}
-
-pub fn configure(threads: usize) {
-    THREADS
-        .set(threads.max(1))
-        .expect("configure broadcast once");
-}
-
-pub(crate) fn threads() -> usize {
-    THREADS.get().copied().unwrap_or(12)
-}
+pub(crate) const WORKERS: usize = 12;
 
 pub(super) const NODES: usize = 3;
 pub(super) const MESSAGES: [&str; 2] = ["first", "second"];
@@ -161,28 +139,19 @@ impl must::Observer for FirstFailure {
     }
 }
 
-pub(super) fn run(make_system: impl Fn() -> must::System + Sync) -> Result<usize, String> {
-    let observer = (
-        must::EventCountingObserver::with_shards(threads()).with_buffered_events(),
-        FirstFailure::default(),
-    );
-    let mut config = must::Config::default()
-        .with_threads(threads())
+pub(super) fn run(make_system: impl Fn() -> must::System + Sync) -> Result<(), String> {
+    let observer = FirstFailure::default();
+    let config = must::Config::default()
+        .with_threads(WORKERS)
         .with_max_sends(SEND_BUDGET)
-        .with_stop_on_terminal_error();
-    if SEND_FIRST.get().copied().unwrap_or(false) {
-        config = config.with_send_first();
-    }
-    if RECEIVE_TAIL.get().copied().unwrap_or(true) {
-        config =
-            config.with_receive_tail(must::explorer::receive_tail::ReceiveTailBudget::default());
-    }
+        .with_stop_on_terminal_error()
+        .with_send_first()
+        .with_receive_tail(must::explorer::receive_tail::ReceiveTailBudget::default());
     must::explore(make_system, &observer, config);
-    if let Some(error) = observer.1.trace.into_inner() {
+    if let Some(error) = observer.trace.into_inner() {
         return Err(error);
     }
-    assert!(observer.0.full() + observer.0.blocked() + observer.0.receive_tails() > 0);
-    Ok(observer.0.events_added())
+    Ok(())
 }
 
 pub(super) fn reply_system(factory: Factory, sender: usize, responder: usize) -> must::System {

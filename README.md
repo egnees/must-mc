@@ -121,17 +121,9 @@ Receive-tail certificates check all reachable predicate-enabled continuations;
 the broadcast observer separately checks crash cuts before accepting a certificate.
 All five scenarios run even when an earlier scenario fails.
 
-For performance comparisons, the broadcast CLI supports `--no-state-cache`,
-`--no-receive-tail`, and `--cache-stats` (counters are written to stderr).
-The optional `--send-first` policy prioritizes ready sends within untimed Must;
-it preserves the source/revisit rules but its performance depends on the program.
-It is disabled by default and cannot be combined with timed exploration.
-
-Selective crash-cut analysis also caches accepted predicate queries by exact
-predicate ownership and interned payload. This bounded, per-worker cache is
-enabled by default and never stores rejections or errors. For diagnostics,
-`MUST_CUTS_PRED_CACHE=0` disables it and `MUST_CUTS_PRED_STATS=1` prints hit counters
-to stderr. Neither switch changes which crash cuts are checked.
+The CLI takes only the solution path and runs all five scenarios with 12 workers.
+Python caching, receive-tail certificates, ready-send scheduling, and the
+accepted-predicate cache are enabled automatically.
 
 Prepare separately labelled, source-hash audited submission variants with:
 

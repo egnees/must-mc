@@ -4,7 +4,7 @@
 use super::common::{self, flush, BROADCAST, MESSAGES, NODES};
 use crate::proc::{Factory, Outputs, Process};
 
-pub fn run(factory: Factory) -> Result<usize, String> {
+pub fn run(factory: Factory) -> Result<(), String> {
     common::run(|| system(factory.clone())).map_err(|error| format!("sequential: {error}"))
 }
 

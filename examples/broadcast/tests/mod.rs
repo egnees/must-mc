@@ -9,7 +9,7 @@ pub mod reply;
 pub mod reverse_reply;
 pub mod sequential;
 
-pub type Scenario = fn(crate::proc::Factory) -> Result<usize, String>;
+pub type Scenario = fn(crate::proc::Factory) -> Result<(), String>;
 
 pub const SCENARIOS: [(&str, Scenario); 5] = [
     ("concurrent", concurrent::run),

@@ -374,20 +374,12 @@ struct PositivePredicateEntry {
 
 struct PositivePredicates {
     entries: [PositivePredicateEntry; POSITIVE_PREDICATE_SLOTS],
-    queries: usize,
-    hits: usize,
-    inserted: usize,
-    worker: Option<std::thread::ThreadId>,
 }
 
 impl Default for PositivePredicates {
     fn default() -> Self {
         Self {
             entries: std::array::from_fn(|_| PositivePredicateEntry::default()),
-            queries: 0,
-            hits: 0,
-            inserted: 0,
-            worker: None,
         }
     }
 }
@@ -402,48 +394,15 @@ impl PositivePredicates {
             % POSITIVE_PREDICATE_SLOTS
     }
 
-    fn contains(&mut self, pred: &Arc<must::Pred>, value: must::Val, stats: bool) -> bool {
+    fn contains(&self, pred: &Arc<must::Pred>, value: must::Val) -> bool {
         let entry = &self.entries[Self::slot(pred, value)];
-        let hit = entry.owner.as_ptr() == Arc::as_ptr(pred) && entry.value == Some(value);
-        if stats {
-            self.worker
-                .get_or_insert_with(|| std::thread::current().id());
-            self.queries += 1;
-            self.hits += usize::from(hit);
-            if self.queries % (1 << 20) == 0 {
-                eprintln!(
-                    "CUTS_PREDICATE_CACHE worker={:?} queries={} hits={} inserted={}",
-                    self.worker.unwrap(),
-                    self.queries,
-                    self.hits,
-                    self.inserted
-                );
-            }
-        }
-        hit
+        entry.owner.as_ptr() == Arc::as_ptr(pred) && entry.value == Some(value)
     }
 
-    fn insert(&mut self, pred: &Arc<must::Pred>, value: must::Val, stats: bool) {
+    fn insert(&mut self, pred: &Arc<must::Pred>, value: must::Val) {
         let entry = &mut self.entries[Self::slot(pred, value)];
         entry.owner = Arc::downgrade(pred);
         entry.value = Some(value);
-        if stats {
-            self.inserted += 1;
-        }
-    }
-}
-
-impl Drop for PositivePredicates {
-    fn drop(&mut self) {
-        if self.queries != 0 {
-            eprintln!(
-                "CUTS_PREDICATE_CACHE worker={:?} queries={} hits={} inserted={} final=1",
-                self.worker.unwrap(),
-                self.queries,
-                self.hits,
-                self.inserted
-            );
-        }
     }
 }
 
@@ -451,38 +410,26 @@ thread_local! {
     static POSITIVE_PREDICATES: RefCell<PositivePredicates> = RefCell::new(PositivePredicates::default());
 }
 
-fn test_predicate_cached(pred: &Arc<must::Pred>, value: must::Val, stats: bool) -> bool {
+fn test_predicate_cached(pred: &Arc<must::Pred>, value: must::Val) -> bool {
     // Selective predicates denote immutable, pure acceptance sets. Python's
     // adapter returns false on transport/decode errors: only true is memoized,
     // so an error/rejection never suppresses a subsequent evaluation/diagnostic.
     // No TLS borrow crosses predicate execution or its Python/diagnostic path.
-    if POSITIVE_PREDICATES.with(|cache| cache.borrow_mut().contains(pred, value, stats)) {
+    if POSITIVE_PREDICATES.with(|cache| cache.borrow().contains(pred, value)) {
         return true;
     }
     let accepted = pred.test_sym(value);
     if accepted {
-        POSITIVE_PREDICATES.with(|cache| cache.borrow_mut().insert(pred, value, stats));
+        POSITIVE_PREDICATES.with(|cache| cache.borrow_mut().insert(pred, value));
     }
     accepted
 }
 
 fn test_cut_predicate(pred: &Arc<must::Pred>, value: must::Val) -> bool {
-    static OPTIONS: OnceLock<(bool, bool)> = OnceLock::new();
-    // Crash-cut analysis treats each immutable predicate snapshot as a pure
-    // acceptance set, just like its per-boundary OnceCell tables. Reuse only
-    // exact-owner successful answers; never reuse tags, failures or verdicts.
-    // Default on after paired measurements; the private =0 switch preserves
-    // the original evaluation path for A/B checks. Metrics remain opt-in.
-    let &(enabled, stats) = OPTIONS.get_or_init(|| {
-        (
-            !std::env::var("MUST_CUTS_PRED_CACHE").is_ok_and(|value| value == "0"),
-            std::env::var("MUST_CUTS_PRED_STATS").is_ok_and(|value| value == "1"),
-        )
-    });
-    if !enabled || pred.is_any() {
+    if pred.is_any() {
         return pred.test_sym(value);
     }
-    test_predicate_cached(pred, value, stats)
+    test_predicate_cached(pred, value)
 }
 
 #[derive(Default)]
@@ -2099,13 +2046,13 @@ mod tests {
             value == "accepted"
         }));
         for _ in 0..3 {
-            assert!(test_predicate_cached(&pred, "accepted".into(), false));
-            assert!(!test_predicate_cached(&pred, "rejected".into(), false));
+            assert!(test_predicate_cached(&pred, "accepted".into()));
+            assert!(!test_predicate_cached(&pred, "rejected".into()));
         }
         // One accepted evaluation is reused; false/error-like results are not.
         assert_eq!(calls.load(Ordering::Relaxed), 4);
         let other = Arc::new(must::Pred::new("same tag", |_| false));
-        assert!(!test_predicate_cached(&other, "accepted".into(), false));
+        assert!(!test_predicate_cached(&other, "accepted".into()));
         let weak = Arc::downgrade(&pred);
         drop(pred);
         assert!(weak.upgrade().is_none());
@@ -2118,27 +2065,23 @@ mod tests {
             owner: weak,
             value: Some(value),
         };
-        assert!(!cache.contains(&other, value, false));
+        assert!(!cache.contains(&other, value));
         cache.entries[index] = PositivePredicateEntry {
             owner: Arc::downgrade(&other),
             value: Some("different value".into()),
         };
-        assert!(!cache.contains(&other, value, false));
-        assert!(test_predicate_cached(
-            &Arc::new(must::Pred::any()),
-            value,
-            false
-        ));
+        assert!(!cache.contains(&other, value));
+        assert!(test_predicate_cached(&Arc::new(must::Pred::any()), value));
     }
 
     #[test]
     fn positive_predicate_cache_releases_borrows_before_nested_predicate_queries() {
         let inner = Arc::new(must::Pred::eq("nested"));
         let outer = Arc::new(must::Pred::new("nested predicate", move |value| {
-            test_predicate_cached(&inner, value.into(), false)
+            test_predicate_cached(&inner, value.into())
         }));
-        assert!(test_predicate_cached(&outer, "nested".into(), false));
-        assert!(!test_predicate_cached(&outer, "rejected".into(), false));
+        assert!(test_predicate_cached(&outer, "nested".into()));
+        assert!(!test_predicate_cached(&outer, "rejected".into()));
     }
 
     #[test]
@@ -2149,15 +2092,15 @@ mod tests {
         let pred = Arc::new(must::Pred::new("transient failure", move |_| {
             count.fetch_add(1, Ordering::Relaxed) != 0
         }));
-        assert!(!test_predicate_cached(&pred, "payload".into(), false));
-        assert!(test_predicate_cached(&pred, "payload".into(), false));
-        assert!(test_predicate_cached(&pred, "payload".into(), false));
+        assert!(!test_predicate_cached(&pred, "payload".into()));
+        assert!(test_predicate_cached(&pred, "payload".into()));
+        assert!(test_predicate_cached(&pred, "payload".into()));
         assert_eq!(calls.load(Ordering::Relaxed), 2);
 
         let body = Arc::new("captured predicate state");
         let weak_body = Arc::downgrade(&body);
         let pred = Arc::new(must::Pred::new("captured state", move |_| !body.is_empty()));
-        assert!(test_predicate_cached(&pred, "payload".into(), false));
+        assert!(test_predicate_cached(&pred, "payload".into()));
         drop(pred);
         assert!(weak_body.upgrade().is_none());
     }
